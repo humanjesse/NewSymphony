@@ -1,0 +1,3 @@
+{"id":"bb817f63","title":"Test adding a new task","description":"Verify that the new tool works by creating a simple task.","status":"completed","priority":2,"type":"task","labels":[],"created_at":1768506018,"updated_at":1768506156,"completed_at":1768506156}
+{"id":"e6208bb9","title":"Dependency test task","description":"Second task for dependency testing.","status":"pending","priority":2,"type":"task","labels":[],"created_at":1768506329,"updated_at":1768506329}
+{"id":"34a2ee1a","title":"Dependent test task","description":"Task that depends on Dependency test task.","status":"blocked","priority":2,"type":"task","labels":[],"created_at":1768506343,"updated_at":1768506343}
