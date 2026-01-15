@@ -173,6 +173,10 @@ pub fn columnText(stmt: *Stmt, col: c_int) ?[]const u8 {
     return std.mem.span(text);
 }
 
+pub fn columnType(stmt: *Stmt, col: c_int) c_int {
+    return sqlite3_column_type(stmt, col);
+}
+
 pub fn lastInsertRowId(db: *Db) i64 {
     return sqlite3_last_insert_rowid(db);
 }

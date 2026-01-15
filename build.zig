@@ -26,6 +26,23 @@ pub fn build(b: *std.Build) void {
     conversation_db_module.addImport("sqlite", sqlite_module);
     // Will add types, ollama, markdown after they're created
 
+    // Task memory system modules (Beads-inspired)
+    const task_store_module = b.createModule(.{
+        .root_source_file = b.path("task_store.zig"),
+    });
+
+    const task_db_module = b.createModule(.{
+        .root_source_file = b.path("task_db.zig"),
+    });
+    task_db_module.addImport("sqlite", sqlite_module);
+    task_db_module.addImport("task_store", task_store_module);
+
+    // Git sync module for task persistence
+    const git_sync_module = b.createModule(.{
+        .root_source_file = b.path("git_sync.zig"),
+    });
+    git_sync_module.addImport("task_store", task_store_module);
+
     // Core lexer module (no dependencies)
     const lexer_module = b.createModule(.{
         .root_source_file = b.path("lexer.zig"),
@@ -113,6 +130,10 @@ pub fn build(b: *std.Build) void {
     context_module.addImport("llm_provider", llm_provider_module);
     context_module.addImport("zvdb", zvdb_module);
     context_module.addImport("embedder_interface", embedder_interface_module);
+    context_module.addImport("task_store", task_store_module);
+    context_module.addImport("task_db", task_db_module);
+    context_module.addImport("git_sync", git_sync_module);
+    context_module.addImport("conversation_db", conversation_db_module);
     // Will add agents and types after they're created
 
     // Agents module (needed by app)
@@ -124,6 +145,7 @@ pub fn build(b: *std.Build) void {
     agents_module.addImport("config", config_module);
     agents_module.addImport("zvdb", zvdb_module);
     agents_module.addImport("embedder_interface", embedder_interface_module);
+    agents_module.addImport("conversation_db", conversation_db_module);
     // Will add tools after it's created
 
     // Now add agents to context_module
@@ -139,6 +161,9 @@ pub fn build(b: *std.Build) void {
     tools_module.addImport("agents", agents_module);
     tools_module.addImport("tree", tree_module);
     tools_module.addImport("html_utils", html_utils_module);
+    tools_module.addImport("task_store", task_store_module);
+    tools_module.addImport("task_db", task_db_module);
+    tools_module.addImport("git_sync", git_sync_module);
     // Will add file_curator and types after they're created
 
     // Now that tools_module is created, add it to agents_module
@@ -359,6 +384,9 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("llm_helper", llm_helper_module);
     app_module.addImport("sqlite", sqlite_module);
     app_module.addImport("conversation_db", conversation_db_module);
+    app_module.addImport("task_store", task_store_module);
+    app_module.addImport("task_db", task_db_module);
+    app_module.addImport("git_sync", git_sync_module);
 
     // Now add app and types to agents and agent modules (circular dependency is OK with modules)
     agents_module.addImport("app", app_module);

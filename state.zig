@@ -1,6 +1,78 @@
 // Application state management (Phase 1: Todo tracking for master loop)
 const std = @import("std");
 const mem = std.mem;
+const fs = std.fs;
+
+/// Normalize a path for consistent comparison.
+/// Uses realpath for existing files, manual normalization for new files.
+fn normalizePath(allocator: mem.Allocator, path: []const u8) ![]const u8 {
+    // Try realpath first (handles symlinks, ./, ../, etc.)
+    return fs.cwd().realpathAlloc(allocator, path) catch |err| {
+        if (err == error.FileNotFound) {
+            // File doesn't exist - do manual normalization
+            return manualNormalize(allocator, path);
+        }
+        return err;
+    };
+}
+
+/// Manual path normalization for non-existent files.
+/// Returns an ABSOLUTE path by joining cwd with the normalized relative path.
+/// Handles: leading ./, redundant //, embedded . and .. components.
+fn manualNormalize(allocator: mem.Allocator, path: []const u8) ![]const u8 {
+    // Handle empty path
+    if (path.len == 0) {
+        return fs.cwd().realpathAlloc(allocator, ".");
+    }
+
+    // Get current working directory (absolute)
+    const cwd = try fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    // Collect path components, resolving . and ..
+    var components = std.ArrayListUnmanaged([]const u8){};
+    defer components.deinit(allocator);
+
+    // Start with cwd components
+    var cwd_iter = mem.splitScalar(u8, cwd, '/');
+    while (cwd_iter.next()) |comp| {
+        if (comp.len > 0) {
+            try components.append(allocator, comp);
+        }
+    }
+
+    // Process input path components
+    var path_iter = mem.splitScalar(u8, path, '/');
+    while (path_iter.next()) |comp| {
+        if (comp.len == 0 or mem.eql(u8, comp, ".")) {
+            // Skip empty components and "."
+            continue;
+        } else if (mem.eql(u8, comp, "..")) {
+            // Go up one directory (but don't go above root)
+            if (components.items.len > 0) {
+                _ = components.pop();
+            }
+        } else {
+            try components.append(allocator, comp);
+        }
+    }
+
+    // Build absolute path
+    var result = std.ArrayListUnmanaged(u8){};
+    errdefer result.deinit(allocator);
+
+    for (components.items) |comp| {
+        try result.append(allocator, '/');
+        try result.appendSlice(allocator, comp);
+    }
+
+    // Handle root case
+    if (result.items.len == 0) {
+        try result.append(allocator, '/');
+    }
+
+    return result.toOwnedSlice(allocator);
+}
 
 /// Todo status enum for tracking progress
 pub const TodoStatus = enum { pending, in_progress, completed };
@@ -76,18 +148,24 @@ pub const AppState = struct {
     }
 
     pub fn markFileAsRead(self: *AppState, path: []const u8) !void {
-        // Check if already tracked to avoid duplicate allocations
-        if (self.read_files.contains(path)) {
-            return; // Already marked, nothing to do
+        // Normalize path for consistent comparison
+        const normalized = try normalizePath(self.allocator, path);
+        errdefer self.allocator.free(normalized);
+
+        // Check if already tracked
+        if (self.read_files.contains(normalized)) {
+            self.allocator.free(normalized);
+            return;
         }
 
-        const owned_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(owned_path);
-        try self.read_files.put(self.allocator, owned_path, {});
+        try self.read_files.put(self.allocator, normalized, {});
     }
 
     pub fn wasFileRead(self: *AppState, path: []const u8) bool {
-        return self.read_files.contains(path);
+        // Normalize path for consistent comparison
+        const normalized = normalizePath(self.allocator, path) catch return false;
+        defer self.allocator.free(normalized);
+        return self.read_files.contains(normalized);
     }
 
     pub fn markFileAsIndexed(self: *AppState, path: []const u8) !void {

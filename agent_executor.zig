@@ -132,11 +132,33 @@ pub const AgentExecutor = struct {
     ) !AgentResult {
         const start_time = std.time.milliTimestamp();
 
+        // Create agent invocation record for persistence (if conversation_db is available)
+        var invocation_id: ?i64 = null;
+        var message_index: i64 = 0;
+        if (context.conversation_db) |db| {
+            if (context.session_id) |session_id| {
+                invocation_id = db.createAgentInvocation(
+                    session_id,
+                    context.system_prompt, // Use system_prompt as agent name identifier
+                    context.current_task_id,
+                    null, // parent_message_id - could be passed if needed
+                ) catch null;
+            }
+        }
+
         // Add user task message
         try self.message_history.append(self.allocator, .{
             .role = "user",
             .content = try self.allocator.dupe(u8, user_task),
         });
+
+        // Persist user message
+        if (context.conversation_db) |db| {
+            if (invocation_id) |inv_id| {
+                _ = db.saveAgentMessage(inv_id, message_index, "user", user_task, null, null, null, null) catch {};
+                message_index += 1;
+            }
+        }
 
         // Filter tools based on capabilities
         const allowed_tools = try self.filterAllowedTools(available_tools);
@@ -206,6 +228,14 @@ pub const AgentExecutor = struct {
                     .{err},
                 );
                 defer self.allocator.free(error_msg);
+
+                // Complete the invocation record with error status
+                if (context.conversation_db) |db| {
+                    if (invocation_id) |inv_id| {
+                        db.completeAgentInvocation(inv_id, "failed", error_msg, @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
+                    }
+                }
+
                 return try AgentResult.err(self.allocator, error_msg, stats);
             };
 
@@ -233,6 +263,14 @@ pub const AgentExecutor = struct {
                     null,
             });
 
+            // Persist assistant message
+            if (context.conversation_db) |db| {
+                if (invocation_id) |inv_id| {
+                    _ = db.saveAgentMessage(inv_id, message_index, "assistant", response_content, final_thinking, null, null, null) catch {};
+                    message_index += 1;
+                }
+            }
+
             // Check if we have tool calls to execute
             const last_msg = self.message_history.items[self.message_history.items.len - 1];
             if (last_msg.tool_calls) |tool_calls| {
@@ -248,6 +286,14 @@ pub const AgentExecutor = struct {
                         .content = try self.allocator.dupe(u8, tool_result),
                         .tool_call_id = try self.allocator.dupe(u8, tool_call_id),
                     });
+
+                    // Persist tool message
+                    if (context.conversation_db) |db| {
+                        if (invocation_id) |inv_id| {
+                            _ = db.saveAgentMessage(inv_id, message_index, "tool", tool_result, null, tool_call_id, tool_call.function.name, true) catch {};
+                            message_index += 1;
+                        }
+                    }
 
                     self.tool_calls_made += 1;
                 }
@@ -268,6 +314,13 @@ pub const AgentExecutor = struct {
                 .execution_time_ms = end_time - start_time,
             };
 
+            // Complete the invocation record
+            if (context.conversation_db) |db| {
+                if (invocation_id) |inv_id| {
+                    db.completeAgentInvocation(inv_id, "completed", response_content, @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
+                }
+            }
+
             return try AgentResult.ok(self.allocator, response_content, stats, final_thinking);
         }
 
@@ -278,6 +331,13 @@ pub const AgentExecutor = struct {
             .tool_calls_made = self.tool_calls_made,
             .execution_time_ms = end_time - start_time,
         };
+
+        // Complete the invocation record with error status
+        if (context.conversation_db) |db| {
+            if (invocation_id) |inv_id| {
+                db.completeAgentInvocation(inv_id, "failed", "Max iterations reached without completion", @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
+            }
+        }
 
         return try AgentResult.err(
             self.allocator,

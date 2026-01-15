@@ -12,6 +12,9 @@ zvdb/test_zon
 # Personal notes
 my_notes/
 
+# Beads task system runtime data
+.tasks/
+
 # Development documentation
 EMOJI_SUPPORT.md
 UPGRADE_NOTES.md

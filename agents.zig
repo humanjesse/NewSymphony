@@ -6,6 +6,7 @@ const config_module = @import("config");
 const tools_module = @import("tools");
 const zvdb = @import("zvdb");
 const embedder_interface = @import("embedder_interface");
+const conversation_db_module = @import("conversation_db");
 
 /// Progress update callback function type (shared with GraphRAG)
 pub const ProgressCallback = *const fn (user_data: ?*anyopaque, update_type: ProgressUpdateType, message: []const u8) void;
@@ -99,6 +100,11 @@ pub const AgentContext = struct {
     // Optional mutable messages list for compression agent
     // Allows compression tools to modify the conversation history
     messages_list: ?*anyopaque = null, // *std.ArrayListUnmanaged(Message) - using anyopaque to avoid circular import
+
+    // Conversation persistence for agent message tracking
+    conversation_db: ?*conversation_db_module.ConversationDB = null,
+    session_id: ?i64 = null,
+    current_task_id: ?[]const u8 = null, // Task ID from task_store if working on a specific task
 };
 
 /// Statistics about agent execution

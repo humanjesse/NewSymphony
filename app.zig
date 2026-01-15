@@ -36,6 +36,9 @@ const profile_ui_state = @import("profile_ui_state");
 const profile_ui_renderer = @import("profile_ui_renderer");
 const profile_ui_input = @import("profile_ui_input");
 const conversation_db_module = @import("conversation_db");
+const task_store_module = @import("task_store");
+const task_db_module = @import("task_db");
+const git_sync_module = @import("git_sync");
 
 // Re-export types for convenience
 pub const Message = types.Message;
@@ -214,6 +217,46 @@ pub const RenderCache = struct {
     }
 };
 
+/// Find the git root directory by walking up from cwd
+/// Returns null if not in a git repository
+fn findGitRoot(allocator: mem.Allocator) !?[]const u8 {
+    // Get current working directory
+    const cwd = fs.cwd();
+    var path_buf: [fs.max_path_bytes]u8 = undefined;
+    const cwd_path = try cwd.realpath(".", &path_buf);
+
+    // Walk up the directory tree looking for .git
+    var current_path = try allocator.dupe(u8, cwd_path);
+    defer allocator.free(current_path);
+
+    while (true) {
+        // Check if .git exists in current directory
+        const git_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{current_path});
+        defer allocator.free(git_path);
+
+        if (fs.cwd().statFile(git_path)) |stat| {
+            // .git exists - could be file (worktree) or directory
+            _ = stat;
+            return try allocator.dupe(u8, current_path);
+        } else |_| {
+            // .git doesn't exist, try parent directory
+        }
+
+        // Find parent directory
+        if (mem.lastIndexOf(u8, current_path, "/")) |last_slash| {
+            if (last_slash == 0) {
+                // We're at root, no .git found
+                return null;
+            }
+            const new_path = try allocator.dupe(u8, current_path[0..last_slash]);
+            allocator.free(current_path);
+            current_path = new_path;
+        } else {
+            // No slash found, we're done
+            return null;
+        }
+    }
+}
 
 pub const App = struct {
     allocator: mem.Allocator,
@@ -269,6 +312,11 @@ pub const App = struct {
     // Conversation persistence
     conversation_db: ?conversation_db_module.ConversationDB = null,
     current_conversation_id: ?i64 = null,
+    // Task memory system (Beads-inspired)
+    task_store: ?*task_store_module.TaskStore = null,
+    task_db: ?*task_db_module.TaskDB = null,
+    git_sync: ?*git_sync_module.GitSync = null,
+    git_root: ?[]const u8 = null, // Project root (where .git is)
 
     // Incremental rendering state
     render_cache: RenderCache = RenderCache.init(),
@@ -366,6 +414,81 @@ pub const App = struct {
         // Persist system message immediately
         try app.persistMessage(app.messages.items.len - 1);
 
+        // Initialize task memory system (Beads-style per-project)
+        // First, try to find git root for per-project storage
+        if (try findGitRoot(allocator)) |git_root| {
+            app.git_root = git_root;
+
+            // Create task store
+            const task_store_ptr = try allocator.create(task_store_module.TaskStore);
+            task_store_ptr.* = task_store_module.TaskStore.init(allocator);
+            app.task_store = task_store_ptr;
+
+            // Start a new session
+            try task_store_ptr.startSession();
+
+            // Initialize GitSync for this project
+            const git_sync_ptr = try allocator.create(git_sync_module.GitSync);
+            git_sync_ptr.* = try git_sync_module.GitSync.init(allocator, git_root);
+            app.git_sync = git_sync_ptr;
+
+            // Create per-project SQLite cache
+            const task_db_path = try std.fmt.allocPrint(allocator, "{s}/.tasks/tasks.db", .{git_root});
+            defer allocator.free(task_db_path);
+
+            // Ensure .tasks directory exists
+            try git_sync_ptr.ensureTasksDir();
+
+            // Create task database
+            const task_db_ptr = try allocator.create(task_db_module.TaskDB);
+            task_db_ptr.* = try task_db_module.TaskDB.init(allocator, task_db_path);
+            app.task_db = task_db_ptr;
+
+            // Cold-start recovery: SQLite first (crash recovery), JSONL fallback (fresh clone)
+            var loaded_from_db = false;
+            if (task_db_ptr.loadIntoStore(task_store_ptr)) |count| {
+                if (count > 0) {
+                    loaded_from_db = true;
+                    std.log.info("Recovered {d} tasks from local cache", .{count});
+                }
+            } else |_| {}
+
+            // Fall back to JSONL (fresh clone or empty SQLite)
+            if (!loaded_from_db) {
+                if (git_sync_ptr.importTasks(task_store_ptr)) |count| {
+                    if (count > 0) {
+                        std.log.info("Loaded {d} tasks from JSONL", .{count});
+                        // Populate SQLite for future crash recovery
+                        task_db_ptr.saveFromStore(task_store_ptr) catch |err| {
+                            std.log.warn("Failed to populate SQLite cache: {}", .{err});
+                        };
+                    }
+                } else |_| {}
+            }
+
+            // Try to restore session state (current_task_id)
+            if (try git_sync_ptr.parseSessionState()) |state| {
+                defer {
+                    var s = state;
+                    s.deinit(allocator);
+                }
+
+                // Restore current task if it exists in store
+                if (state.current_task_id) |cid| {
+                    if (task_store_ptr.tasks.contains(cid)) {
+                        task_store_ptr.current_task_id = cid;
+                    }
+                }
+            }
+        } else {
+            // Not in a git repo - task system unavailable
+            // Create minimal task store for in-memory use only
+            const task_store_ptr = try allocator.create(task_store_module.TaskStore);
+            task_store_ptr.* = task_store_module.TaskStore.init(allocator);
+            app.task_store = task_store_ptr;
+            // Note: git_sync and task_db remain null - Beads features disabled
+        }
+
         return app;
     }
 
@@ -380,6 +503,11 @@ pub const App = struct {
             .vector_store = self.vector_store,
             .embedder = self.embedder,
             .agent_registry = &self.agent_registry,
+            .task_store = self.task_store,
+            .task_db = self.task_db,
+            .git_sync = self.git_sync,
+            .conversation_db = if (self.conversation_db) |*db| db else null,
+            .session_id = self.current_conversation_id,
         };
     }
 
@@ -943,6 +1071,17 @@ pub const App = struct {
         // Clean up profile UI if active
         if (self.profile_ui) |*profile_ui| {
             profile_ui.deinit();
+        }
+
+        // Clean up task memory system
+        if (self.task_store) |store| {
+            store.deinit();
+            self.allocator.destroy(store);
+        }
+        if (self.task_db) |db| {
+            var task_db = db;
+            task_db.deinit();
+            self.allocator.destroy(db);
         }
 
         // Clean up conversation database

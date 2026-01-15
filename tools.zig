@@ -18,6 +18,25 @@ const pwd = @import("tools/pwd.zig");
 const add_todo = @import("tools/add_todo.zig");
 const list_todos = @import("tools/list_todos.zig");
 const update_todo = @import("tools/update_todo.zig");
+// Task memory system tools (Beads-inspired)
+const add_task = @import("tools/add_task.zig");
+const list_tasks = @import("tools/list_tasks.zig");
+const get_ready_tasks = @import("tools/get_ready_tasks.zig");
+const add_dependency = @import("tools/add_dependency.zig");
+const complete_task = @import("tools/complete_task.zig");
+const update_task = @import("tools/update_task.zig");
+// New Beads-style tools
+const get_current_task = @import("tools/get_current_task.zig");
+const start_task = @import("tools/start_task.zig");
+const block_task = @import("tools/block_task.zig");
+const add_subtask = @import("tools/add_subtask.zig");
+const get_session_context = @import("tools/get_session_context.zig");
+const land_the_plane = @import("tools/land_the_plane.zig");
+// Task hierarchy and graph tools (zvdb-integrated)
+const get_children = @import("tools/get_children.zig");
+const get_siblings = @import("tools/get_siblings.zig");
+const get_epic_summary = @import("tools/get_epic_summary.zig");
+const sync_to_git = @import("tools/sync_to_git.zig");
 const run_agent = @import("tools/run_agent.zig");
 const list_agents = @import("tools/list_agents.zig");
 const git_status = @import("tools/git_status.zig");
@@ -48,6 +67,7 @@ pub const ToolErrorType = enum {
     io_error,
     parse_error,
     internal_error,
+    invalid_arguments,
 };
 
 pub const ToolResult = struct {
@@ -216,10 +236,32 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try git_pull.getDefinition(allocator));
     try tools.append(allocator, try git_reset.getDefinition(allocator));
 
-    // Todo management tools (Phase 1)
+    // Todo management tools (Phase 1 - legacy, kept for compatibility)
     try tools.append(allocator, try add_todo.getDefinition(allocator));
     try tools.append(allocator, try list_todos.getDefinition(allocator));
     try tools.append(allocator, try update_todo.getDefinition(allocator));
+
+    // Task memory system tools (Beads-inspired)
+    try tools.append(allocator, try add_task.getDefinition(allocator));
+    try tools.append(allocator, try list_tasks.getDefinition(allocator));
+    try tools.append(allocator, try get_ready_tasks.getDefinition(allocator));
+    try tools.append(allocator, try add_dependency.getDefinition(allocator));
+    try tools.append(allocator, try complete_task.getDefinition(allocator));
+    try tools.append(allocator, try update_task.getDefinition(allocator));
+
+    // New Beads-style tools
+    try tools.append(allocator, try get_current_task.getDefinition(allocator));
+    try tools.append(allocator, try start_task.getDefinition(allocator));
+    try tools.append(allocator, try block_task.getDefinition(allocator));
+    try tools.append(allocator, try add_subtask.getDefinition(allocator));
+    try tools.append(allocator, try get_session_context.getDefinition(allocator));
+    try tools.append(allocator, try land_the_plane.getDefinition(allocator));
+
+    // Task hierarchy and graph tools (zvdb-integrated)
+    try tools.append(allocator, try get_children.getDefinition(allocator));
+    try tools.append(allocator, try get_siblings.getDefinition(allocator));
+    try tools.append(allocator, try get_epic_summary.getDefinition(allocator));
+    try tools.append(allocator, try sync_to_git.getDefinition(allocator));
 
     // Agent tools
     try tools.append(allocator, try run_agent.getDefinition(allocator));

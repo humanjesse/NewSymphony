@@ -113,6 +113,8 @@ pub fn execute(
         .vector_store = context.vector_store,
         .embedder = context.embedder,
         .recent_messages = context.recent_messages,
+        .conversation_db = context.conversation_db,
+        .session_id = context.session_id,
     };
 
     // Execute agent

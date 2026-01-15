@@ -82,7 +82,7 @@ pub const ConversationDB = struct {
         );
 
 
-        // Agent executions table
+        // Agent executions table (legacy - kept for backward compatibility)
         try sqlite.exec(self.db,
             \\CREATE TABLE IF NOT EXISTS agent_executions (
             \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,6 +95,42 @@ pub const ConversationDB = struct {
             \\    iterations_used INTEGER DEFAULT 0,
             \\    timestamp INTEGER NOT NULL,
             \\    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+            \\)
+        );
+
+        // Agent invocations table - tracks each agent run with full context
+        try sqlite.exec(self.db,
+            \\CREATE TABLE IF NOT EXISTS agent_invocations (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    session_id INTEGER NOT NULL,
+            \\    parent_message_id INTEGER,
+            \\    agent_name TEXT NOT NULL,
+            \\    task_id TEXT,
+            \\    started_at INTEGER NOT NULL,
+            \\    ended_at INTEGER,
+            \\    status TEXT DEFAULT 'running',
+            \\    result_summary TEXT,
+            \\    tool_calls_made INTEGER DEFAULT 0,
+            \\    iterations_used INTEGER DEFAULT 0,
+            \\    FOREIGN KEY (session_id) REFERENCES conversations(id) ON DELETE CASCADE,
+            \\    FOREIGN KEY (parent_message_id) REFERENCES messages(id)
+            \\)
+        );
+
+        // Agent messages table - full conversation history for each agent invocation
+        try sqlite.exec(self.db,
+            \\CREATE TABLE IF NOT EXISTS agent_messages (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    invocation_id INTEGER NOT NULL,
+            \\    message_index INTEGER NOT NULL,
+            \\    role TEXT NOT NULL,
+            \\    content TEXT NOT NULL,
+            \\    thinking_content TEXT,
+            \\    timestamp INTEGER NOT NULL,
+            \\    tool_call_id TEXT,
+            \\    tool_name TEXT,
+            \\    tool_success INTEGER,
+            \\    FOREIGN KEY (invocation_id) REFERENCES agent_invocations(id) ON DELETE CASCADE
             \\)
         );
 
@@ -126,6 +162,18 @@ pub const ConversationDB = struct {
         try sqlite.exec(self.db,
             \\CREATE INDEX IF NOT EXISTS idx_conversations_profile
             \\ON conversations(profile_name, last_message_at DESC)
+        );
+
+        // Index for agent messages
+        try sqlite.exec(self.db,
+            \\CREATE INDEX IF NOT EXISTS idx_agent_messages_invocation
+            \\ON agent_messages(invocation_id, message_index)
+        );
+
+        // Index for agent invocations by task
+        try sqlite.exec(self.db,
+            \\CREATE INDEX IF NOT EXISTS idx_agent_invocations_task
+            \\ON agent_invocations(task_id)
         );
 
         // Set schema version
@@ -334,5 +382,361 @@ pub const ConversationDB = struct {
     /// Rollback a transaction
     pub fn rollbackTransaction(self: *Self) !void {
         try sqlite.exec(self.db, "ROLLBACK");
+    }
+
+    // ========== Agent Invocation Methods ==========
+
+    /// Create a new agent invocation record
+    pub fn createAgentInvocation(
+        self: *Self,
+        session_id: i64,
+        agent_name: []const u8,
+        task_id: ?[]const u8,
+        parent_message_id: ?i64,
+    ) !i64 {
+        const now = std.time.timestamp();
+
+        const stmt = try sqlite.prepare(self.db,
+            \\INSERT INTO agent_invocations (session_id, parent_message_id, agent_name, task_id, started_at, status)
+            \\VALUES (?, ?, ?, ?, ?, 'running')
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, session_id);
+
+        if (parent_message_id) |msg_id| {
+            try sqlite.bindInt64(stmt, 2, msg_id);
+        } else {
+            try sqlite.bindNull(stmt, 2);
+        }
+
+        try sqlite.bindText(stmt, 3, agent_name);
+
+        if (task_id) |tid| {
+            try sqlite.bindText(stmt, 4, tid);
+        } else {
+            try sqlite.bindNull(stmt, 4);
+        }
+
+        try sqlite.bindInt64(stmt, 5, now);
+
+        _ = try sqlite.step(stmt);
+
+        return sqlite.lastInsertRowId(self.db);
+    }
+
+    /// Save a message within an agent invocation
+    pub fn saveAgentMessage(
+        self: *Self,
+        invocation_id: i64,
+        message_index: i64,
+        role: []const u8,
+        content: []const u8,
+        thinking_content: ?[]const u8,
+        tool_call_id: ?[]const u8,
+        tool_name: ?[]const u8,
+        tool_success: ?bool,
+    ) !i64 {
+        const now = std.time.timestamp();
+
+        const stmt = try sqlite.prepare(self.db,
+            \\INSERT INTO agent_messages (invocation_id, message_index, role, content, thinking_content, timestamp, tool_call_id, tool_name, tool_success)
+            \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, invocation_id);
+        try sqlite.bindInt64(stmt, 2, message_index);
+        try sqlite.bindText(stmt, 3, role);
+        try sqlite.bindText(stmt, 4, content);
+
+        if (thinking_content) |thinking| {
+            try sqlite.bindText(stmt, 5, thinking);
+        } else {
+            try sqlite.bindNull(stmt, 5);
+        }
+
+        try sqlite.bindInt64(stmt, 6, now);
+
+        if (tool_call_id) |tcid| {
+            try sqlite.bindText(stmt, 7, tcid);
+        } else {
+            try sqlite.bindNull(stmt, 7);
+        }
+
+        if (tool_name) |name| {
+            try sqlite.bindText(stmt, 8, name);
+        } else {
+            try sqlite.bindNull(stmt, 8);
+        }
+
+        if (tool_success) |success| {
+            try sqlite.bindInt64(stmt, 9, if (success) 1 else 0);
+        } else {
+            try sqlite.bindNull(stmt, 9);
+        }
+
+        _ = try sqlite.step(stmt);
+
+        return sqlite.lastInsertRowId(self.db);
+    }
+
+    /// Complete an agent invocation (update status and stats)
+    pub fn completeAgentInvocation(
+        self: *Self,
+        invocation_id: i64,
+        status: []const u8,
+        result_summary: ?[]const u8,
+        tool_calls_made: i64,
+        iterations_used: i64,
+    ) !void {
+        const now = std.time.timestamp();
+
+        const stmt = try sqlite.prepare(self.db,
+            \\UPDATE agent_invocations
+            \\SET ended_at = ?, status = ?, result_summary = ?, tool_calls_made = ?, iterations_used = ?
+            \\WHERE id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, now);
+        try sqlite.bindText(stmt, 2, status);
+
+        if (result_summary) |summary| {
+            try sqlite.bindText(stmt, 3, summary);
+        } else {
+            try sqlite.bindNull(stmt, 3);
+        }
+
+        try sqlite.bindInt64(stmt, 4, tool_calls_made);
+        try sqlite.bindInt64(stmt, 5, iterations_used);
+        try sqlite.bindInt64(stmt, 6, invocation_id);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    // ========== Query Methods ==========
+
+    /// Agent invocation query result
+    pub const AgentInvocation = struct {
+        id: i64,
+        session_id: i64,
+        agent_name: []const u8,
+        task_id: ?[]const u8,
+        started_at: i64,
+        ended_at: ?i64,
+        status: []const u8,
+        result_summary: ?[]const u8,
+        tool_calls_made: i64,
+        iterations_used: i64,
+
+        pub fn deinit(self: *AgentInvocation, allocator: Allocator) void {
+            allocator.free(self.agent_name);
+            if (self.task_id) |tid| allocator.free(tid);
+            allocator.free(self.status);
+            if (self.result_summary) |rs| allocator.free(rs);
+        }
+    };
+
+    /// Agent message query result
+    pub const AgentMessage = struct {
+        id: i64,
+        invocation_id: i64,
+        message_index: i64,
+        role: []const u8,
+        content: []const u8,
+        thinking_content: ?[]const u8,
+        timestamp: i64,
+        tool_call_id: ?[]const u8,
+        tool_name: ?[]const u8,
+        tool_success: ?bool,
+
+        pub fn deinit(self: *AgentMessage, allocator: Allocator) void {
+            allocator.free(self.role);
+            allocator.free(self.content);
+            if (self.thinking_content) |tc| allocator.free(tc);
+            if (self.tool_call_id) |tcid| allocator.free(tcid);
+            if (self.tool_name) |tn| allocator.free(tn);
+        }
+    };
+
+    /// Get agent invocations with optional filters
+    pub fn getAgentInvocations(
+        self: *Self,
+        session_id: ?i64,
+        agent_name: ?[]const u8,
+        limit: usize,
+    ) ![]AgentInvocation {
+        var query_buf: [512]u8 = undefined;
+        var query_len: usize = 0;
+
+        const base_query =
+            \\SELECT id, session_id, agent_name, task_id, started_at, ended_at,
+            \\       status, result_summary, tool_calls_made, iterations_used
+            \\FROM agent_invocations WHERE 1=1
+        ;
+        @memcpy(query_buf[0..base_query.len], base_query);
+        query_len = base_query.len;
+
+        if (session_id != null) {
+            const clause = " AND session_id = ?";
+            @memcpy(query_buf[query_len..][0..clause.len], clause);
+            query_len += clause.len;
+        }
+
+        if (agent_name != null) {
+            const clause = " AND agent_name = ?";
+            @memcpy(query_buf[query_len..][0..clause.len], clause);
+            query_len += clause.len;
+        }
+
+        const order = " ORDER BY started_at DESC LIMIT ?";
+        @memcpy(query_buf[query_len..][0..order.len], order);
+        query_len += order.len;
+
+        const stmt = try sqlite.prepare(self.db, query_buf[0..query_len]);
+        defer sqlite.finalize(stmt);
+
+        var bind_idx: usize = 1;
+        if (session_id) |sid| {
+            try sqlite.bindInt64(stmt, @intCast(bind_idx), sid);
+            bind_idx += 1;
+        }
+        if (agent_name) |name| {
+            try sqlite.bindText(stmt, @intCast(bind_idx), name);
+            bind_idx += 1;
+        }
+        try sqlite.bindInt64(stmt, @intCast(bind_idx), @intCast(limit));
+
+        var results = std.ArrayListUnmanaged(AgentInvocation){};
+        errdefer {
+            for (results.items) |*inv| inv.deinit(self.allocator);
+            results.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            const inv = AgentInvocation{
+                .id = sqlite.columnInt64(stmt, 0),
+                .session_id = sqlite.columnInt64(stmt, 1),
+                .agent_name = if (sqlite.columnText(stmt, 2)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .task_id = if (sqlite.columnType(stmt, 3) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 3)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .started_at = sqlite.columnInt64(stmt, 4),
+                .ended_at = if (sqlite.columnType(stmt, 5) != sqlite.SQLITE_NULL) sqlite.columnInt64(stmt, 5) else null,
+                .status = if (sqlite.columnText(stmt, 6)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .result_summary = if (sqlite.columnType(stmt, 7) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 7)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .tool_calls_made = sqlite.columnInt64(stmt, 8),
+                .iterations_used = sqlite.columnInt64(stmt, 9),
+            };
+            try results.append(self.allocator, inv);
+        }
+
+        return results.toOwnedSlice(self.allocator);
+    }
+
+    /// Get all messages for an agent invocation
+    pub fn getAgentMessages(self: *Self, invocation_id: i64) ![]AgentMessage {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT id, invocation_id, message_index, role, content, thinking_content,
+            \\       timestamp, tool_call_id, tool_name, tool_success
+            \\FROM agent_messages WHERE invocation_id = ?
+            \\ORDER BY message_index ASC
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, invocation_id);
+
+        var results = std.ArrayListUnmanaged(AgentMessage){};
+        errdefer {
+            for (results.items) |*msg| msg.deinit(self.allocator);
+            results.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            const msg = AgentMessage{
+                .id = sqlite.columnInt64(stmt, 0),
+                .invocation_id = sqlite.columnInt64(stmt, 1),
+                .message_index = sqlite.columnInt64(stmt, 2),
+                .role = if (sqlite.columnText(stmt, 3)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .content = if (sqlite.columnText(stmt, 4)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .thinking_content = if (sqlite.columnType(stmt, 5) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 5)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .timestamp = sqlite.columnInt64(stmt, 6),
+                .tool_call_id = if (sqlite.columnType(stmt, 7) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 7)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .tool_name = if (sqlite.columnType(stmt, 8) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 8)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .tool_success = if (sqlite.columnType(stmt, 9) != sqlite.SQLITE_NULL)
+                    sqlite.columnInt64(stmt, 9) != 0
+                else
+                    null,
+            };
+            try results.append(self.allocator, msg);
+        }
+
+        return results.toOwnedSlice(self.allocator);
+    }
+
+    /// Get all agent invocations for a specific task
+    pub fn getInvocationsForTask(self: *Self, task_id: []const u8) ![]AgentInvocation {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT id, session_id, agent_name, task_id, started_at, ended_at,
+            \\       status, result_summary, tool_calls_made, iterations_used
+            \\FROM agent_invocations WHERE task_id = ?
+            \\ORDER BY started_at DESC
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, task_id);
+
+        var results = std.ArrayListUnmanaged(AgentInvocation){};
+        errdefer {
+            for (results.items) |*inv| inv.deinit(self.allocator);
+            results.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            const inv = AgentInvocation{
+                .id = sqlite.columnInt64(stmt, 0),
+                .session_id = sqlite.columnInt64(stmt, 1),
+                .agent_name = if (sqlite.columnText(stmt, 2)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .task_id = if (sqlite.columnType(stmt, 3) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 3)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .started_at = sqlite.columnInt64(stmt, 4),
+                .ended_at = if (sqlite.columnType(stmt, 5) != sqlite.SQLITE_NULL) sqlite.columnInt64(stmt, 5) else null,
+                .status = if (sqlite.columnText(stmt, 6)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .result_summary = if (sqlite.columnType(stmt, 7) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 7)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .tool_calls_made = sqlite.columnInt64(stmt, 8),
+                .iterations_used = sqlite.columnInt64(stmt, 9),
+            };
+            try results.append(self.allocator, inv);
+        }
+
+        return results.toOwnedSlice(self.allocator);
     }
 };
