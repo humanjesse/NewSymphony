@@ -109,8 +109,8 @@ pub fn parseAgentFile(
     return try parseMarkdown(allocator, content);
 }
 
-/// Parse markdown content
-fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !AgentConfig {
+/// Parse markdown content (public for use with embedded content)
+pub fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !AgentConfig {
     var name: ?[]const u8 = null;
     var description: ?[]const u8 = null;
     var tools = std.ArrayListUnmanaged([]const u8){};

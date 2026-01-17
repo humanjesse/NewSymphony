@@ -5,6 +5,10 @@ const agents_module = app_module.agents_module; // Get agents from app which has
 const agent_writer = @import("agent_writer");
 const agent_executor = @import("agent_executor");
 
+// Embedded hardcoded agents (compiled into binary)
+const embedded_planner = @embedFile("agents_hardcoded/planner.md");
+const embedded_questioner = @embedFile("agents_hardcoded/questioner.md");
+
 const AgentDefinition = agents_module.AgentDefinition;
 const AgentRegistry = agents_module.AgentRegistry;
 const AgentContext = agents_module.AgentContext;
@@ -94,11 +98,31 @@ pub const AgentLoader = struct {
         try self.loadMarkdownAgents();
     }
 
-    /// Register built-in native Zig agents
+    /// Register built-in native Zig agents (embedded at compile time)
     fn registerNativeAgents(self: *AgentLoader) !void {
-        // Currently no native agents registered
-        // Placeholder for future native agent registrations
-        _ = self;
+        // List of embedded agent contents
+        const embedded_agents = [_][]const u8{
+            embedded_planner,
+            embedded_questioner,
+        };
+
+        for (embedded_agents) |embedded_content| {
+            // Parse the embedded markdown content
+            var config = try agent_writer.parseMarkdown(self.allocator, embedded_content);
+            errdefer config.deinit(self.allocator);
+
+            // Create AgentDefinition from config
+            const definition = try self.createDefinitionFromConfig(&config);
+
+            // Store loaded agent (for memory management)
+            try self.loaded_agents.append(self.allocator, .{
+                .config = config,
+                .definition = definition,
+            });
+
+            // Register in registry
+            try self.registry.register(definition);
+        }
     }
 
     /// Load and register markdown-defined agents
