@@ -348,6 +348,7 @@ pub const GitSync = struct {
             .completed_at = data.completed_at,
             .parent_id = parent_id,
             .blocked_by_count = 0, // Will be computed when loading dependencies
+            .blocked_reason = null, // Not persisted in git sync format
         };
 
         try store.tasks.put(id, task);

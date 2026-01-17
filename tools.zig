@@ -22,6 +22,7 @@ const update_todo = @import("tools/update_todo.zig");
 const add_task = @import("tools/add_task.zig");
 const list_tasks = @import("tools/list_tasks.zig");
 const get_ready_tasks = @import("tools/get_ready_tasks.zig");
+const get_blocked_tasks = @import("tools/get_blocked_tasks.zig");
 const add_dependency = @import("tools/add_dependency.zig");
 const complete_task = @import("tools/complete_task.zig");
 const update_task = @import("tools/update_task.zig");
@@ -39,6 +40,7 @@ const get_epic_summary = @import("tools/get_epic_summary.zig");
 const sync_to_git = @import("tools/sync_to_git.zig");
 const run_agent = @import("tools/run_agent.zig");
 const list_agents = @import("tools/list_agents.zig");
+const planning_done = @import("tools/planning_done.zig");
 const git_status = @import("tools/git_status.zig");
 const git_diff = @import("tools/git_diff.zig");
 const git_log = @import("tools/git_log.zig");
@@ -245,6 +247,7 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try add_task.getDefinition(allocator));
     try tools.append(allocator, try list_tasks.getDefinition(allocator));
     try tools.append(allocator, try get_ready_tasks.getDefinition(allocator));
+    try tools.append(allocator, try get_blocked_tasks.getDefinition(allocator));
     try tools.append(allocator, try add_dependency.getDefinition(allocator));
     try tools.append(allocator, try complete_task.getDefinition(allocator));
     try tools.append(allocator, try update_task.getDefinition(allocator));
@@ -266,6 +269,7 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     // Agent tools
     try tools.append(allocator, try run_agent.getDefinition(allocator));
     try tools.append(allocator, try list_agents.getDefinition(allocator));
+    try tools.append(allocator, try planning_done.getDefinition(allocator));
 
     // Web tools
     try tools.append(allocator, try web_search.getDefinition(allocator));

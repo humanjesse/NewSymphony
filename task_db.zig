@@ -124,8 +124,14 @@ pub const TaskDB = struct {
             \\)
         );
 
+        // Migration: Add blocked_reason column if it doesn't exist
+        // SQLite doesn't have IF NOT EXISTS for ALTER TABLE, so we catch the error
+        sqlite.exec(self.db, "ALTER TABLE tasks ADD COLUMN blocked_reason TEXT") catch {
+            // Column already exists, ignore error
+        };
+
         // Set schema version
-        try self.setMetadata("schema_version", "1");
+        try self.setMetadata("schema_version", "2");
     }
 
     /// Save a task to the database (insert or update)
@@ -151,8 +157,8 @@ pub const TaskDB = struct {
         const stmt = try sqlite.prepare(self.db,
             \\INSERT OR REPLACE INTO tasks (
             \\    id, title, description, status, priority, task_type,
-            \\    labels, created_at, updated_at, completed_at, parent_id
-            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \\    labels, created_at, updated_at, completed_at, parent_id, blocked_reason
+            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         );
         defer sqlite.finalize(stmt);
 
@@ -210,6 +216,15 @@ pub const TaskDB = struct {
             try sqlite.bindNull(stmt, 11);
         }
 
+        // Bind blocked_reason
+        if (task.blocked_reason) |reason| {
+            const reason_z = try self.allocator.dupeZ(u8, reason);
+            defer self.allocator.free(reason_z);
+            try sqlite.bindText(stmt, 12, reason_z);
+        } else {
+            try sqlite.bindNull(stmt, 12);
+        }
+
         _ = try sqlite.step(stmt);
     }
 
@@ -217,7 +232,7 @@ pub const TaskDB = struct {
     pub fn loadTask(self: *Self, task_id: TaskId) !?Task {
         const stmt = try sqlite.prepare(self.db,
             \\SELECT id, title, description, status, priority, task_type,
-            \\       labels, created_at, updated_at, completed_at, parent_id
+            \\       labels, created_at, updated_at, completed_at, parent_id, blocked_reason
             \\FROM tasks WHERE id = ?
         );
         defer sqlite.finalize(stmt);
@@ -238,7 +253,7 @@ pub const TaskDB = struct {
     pub fn loadAllTasks(self: *Self) ![]Task {
         const stmt = try sqlite.prepare(self.db,
             \\SELECT id, title, description, status, priority, task_type,
-            \\       labels, created_at, updated_at, completed_at, parent_id
+            \\       labels, created_at, updated_at, completed_at, parent_id, blocked_reason
             \\FROM tasks
         );
         defer sqlite.finalize(stmt);
@@ -347,6 +362,15 @@ pub const TaskDB = struct {
             }
         }
 
+        // Blocked reason (column 11)
+        const blocked_reason = if (sqlite.columnType(stmt, 11) != sqlite.SQLITE_NULL)
+            if (sqlite.columnText(stmt, 11)) |r|
+                try self.allocator.dupe(u8, r)
+            else
+                null
+        else
+            null;
+
         return Task{
             .id = id,
             .title = title,
@@ -360,6 +384,7 @@ pub const TaskDB = struct {
             .completed_at = completed_at,
             .parent_id = parent_id,
             .blocked_by_count = 0, // Will be recalculated when loading dependencies
+            .blocked_reason = blocked_reason,
         };
     }
 

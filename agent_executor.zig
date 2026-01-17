@@ -112,6 +112,9 @@ pub const AgentExecutor = struct {
     invocation_id: ?i64 = null,
     message_index: i64 = 0,
 
+    // Planning completion flag (set by planning_done tool)
+    planning_complete: bool = false,
+
     // VTable for AgentExecutorInterface
     const vtable = AgentExecutorInterface.VTable{
         .deinit = vtableDeinit,
@@ -411,6 +414,9 @@ pub const AgentExecutor = struct {
                             .name = tool_call.function.name,
                             .success = success,
                             .execution_time_ms = exec_time,
+                            .arguments = tool_call.function.arguments,
+                            .result = tool_result,
+                            .data_size_bytes = tool_result.len,
                         };
                         callback(callback_user_data, .tool_complete, tool_call.function.name, &tool_data);
                     }
@@ -448,6 +454,26 @@ pub const AgentExecutor = struct {
                 .tool_calls_made = self.tool_calls_made,
                 .execution_time_ms = end_time - self.start_time + self.accumulated_time_ms,
             };
+
+            // Check if planning_done tool was called (overrides conversation_mode)
+            if (self.planning_complete) {
+                // Planning phase complete - force completion even in conversation mode
+                self.planning_complete = false; // Reset flag for next time
+
+                // Notify completion
+                if (progress_callback) |callback| {
+                    callback(callback_user_data, .complete, "Planning complete", null);
+                }
+
+                // Complete the invocation record
+                if (context.conversation_db) |db| {
+                    if (self.invocation_id) |inv_id| {
+                        db.completeAgentInvocation(inv_id, "completed", response_content, @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
+                    }
+                }
+
+                return try AgentResult.ok(self.allocator, response_content, stats, final_thinking);
+            }
 
             if (self.capabilities.conversation_mode) {
                 // Conversation mode: agent responded, wait for user input
@@ -556,6 +582,7 @@ pub const AgentExecutor = struct {
             .task_db = agent_context.task_db,
             .git_sync = agent_context.git_sync,
             .agent_registry = agent_context.agent_registry,
+            .planning_complete_ptr = &self.planning_complete,
         };
 
         // Execute tool (look up in tools module)

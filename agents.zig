@@ -18,6 +18,10 @@ pub const ToolProgressData = struct {
     name: []const u8,
     success: bool,
     execution_time_ms: i64,
+    // Display fields for subagent tool call transparency
+    arguments: ?[]const u8 = null, // Tool call arguments JSON
+    result: ?[]const u8 = null, // Tool result (success data or error msg)
+    data_size_bytes: usize = 0, // For display stats
 };
 
 /// Progress update callback function type (shared with GraphRAG)

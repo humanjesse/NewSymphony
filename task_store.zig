@@ -128,6 +128,7 @@ pub const Task = struct {
     completed_at: ?i64,
     parent_id: ?TaskId, // For molecules (epics)
     blocked_by_count: usize, // Cached count of blocking dependencies
+    blocked_reason: ?[]const u8, // Why this task is blocked (owned)
 
     /// Free all owned memory
     pub fn deinit(self: *Task, allocator: Allocator) void {
@@ -139,6 +140,9 @@ pub const Task = struct {
             allocator.free(label);
         }
         allocator.free(self.labels);
+        if (self.blocked_reason) |reason| {
+            allocator.free(reason);
+        }
     }
 };
 
@@ -396,6 +400,7 @@ pub const TaskStore = struct {
             .completed_at = null,
             .parent_id = params.parent_id,
             .blocked_by_count = 0,
+            .blocked_reason = null,
         };
 
         try self.tasks.put(id, task);
@@ -457,6 +462,42 @@ pub const TaskStore = struct {
         task.task_type = new_type;
         task.updated_at = std.time.timestamp();
         self.ready_cache_valid = false;
+    }
+
+    /// Update blocked_reason for a task (used by questioner/evaluator agents)
+    pub fn updateBlockedReason(self: *Self, task_id: TaskId, reason: ?[]const u8) !void {
+        const task = self.tasks.getPtr(task_id) orelse return error.TaskNotFound;
+        // Free existing reason if any
+        if (task.blocked_reason) |old_reason| {
+            self.allocator.free(old_reason);
+        }
+        // Set new reason (or null)
+        task.blocked_reason = if (reason) |r|
+            try self.allocator.dupe(u8, r)
+        else
+            null;
+        task.updated_at = std.time.timestamp();
+    }
+
+    /// Clear blocked_reason for a task (convenience wrapper)
+    pub fn clearBlockedReason(self: *Self, task_id: TaskId) !void {
+        try self.updateBlockedReason(task_id, null);
+    }
+
+    /// Get all blocked tasks that have a blocked_reason set
+    /// Returns tasks that need decomposition by planner
+    pub fn getBlockedTasksWithReasons(self: *Self) ![]Task {
+        var result = std.ArrayListUnmanaged(Task){};
+        errdefer result.deinit(self.allocator);
+
+        var iter = self.tasks.valueIterator();
+        while (iter.next()) |task| {
+            if (task.status == .blocked and task.blocked_reason != null) {
+                try result.append(self.allocator, task.*);
+            }
+        }
+
+        return result.toOwnedSlice(self.allocator);
     }
 
     /// Add a dependency between tasks
@@ -763,7 +804,7 @@ pub const TaskStore = struct {
         for (self.dependencies.items) |dep| {
             if (mem.eql(u8, &dep.dst_id, &task_id) and dep.dep_type.isBlocking()) {
                 if (self.tasks.get(dep.src_id)) |t| {
-                    try result.append(self.allocator, t.*);
+                    try result.append(self.allocator, t);
                 }
             }
         }
@@ -779,7 +820,7 @@ pub const TaskStore = struct {
         for (self.dependencies.items) |dep| {
             if (mem.eql(u8, &dep.src_id, &task_id) and dep.dep_type.isBlocking()) {
                 if (self.tasks.get(dep.dst_id)) |t| {
-                    try result.append(self.allocator, t.*);
+                    try result.append(self.allocator, t);
                 }
             }
         }
@@ -926,7 +967,7 @@ pub const TaskStore = struct {
                 if (self.tasks.get(current.id)) |task| {
                     if (task.status == .pending or task.status == .in_progress) {
                         if (task.task_type != .molecule or current.depth == max_depth) {
-                            try result.append(self.allocator, task.*);
+                            try result.append(self.allocator, task);
                         }
                     }
                 }

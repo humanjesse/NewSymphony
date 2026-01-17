@@ -58,4 +58,8 @@ pub const AppContext = struct {
     // Active agent session for slash command conversations
     // When a user starts an agent with /agentname, session is stored here
     active_agent: ?*ActiveAgentSession = null,
+
+    // Pointer to executor's planning_complete flag (set by planning_done tool)
+    // When set to true, forces conversation_mode agent to complete
+    planning_complete_ptr: ?*bool = null,
 };

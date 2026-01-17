@@ -159,6 +159,8 @@ pub const App = struct {
     agent_result_ready: bool = false,
     agent_result_mutex: std.Thread.Mutex = .{},
     agent_tool_events: std.ArrayListUnmanaged(AgentToolEvent) = .{},
+    // Agent command events (queued from kickback functions for main loop dispatch)
+    agent_command_events: std.ArrayListUnmanaged(app_agents.AgentCommandEvent) = .{},
     // Pending user messages (queued while agent/streaming is active)
     pending_user_messages: std.ArrayListUnmanaged([]const u8) = .{},
     // Available tools for the model
@@ -570,11 +572,29 @@ pub const App = struct {
             result.deinit(self.allocator);
         }
 
+        // Clean up active agent session if any (conversation-mode agents)
+        // This frees the executor and its message history
+        if (self.app_context.active_agent) |session| {
+            // Get the executor through the type-safe interface
+            const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
+            session.executor.deinit(); // Frees message history
+            self.allocator.destroy(executor);
+            self.allocator.free(session.agent_name);
+            self.allocator.destroy(session);
+            self.app_context.active_agent = null;
+        }
+
         // Clean up any pending agent tool events
         for (self.agent_tool_events.items) |event| {
             self.allocator.free(event.tool_name);
         }
         self.agent_tool_events.deinit(self.allocator);
+
+        // Clean up pending agent command events
+        for (self.agent_command_events.items) |*event| {
+            event.deinit(self.allocator);
+        }
+        self.agent_command_events.deinit(self.allocator);
 
         // Clean up pending user messages if any
         for (self.pending_user_messages.items) |msg| {
@@ -817,6 +837,9 @@ pub const App = struct {
                 // Process queued user messages
                 _ = try self.processQueuedMessages();
             }
+
+            // 4b. Process queued agent command events (kickback dispatch)
+            _ = try app_agents.processAgentCommandEvents(self);
 
             // 5. Render (when not streaming)
             if (!self.streaming_active) {

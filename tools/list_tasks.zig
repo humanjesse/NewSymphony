@@ -5,6 +5,7 @@ const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
 const task_store = @import("task_store");
+const html_utils = @import("html_utils");
 
 const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
@@ -135,30 +136,31 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         if (i > 0) try json.append(allocator, ',');
 
         // Escape title for JSON
-        var escaped_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_title.deinit(allocator);
-        for (task.title) |c| {
-            switch (c) {
-                '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                '\r' => try escaped_title.appendSlice(allocator, "\\r"),
-                '\t' => try escaped_title.appendSlice(allocator, "\\t"),
-                else => try escaped_title.append(allocator, c),
-            }
-        }
+        const escaped_title = try html_utils.escapeJSON(allocator, task.title);
+        defer allocator.free(escaped_title);
 
+        // Base task info
         try json.writer(allocator).print(
-            "{{\"id\":\"{s}\",\"title\":\"{s}\",\"status\":\"{s}\",\"priority\":{d},\"type\":\"{s}\",\"blocked_by\":{d}}}",
+            "{{\"id\":\"{s}\",\"title\":\"{s}\",\"status\":\"{s}\",\"priority\":{d},\"type\":\"{s}\",\"blocked_by\":{d}",
             .{
                 &task.id,
-                escaped_title.items,
+                escaped_title,
                 task.status.toString(),
                 task.priority.toInt(),
                 task.task_type.toString(),
                 task.blocked_by_count,
             },
         );
+
+        // Add blocked_reason if present and task is blocked
+        if (task.status == .blocked and task.blocked_reason != null) {
+            const escaped_reason = try html_utils.escapeJSON(allocator, task.blocked_reason.?);
+            defer allocator.free(escaped_reason);
+            try json.writer(allocator).print(",\"blocked_reason\":\"{s}\"", .{escaped_reason});
+        }
+
+        // Close the object
+        try json.append(allocator, '}');
     }
 
     // Add summary

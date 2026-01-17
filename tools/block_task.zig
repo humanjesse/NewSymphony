@@ -103,6 +103,11 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         return ToolResult.err(allocator, .internal_error, "Failed to update task status", start_time);
     };
 
+    // Update blocked_reason on the task
+    store.updateBlockedReason(task_id, reason) catch {
+        return ToolResult.err(allocator, .internal_error, "Failed to update blocked reason", start_time);
+    };
+
     // If blocked_by is specified, add a dependency
     if (parsed.value.object.get("blocked_by")) |v| {
         if (v == .string and v.string.len == 8) {

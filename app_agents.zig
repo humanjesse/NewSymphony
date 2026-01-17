@@ -39,6 +39,37 @@ pub const AgentToolEvent = struct {
     tool_name: []const u8, // Owned, must be freed
     success: bool = true,
     execution_time_ms: i64 = 0,
+    // Display fields for subagent tool call transparency
+    arguments: ?[]const u8 = null, // Owned, must be freed
+    result: ?[]const u8 = null, // Owned, must be freed
+    data_size_bytes: usize = 0,
+};
+
+/// Agent command events for deferred dispatch (breaks recursive error set resolution)
+/// Instead of kickback functions calling handleAgentCommand directly (which creates
+/// recursive error sets), they queue events that the main loop dispatches.
+pub const AgentCommandEvent = union(enum) {
+    start_questioner: struct {
+        task: []const u8, // Owned, must be freed
+        display_text: []const u8, // Owned, must be freed
+    },
+    start_planner: struct {
+        prompt: []const u8, // Owned, must be freed
+        display_text: []const u8, // Owned, must be freed
+    },
+
+    pub fn deinit(self: *AgentCommandEvent, allocator: mem.Allocator) void {
+        switch (self.*) {
+            .start_questioner => |data| {
+                allocator.free(data.task);
+                allocator.free(data.display_text);
+            },
+            .start_planner => |data| {
+                allocator.free(data.prompt);
+                allocator.free(data.display_text);
+            },
+        }
+    }
 };
 
 /// Agent progress context for streaming sub-agent progress to UI
@@ -53,6 +84,43 @@ pub fn freeOllamaTools(allocator: mem.Allocator, tools: []const ollama.Tool) voi
         allocator.free(tool.function.parameters);
     }
     allocator.free(tools);
+}
+
+/// Format tool call display content for subagent tool messages
+/// Matches the format used by main agent's ToolResult.formatDisplay()
+/// Takes individual fields to work with both ToolProgressData and AgentToolEvent
+fn formatToolDisplay(
+    allocator: mem.Allocator,
+    name: []const u8,
+    success: bool,
+    execution_time_ms: i64,
+    arguments: ?[]const u8,
+    result: ?[]const u8,
+    data_size_bytes: usize,
+) ![]const u8 {
+    var display = std.ArrayListUnmanaged(u8){};
+    errdefer display.deinit(allocator);
+    const writer = display.writer(allocator);
+
+    try writer.print("[Tool: {s}] Status: ", .{name});
+    try writer.writeAll(if (success) "✅ SUCCESS" else "❌ FAILED");
+
+    if (result) |r| {
+        const preview_len = @min(r.len, 10000);
+        try writer.print("\nResult: {s}", .{r[0..preview_len]});
+        if (r.len > 10000) {
+            try writer.print("... ({d} more bytes)", .{r.len - 10000});
+        }
+    }
+
+    try writer.print("\nExecution Time: {d}ms", .{execution_time_ms});
+    try writer.print("\nData Size: {d} bytes", .{data_size_bytes});
+
+    if (arguments) |args| {
+        try writer.print("\nArguments: {s}", .{args});
+    }
+
+    return display.toOwnedSlice(allocator);
 }
 
 /// Finalize agent message with nice formatting when agent completes
@@ -152,6 +220,10 @@ pub fn agentProgressCallback(user_data: ?*anyopaque, update_type: agents_module.
             if (ctx.is_background_thread) {
                 const data = tool_data orelse return;
                 const tool_name_copy = allocator.dupe(u8, data.name) catch return;
+                // Copy arguments and result for display
+                const args_copy = if (data.arguments) |a| allocator.dupe(u8, a) catch null else null;
+                const result_copy = if (data.result) |r| allocator.dupe(u8, r) catch null else null;
+
                 ctx.app.agent_result_mutex.lock();
                 defer ctx.app.agent_result_mutex.unlock();
                 ctx.app.agent_tool_events.append(allocator, .{
@@ -159,8 +231,13 @@ pub fn agentProgressCallback(user_data: ?*anyopaque, update_type: agents_module.
                     .tool_name = tool_name_copy,
                     .success = data.success,
                     .execution_time_ms = data.execution_time_ms,
+                    .arguments = args_copy,
+                    .result = result_copy,
+                    .data_size_bytes = data.data_size_bytes,
                 }) catch {
                     allocator.free(tool_name_copy);
+                    if (args_copy) |a| allocator.free(a);
+                    if (result_copy) |r| allocator.free(r);
                     return;
                 };
                 return;
@@ -172,6 +249,27 @@ pub fn agentProgressCallback(user_data: ?*anyopaque, update_type: agents_module.
                 var msg = &ctx.app.messages.items[idx];
                 msg.tool_success = data.success;
                 msg.tool_execution_time = data.execution_time_ms;
+
+                // Format and set display content for tool call transparency
+                const display_content = formatToolDisplay(
+                    allocator,
+                    data.name,
+                    data.success,
+                    data.execution_time_ms,
+                    data.arguments,
+                    data.result,
+                    data.data_size_bytes,
+                ) catch return;
+
+                // Free old empty content
+                allocator.free(msg.content);
+                for (msg.processed_content.items) |*item| {
+                    item.deinit(allocator);
+                }
+                msg.processed_content.deinit(allocator);
+
+                msg.content = display_content;
+                msg.processed_content = markdown.processMarkdown(allocator, display_content) catch .{};
             }
             ctx.current_tool_message_idx = null;
             // Silently ignore redraw failures - UI will update on next event
@@ -231,7 +329,9 @@ pub fn agentThreadFn(ctx: *AgentThreadContext) void {
             .thinking = null,
             .content = null,
             .done = true,
-        }) catch {};
+        }) catch |err| {
+            std.log.warn("Failed to append done chunk: {}", .{err});
+        };
     }
 
     // Store result for main thread to pick up
@@ -247,7 +347,13 @@ pub fn handleAgentCommand(app: *App, agent_name: []const u8, task: ?[]const u8, 
     // If this agent is already active, end the session
     if (app.app_context.active_agent) |active| {
         if (mem.eql(u8, active.agent_name, agent_name)) {
+            // Check if this was the planner being ended - trigger kickback
+            const was_planner = mem.eql(u8, active.agent_name, "planner");
             try endAgentSession(app);
+            if (was_planner) {
+                // Queue kickback event for main loop dispatch
+                triggerKickbackLoop(app);
+            }
             return;
         }
     }
@@ -472,6 +578,10 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
     defer result.deinit(app.allocator);
     const session = app.app_context.active_agent orelse return;
 
+    // Capture agent name before session is cleaned up
+    const agent_name_copy = try app.allocator.dupe(u8, session.agent_name);
+    defer app.allocator.free(agent_name_copy);
+
     if (result.status == .complete or result.status == .failed) {
         // Agent finished - finalize the streamed message and end session
         // The message content was already populated via streaming
@@ -496,12 +606,132 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
             }
         }
 
-        try finalizeAgentStreamedMessage(app, session.agent_name, result.success);
+        try finalizeAgentStreamedMessage(app, agent_name_copy, result.success);
         try endAgentSession(app);
+
+        // Kickback orchestration: trigger questioner after planner completes successfully
+        if (result.success and mem.eql(u8, agent_name_copy, "planner")) {
+            triggerKickbackLoop(app);
+        }
+
+        // Kickback orchestration: when questioner completes, check for blocked tasks
+        if (result.success and mem.eql(u8, agent_name_copy, "questioner")) {
+            handleQuestionerComplete(app);
+        }
     } else if (result.status == .needs_input) {
         // Conversation mode: agent responded, waiting for user input
         // Finalize the streamed message but keep session alive
-        try finalizeAgentStreamedMessage(app, session.agent_name, true);
+        try finalizeAgentStreamedMessage(app, agent_name_copy, true);
+    }
+}
+
+/// Kickback orchestration: planner -> questioner -> planner loop
+/// Queues a questioner start event instead of direct call (avoids recursive error set)
+pub fn triggerKickbackLoop(app: *App) void {
+    // Check if questioner agent exists in registry
+    const registry = app.app_context.agent_registry orelse return;
+    if (registry.get("questioner") == null) {
+        // Questioner not configured, skip kickback
+        return;
+    }
+
+    // Queue event for main loop dispatch (avoids recursive error set resolution)
+    const task = app.allocator.dupe(u8, "Evaluate all ready tasks") catch return;
+    const display = app.allocator.dupe(u8, "/questioner Evaluate all ready tasks") catch {
+        app.allocator.free(task);
+        return;
+    };
+
+    app.agent_command_events.append(app.allocator, .{
+        .start_questioner = .{ .task = task, .display_text = display },
+    }) catch {
+        app.allocator.free(task);
+        app.allocator.free(display);
+    };
+}
+
+/// Handle questioner completion - queue planner event to decompose blocked tasks
+pub fn handleQuestionerComplete(app: *App) void {
+    const task_store = app.app_context.task_store orelse return;
+    const registry = app.app_context.agent_registry orelse return;
+
+    // Check if planner agent exists
+    if (registry.get("planner") == null) {
+        return;
+    }
+
+    // Get blocked tasks that have reasons (need decomposition)
+    const blocked_tasks = task_store.getBlockedTasksWithReasons() catch return;
+    defer app.allocator.free(blocked_tasks);
+
+    if (blocked_tasks.len == 0) {
+        // No blocked tasks, kickback loop complete
+        return;
+    }
+
+    // Build prompt for planner with blocked task info
+    var prompt = std.ArrayListUnmanaged(u8){};
+    defer prompt.deinit(app.allocator);
+
+    prompt.appendSlice(app.allocator, "KICKBACK: The following tasks were blocked by the questioner and need decomposition:\n\n") catch return;
+
+    for (blocked_tasks) |task| {
+        prompt.writer(app.allocator).print("- Task {s}: \"{s}\"\n  Reason: {s}\n\n", .{
+            &task.id,
+            task.title,
+            task.blocked_reason orelse "No reason provided",
+        }) catch return;
+
+        // Clear the blocked_reason so we don't re-process this task
+        task_store.clearBlockedReason(task.id) catch |err| {
+            std.log.warn("Failed to clear blocked reason for task {s}: {}", .{ &task.id, err });
+        };
+    }
+
+    prompt.appendSlice(app.allocator, "Please decompose these tasks into smaller, executable subtasks.") catch return;
+
+    // Create owned copies for the event (these will be freed by event.deinit)
+    const prompt_str = app.allocator.dupe(u8, prompt.items) catch return;
+    const display_text = std.fmt.allocPrint(app.allocator, "/planner [KICKBACK] Decomposing {d} blocked task(s)", .{blocked_tasks.len}) catch {
+        app.allocator.free(prompt_str);
+        return;
+    };
+
+    // Queue event for main loop dispatch (avoids recursive error set resolution)
+    app.agent_command_events.append(app.allocator, .{
+        .start_planner = .{ .prompt = prompt_str, .display_text = display_text },
+    }) catch {
+        app.allocator.free(prompt_str);
+        app.allocator.free(display_text);
+    };
+}
+
+/// Process queued agent command events (main loop calls this)
+/// Returns true if an agent was started, false otherwise
+pub fn processAgentCommandEvents(app: *App) !bool {
+    if (app.agent_command_events.items.len == 0) return false;
+
+    // Don't process if an agent is already running
+    if (app.agent_thread != null) return false;
+    if (app.app_context.active_agent != null) return false;
+
+    // Pop first event (FIFO order)
+    var event = app.agent_command_events.orderedRemove(0);
+    defer event.deinit(app.allocator);
+
+    switch (event) {
+        .start_questioner => |data| {
+            handleAgentCommand(app, "questioner", data.task, data.display_text) catch |err| {
+                std.log.warn("Failed to start questioner in kickback: {}", .{err});
+            };
+            return true;
+        },
+        .start_planner => |data| {
+            handleAgentCommand(app, "planner", data.prompt, data.display_text) catch |err| {
+                std.log.warn("Failed to start planner in kickback: {}", .{err});
+            };
+            return true;
+        },
     }
 }
 
@@ -591,8 +821,12 @@ pub fn processAgentToolEvents(app: *App) !void {
         defer app.allocator.free(events);
         var current_tool_idx: ?usize = null;
 
-        for (events) |event| {
-            defer app.allocator.free(event.tool_name);
+        for (events) |*event| {
+            defer {
+                app.allocator.free(event.tool_name);
+                if (event.arguments) |a| app.allocator.free(a);
+                if (event.result) |r| app.allocator.free(r);
+            }
 
             switch (event.event_type) {
                 .start => {
@@ -621,6 +855,27 @@ pub fn processAgentToolEvents(app: *App) !void {
                         var msg = &app.messages.items[idx];
                         msg.tool_success = event.success;
                         msg.tool_execution_time = event.execution_time_ms;
+
+                        // Format and set display content for tool call transparency
+                        if (formatToolDisplay(
+                            app.allocator,
+                            event.tool_name,
+                            event.success,
+                            event.execution_time_ms,
+                            event.arguments,
+                            event.result,
+                            event.data_size_bytes,
+                        )) |display_content| {
+                            // Free old empty content
+                            app.allocator.free(msg.content);
+                            for (msg.processed_content.items) |*item| {
+                                item.deinit(app.allocator);
+                            }
+                            msg.processed_content.deinit(app.allocator);
+
+                            msg.content = display_content;
+                            msg.processed_content = markdown.processMarkdown(app.allocator, display_content) catch .{};
+                        } else |_| {}
                     }
                     current_tool_idx = null;
                 },
