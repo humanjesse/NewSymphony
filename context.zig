@@ -13,7 +13,16 @@ const task_db_module = @import("task_db");
 const git_sync_module = @import("git_sync");
 const conversation_db_module = @import("conversation_db");
 
-pub const AppContext = struct{
+/// State for an active agent conversation session (slash command mode)
+pub const ActiveAgentSession = struct {
+    /// Type-safe executor interface (use .ptr field to get underlying AgentExecutor when needed)
+    executor: agents_module.AgentExecutorInterface,
+    agent_name: []const u8,
+    system_prompt: []const u8,
+    capabilities: agents_module.AgentCapabilities,
+};
+
+pub const AppContext = struct {
     allocator: std.mem.Allocator,
     config: *const config_module.Config,
     state: *state_module.AppState,
@@ -43,6 +52,10 @@ pub const AppContext = struct{
     // Agent progress callback for real-time streaming
     // Set by app.zig before executing agent-powered tools
     // Allows sub-agents (like file curator) to stream progress to UI
-    agent_progress_callback: ?*const fn (?*anyopaque, ProgressUpdateType, []const u8) void = null,
+    agent_progress_callback: ?agents_module.ProgressCallback = null,
     agent_progress_user_data: ?*anyopaque = null,
+
+    // Active agent session for slash command conversations
+    // When a user starts an agent with /agentname, session is stored here
+    active_agent: ?*ActiveAgentSession = null,
 };

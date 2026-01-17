@@ -83,6 +83,7 @@ pub const AgentConfig = struct {
     tools: []const []const u8,
     system_prompt: []const u8,
     max_iterations: ?usize,
+    conversation_mode: bool,
 
     pub fn deinit(self: *AgentConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -115,6 +116,7 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !AgentConfig
     var tools = std.ArrayListUnmanaged([]const u8){};
     var system_prompt: ?[]const u8 = null;
     var max_iterations: ?usize = null;
+    var conversation_mode: bool = false;
 
     // Clean up on error
     errdefer {
@@ -165,6 +167,8 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !AgentConfig
                 }
             } else if (std.mem.eql(u8, key, "max_iterations")) {
                 max_iterations = try std.fmt.parseInt(usize, value, 10);
+            } else if (std.mem.eql(u8, key, "conversation_mode")) {
+                conversation_mode = std.mem.eql(u8, value, "true");
             }
         }
     }
@@ -180,6 +184,7 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !AgentConfig
         .tools = try tools.toOwnedSlice(allocator),
         .system_prompt = system_prompt.?,
         .max_iterations = max_iterations,
+        .conversation_mode = conversation_mode,
     };
 }
 

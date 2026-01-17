@@ -13,6 +13,8 @@ const AgentStats = agents_module.AgentStats;
 const AgentCapabilities = agents_module.AgentCapabilities;
 const ProgressCallback = agents_module.ProgressCallback;
 const ProgressUpdateType = agents_module.ProgressUpdateType;
+const ToolProgressData = agents_module.ToolProgressData;
+const AgentExecutorInterface = agents_module.AgentExecutorInterface;
 
 /// Context for streaming callback
 const StreamContext = struct {
@@ -36,10 +38,10 @@ fn streamCallback(
     // Notify progress callback
     if (ctx.progress_callback) |callback| {
         if (thinking_chunk) |chunk| {
-            callback(ctx.callback_user_data, .thinking, chunk);
+            callback(ctx.callback_user_data, .thinking, chunk, null);
         }
         if (content_chunk) |chunk| {
-            callback(ctx.callback_user_data, .content, chunk);
+            callback(ctx.callback_user_data, .content, chunk, null);
         }
     }
 
@@ -55,6 +57,17 @@ fn streamCallback(
 
     // Collect tool calls
     if (tool_calls_chunk) |calls| {
+        // Free the incoming chunk after processing (we take ownership from lmstudio.zig)
+        defer {
+            for (calls) |call| {
+                if (call.id) |id| ctx.allocator.free(id);
+                if (call.type) |t| ctx.allocator.free(t);
+                ctx.allocator.free(call.function.name);
+                ctx.allocator.free(call.function.arguments);
+            }
+            ctx.allocator.free(calls);
+        }
+
         for (calls) |call| {
             // Notify progress callback about tool call
             if (ctx.progress_callback) |callback| {
@@ -64,7 +77,7 @@ fn streamCallback(
                     .{call.function.name},
                 ) catch continue;
                 defer ctx.allocator.free(msg);
-                callback(ctx.callback_user_data, .tool_call, msg);
+                callback(ctx.callback_user_data, .tool_call, msg, null);
             }
 
             // Deep copy the tool call
@@ -91,6 +104,36 @@ pub const AgentExecutor = struct {
     // Statistics
     iterations_used: usize = 0,
     tool_calls_made: usize = 0,
+
+    // Pause/resume state (for conversation mode)
+    start_time: i64 = 0,
+    accumulated_time_ms: i64 = 0, // Track time across pause/resume
+    invocation_id: ?i64 = null,
+    message_index: i64 = 0,
+
+    // VTable for AgentExecutorInterface
+    const vtable = AgentExecutorInterface.VTable{
+        .deinit = vtableDeinit,
+        .getMessageHistoryLen = vtableGetMessageHistoryLen,
+    };
+
+    fn vtableDeinit(ptr: *anyopaque) void {
+        const self: *AgentExecutor = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+
+    fn vtableGetMessageHistoryLen(ptr: *anyopaque) usize {
+        const self: *AgentExecutor = @ptrCast(@alignCast(ptr));
+        return self.message_history.items.len;
+    }
+
+    /// Get an interface to this executor for type-safe passing
+    pub fn interface(self: *AgentExecutor) AgentExecutorInterface {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator, capabilities: AgentCapabilities) AgentExecutor {
         return .{
@@ -130,14 +173,13 @@ pub const AgentExecutor = struct {
         progress_callback: ?ProgressCallback,
         callback_user_data: ?*anyopaque,
     ) !AgentResult {
-        const start_time = std.time.milliTimestamp();
+        // Store start time for pause/resume tracking
+        self.start_time = std.time.milliTimestamp();
 
         // Create agent invocation record for persistence (if conversation_db is available)
-        var invocation_id: ?i64 = null;
-        var message_index: i64 = 0;
         if (context.conversation_db) |db| {
             if (context.session_id) |session_id| {
-                invocation_id = db.createAgentInvocation(
+                self.invocation_id = db.createAgentInvocation(
                     session_id,
                     context.system_prompt, // Use system_prompt as agent name identifier
                     context.current_task_id,
@@ -154,9 +196,9 @@ pub const AgentExecutor = struct {
 
         // Persist user message
         if (context.conversation_db) |db| {
-            if (invocation_id) |inv_id| {
-                _ = db.saveAgentMessage(inv_id, message_index, "user", user_task, null, null, null, null) catch {};
-                message_index += 1;
+            if (self.invocation_id) |inv_id| {
+                _ = db.saveAgentMessage(inv_id, self.message_index, "user", user_task, null, null, null, null) catch {};
+                self.message_index += 1;
             }
         }
 
@@ -164,12 +206,63 @@ pub const AgentExecutor = struct {
         const allowed_tools = try self.filterAllowedTools(available_tools);
         defer self.allocator.free(allowed_tools);
 
+        // Execute the iteration loop
+        return try self.executeIterationLoop(context, system_prompt, allowed_tools, progress_callback, callback_user_data);
+    }
+
+    /// Resume execution after user provided input (for conversation mode)
+    /// Call this when AgentResult.status == .needs_input and you have the user's response
+    pub fn resumeWithUserInput(
+        self: *AgentExecutor,
+        context: AgentContext,
+        system_prompt: []const u8,
+        user_response: []const u8,
+        available_tools: []const ollama.Tool,
+        progress_callback: ?ProgressCallback,
+        callback_user_data: ?*anyopaque,
+    ) !AgentResult {
+        // Reset start time for this resume session
+        self.start_time = std.time.milliTimestamp();
+
+        // Add the user's response to message history
+        try self.message_history.append(self.allocator, .{
+            .role = "user",
+            .content = try self.allocator.dupe(u8, user_response),
+        });
+
+        // Persist user message
+        if (context.conversation_db) |db| {
+            if (self.invocation_id) |inv_id| {
+                _ = db.saveAgentMessage(inv_id, self.message_index, "user", user_response, null, null, null, null) catch {};
+                self.message_index += 1;
+            }
+        }
+
+        // Filter tools based on capabilities
+        const allowed_tools = try self.filterAllowedTools(available_tools);
+        defer self.allocator.free(allowed_tools);
+
+        // Execute the iteration loop
+        return try self.executeIterationLoop(context, system_prompt, allowed_tools, progress_callback, callback_user_data);
+    }
+
+    /// Private: shared iteration loop for run() and resumeWithUserInput()
+    fn executeIterationLoop(
+        self: *AgentExecutor,
+        context: AgentContext,
+        system_prompt: []const u8,
+        allowed_tools: []const ollama.Tool,
+        progress_callback: ?ProgressCallback,
+        callback_user_data: ?*anyopaque,
+    ) !AgentResult {
         // Track thinking content across iterations (will contain final thinking)
         var final_thinking: ?[]const u8 = null;
         defer if (final_thinking) |t| self.allocator.free(t);
 
-        // Main iteration loop
-        while (self.iterations_used < self.capabilities.max_iterations) {
+        // Main iteration loop (max_iterations: 0 = infinite)
+        while (self.capabilities.max_iterations == 0 or
+            self.iterations_used < self.capabilities.max_iterations)
+        {
             self.iterations_used += 1;
 
             // Notify progress callback
@@ -180,7 +273,7 @@ pub const AgentExecutor = struct {
                     .{ self.iterations_used, self.capabilities.max_iterations },
                 );
                 defer self.allocator.free(msg);
-                callback(callback_user_data, .iteration, msg);
+                callback(callback_user_data, .iteration, msg, null);
             }
 
             // Prepare streaming context
@@ -194,6 +287,16 @@ pub const AgentExecutor = struct {
             };
             defer stream_ctx.content_buffer.deinit(self.allocator);
             // Note: thinking_buffer is extracted before defer, so don't deinit here
+            // Clean up tool_calls if they weren't transferred (error case)
+            defer {
+                for (stream_ctx.tool_calls.items) |call| {
+                    if (call.id) |id| self.allocator.free(id);
+                    if (call.type) |t| self.allocator.free(t);
+                    self.allocator.free(call.function.name);
+                    self.allocator.free(call.function.arguments);
+                }
+                stream_ctx.tool_calls.deinit(self.allocator);
+            }
 
             // Call LLM
             const model = context.capabilities.model_override orelse context.config.model;
@@ -220,7 +323,7 @@ pub const AgentExecutor = struct {
                 const stats = AgentStats{
                     .iterations_used = self.iterations_used,
                     .tool_calls_made = self.tool_calls_made,
-                    .execution_time_ms = end_time - start_time,
+                    .execution_time_ms = end_time - self.start_time + self.accumulated_time_ms,
                 };
                 const error_msg = try std.fmt.allocPrint(
                     self.allocator,
@@ -231,7 +334,7 @@ pub const AgentExecutor = struct {
 
                 // Complete the invocation record with error status
                 if (context.conversation_db) |db| {
-                    if (invocation_id) |inv_id| {
+                    if (self.invocation_id) |inv_id| {
                         db.completeAgentInvocation(inv_id, "failed", error_msg, @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
                     }
                 }
@@ -265,9 +368,9 @@ pub const AgentExecutor = struct {
 
             // Persist assistant message
             if (context.conversation_db) |db| {
-                if (invocation_id) |inv_id| {
-                    _ = db.saveAgentMessage(inv_id, message_index, "assistant", response_content, final_thinking, null, null, null) catch {};
-                    message_index += 1;
+                if (self.invocation_id) |inv_id| {
+                    _ = db.saveAgentMessage(inv_id, self.message_index, "assistant", response_content, final_thinking, null, null, null) catch {};
+                    self.message_index += 1;
                 }
             }
 
@@ -276,8 +379,26 @@ pub const AgentExecutor = struct {
             if (last_msg.tool_calls) |tool_calls| {
                 // Execute tool calls
                 for (tool_calls) |tool_call| {
+                    // Notify tool_start
+                    if (progress_callback) |callback| {
+                        callback(callback_user_data, .tool_start, tool_call.function.name, null);
+                    }
+
+                    const tool_start_time = std.time.milliTimestamp();
                     const tool_result = try self.executeTool(tool_call, context);
+                    const exec_time = std.time.milliTimestamp() - tool_start_time;
                     defer self.allocator.free(tool_result);
+
+                    // Notify tool_complete with structured data
+                    if (progress_callback) |callback| {
+                        const success = !std.mem.startsWith(u8, tool_result, "Error:");
+                        const tool_data = ToolProgressData{
+                            .name = tool_call.function.name,
+                            .success = success,
+                            .execution_time_ms = exec_time,
+                        };
+                        callback(callback_user_data, .tool_complete, tool_call.function.name, &tool_data);
+                    }
 
                     // Add tool result to message history
                     const tool_call_id = tool_call.id orelse "unknown";
@@ -289,9 +410,9 @@ pub const AgentExecutor = struct {
 
                     // Persist tool message
                     if (context.conversation_db) |db| {
-                        if (invocation_id) |inv_id| {
-                            _ = db.saveAgentMessage(inv_id, message_index, "tool", tool_result, null, tool_call_id, tool_call.function.name, true) catch {};
-                            message_index += 1;
+                        if (self.invocation_id) |inv_id| {
+                            _ = db.saveAgentMessage(inv_id, self.message_index, "tool", tool_result, null, tool_call_id, tool_call.function.name, true) catch {};
+                            self.message_index += 1;
                         }
                     }
 
@@ -301,22 +422,33 @@ pub const AgentExecutor = struct {
                 continue;
             }
 
-            // No tool calls - we're done!
-            // Notify completion
-            if (progress_callback) |callback| {
-                callback(callback_user_data, .complete, "Agent completed");
-            }
-
+            // No tool calls - check if conversation mode
             const end_time = std.time.milliTimestamp();
             const stats = AgentStats{
                 .iterations_used = self.iterations_used,
                 .tool_calls_made = self.tool_calls_made,
-                .execution_time_ms = end_time - start_time,
+                .execution_time_ms = end_time - self.start_time + self.accumulated_time_ms,
             };
+
+            if (self.capabilities.conversation_mode) {
+                // Conversation mode: agent responded, wait for user input
+                // Update accumulated time for next resume
+                self.accumulated_time_ms += end_time - self.start_time;
+
+                var result = try AgentResult.ok(self.allocator, response_content, stats, final_thinking);
+                result.status = .needs_input;
+                return result;
+            }
+
+            // Non-conversation mode: we're done!
+            // Notify completion
+            if (progress_callback) |callback| {
+                callback(callback_user_data, .complete, "Agent completed", null);
+            }
 
             // Complete the invocation record
             if (context.conversation_db) |db| {
-                if (invocation_id) |inv_id| {
+                if (self.invocation_id) |inv_id| {
                     db.completeAgentInvocation(inv_id, "completed", response_content, @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
                 }
             }
@@ -329,12 +461,12 @@ pub const AgentExecutor = struct {
         const stats = AgentStats{
             .iterations_used = self.iterations_used,
             .tool_calls_made = self.tool_calls_made,
-            .execution_time_ms = end_time - start_time,
+            .execution_time_ms = end_time - self.start_time + self.accumulated_time_ms,
         };
 
         // Complete the invocation record with error status
         if (context.conversation_db) |db| {
-            if (invocation_id) |inv_id| {
+            if (self.invocation_id) |inv_id| {
                 db.completeAgentInvocation(inv_id, "failed", "Max iterations reached without completion", @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
             }
         }
@@ -392,20 +524,23 @@ pub const AgentExecutor = struct {
         }
 
         // Build AppContext from AgentContext
-        // Note: Agents don't have full AppContext, but tools expect it
-        // We create a minimal AppContext for tool execution
+        // Pass through all context fields so agents can use any tool
         var app_context = context_module.AppContext{
             .allocator = self.allocator,
             .config = agent_context.config,
-            .state = undefined, // Agents don't have state - tools that need state won't work
+            .state = agent_context.state,
             .llm_provider = agent_context.llm_provider,
             .vector_store = agent_context.vector_store,
             .embedder = agent_context.embedder,
-            .recent_messages = agent_context.recent_messages, // Pass through for context-aware tools (file_curator needs this!)
+            .recent_messages = agent_context.recent_messages,
+            .task_store = agent_context.task_store,
+            .task_db = agent_context.task_db,
+            .git_sync = agent_context.git_sync,
+            .agent_registry = agent_context.agent_registry,
         };
 
         // Execute tool (look up in tools module)
-        const tool_result = tools_module.executeToolCall(
+        var tool_result = tools_module.executeToolCall(
             self.allocator,
             tool_call,
             &app_context,
@@ -416,8 +551,9 @@ pub const AgentExecutor = struct {
                 .{err},
             );
         };
+        defer tool_result.deinit(self.allocator);
 
-        // Format result as string
+        // Format result as string (data is duped, original freed by defer)
         if (tool_result.success) {
             if (tool_result.data) |data| {
                 return try self.allocator.dupe(u8, data);

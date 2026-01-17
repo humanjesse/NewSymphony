@@ -98,9 +98,12 @@ pub fn execute(
         const ProgressDisplayContext = agents_module.ProgressDisplayContext;
         const progress_ctx: *ProgressDisplayContext = @ptrCast(@alignCast(user_data));
 
-        // Free old generic name and set actual agent name
-        allocator.free(progress_ctx.task_name);
+        // Free old name only if it was heap-allocated (not a string literal)
+        if (progress_ctx.task_name_owned) {
+            allocator.free(progress_ctx.task_name);
+        }
         progress_ctx.task_name = try allocator.dupe(u8, agent_def.name);
+        progress_ctx.task_name_owned = true;
     }
 
     // Build agent context
@@ -115,6 +118,7 @@ pub fn execute(
         .recent_messages = context.recent_messages,
         .conversation_db = context.conversation_db,
         .session_id = context.session_id,
+        .state = context.state,
     };
 
     // Execute agent

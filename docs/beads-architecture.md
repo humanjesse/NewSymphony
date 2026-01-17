@@ -4,7 +4,7 @@
 
 Beads is a **work queue and session memory system** for agents. It lets agents wake up knowing what they were working on and what's next. This is NOT a planning tool like Jira—high-level planning happens elsewhere. Beads manages immediate execution work.
 
-**Core principle:** Git is the source of truth (`.tasks/` directory). SQLite is just a fast query cache.
+**Core principle:** SQLite provides crash-safe local persistence. JSONL files in `.tasks/` are the git-friendly format for sharing and collaboration.
 
 ## System Boundaries
 
@@ -71,17 +71,31 @@ Dependencies also have a `weight: f32` field (reserved for future semantic weigh
 ## Storage Architecture
 
 ```
-.tasks/                      # Git-tracked (source of truth)
-├── tasks.jsonl             # All tasks, one JSON per line
-├── dependencies.jsonl      # All dependencies, one JSON per line
-└── SESSION_STATE.md        # Human-readable cold start context
-
-.tasks/tasks.db             # SQLite cache (ephemeral, gitignored)
+.tasks/                      # Per-project, in git root
+├── tasks.jsonl             # Git-tracked (for sharing/collaboration)
+├── dependencies.jsonl      # Git-tracked
+├── SESSION_STATE.md        # Git-tracked (cold start context)
+└── tasks.db                # SQLite (gitignored, crash recovery)
 ```
 
-**Write flow:** Tool → TaskStore (memory) → TaskDB (SQLite) → [on sync] → JSONL + git commit
+### Write Flow
+Tool → TaskStore (memory) → TaskDB (SQLite, immediate)
+                         → [on land_the_plane] → JSONL + git commit
 
-**Read flow (cold start):** JSONL → TaskStore → TaskDB cache → SESSION_STATE.md parsed
+### Read Flow (Cold Start)
+1. SQLite exists with data? → Load from SQLite (preserves unsaved work)
+2. No SQLite but JSONL exists? → Load from JSONL (fresh clone) → Populate SQLite
+3. Neither? → Fresh start
+
+### Crash Recovery
+If app crashes before `land_the_plane`, work is preserved in SQLite.
+On restart, tasks load from SQLite automatically.
+
+### Collaboration Flow
+```
+User A: work → land_the_plane → git push
+User B: git pull → app loads from JSONL (no local SQLite) → SQLite populated
+```
 
 ## Tool Reference
 

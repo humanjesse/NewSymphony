@@ -15,6 +15,7 @@ pub const PermissionRequest = struct {
 pub const Message = struct {
     role: enum { user, assistant, system, tool, display_only_data },
     content: []const u8, // Raw markdown text
+    agent_source: ?[]const u8 = null, // Which agent generated this message (for filtering from main context)
     processed_content: std.ArrayListUnmanaged(markdown.RenderableItem),
     thinking_content: ?[]const u8 = null, // Optional reasoning/thinking content
     processed_thinking_content: ?std.ArrayListUnmanaged(markdown.RenderableItem) = null,

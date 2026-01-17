@@ -152,6 +152,7 @@ pub const AgentLoader = struct {
             .num_ctx = null, // Use default
             .num_predict = -1,
             .enable_thinking = false,
+            .conversation_mode = config.conversation_mode,
         };
 
         return AgentDefinition{

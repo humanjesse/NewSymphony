@@ -146,6 +146,10 @@ pub fn build(b: *std.Build) void {
     agents_module.addImport("zvdb", zvdb_module);
     agents_module.addImport("embedder_interface", embedder_interface_module);
     agents_module.addImport("conversation_db", conversation_db_module);
+    agents_module.addImport("task_store", task_store_module);
+    agents_module.addImport("task_db", task_db_module);
+    agents_module.addImport("git_sync", git_sync_module);
+    agents_module.addImport("state", state_module);
     // Will add tools after it's created
 
     // Now add agents to context_module

@@ -7,20 +7,36 @@ const tools_module = @import("tools");
 const zvdb = @import("zvdb");
 const embedder_interface = @import("embedder_interface");
 const conversation_db_module = @import("conversation_db");
+const task_store_module = @import("task_store");
+const task_db_module = @import("task_db");
+const git_sync_module = @import("git_sync");
+const state_module = @import("state");
+
+/// Structured data for tool completion progress updates
+/// Replaces stringly-typed "name|success|time_ms" format
+pub const ToolProgressData = struct {
+    name: []const u8,
+    success: bool,
+    execution_time_ms: i64,
+};
 
 /// Progress update callback function type (shared with GraphRAG)
-pub const ProgressCallback = *const fn (user_data: ?*anyopaque, update_type: ProgressUpdateType, message: []const u8) void;
+/// - message: Text message for most update types
+/// - tool_data: Structured data for .tool_complete updates (null for other types)
+pub const ProgressCallback = *const fn (user_data: ?*anyopaque, update_type: ProgressUpdateType, message: []const u8, tool_data: ?*const ToolProgressData) void;
 
 /// Types of progress updates during agent execution (shared with GraphRAG)
 pub const ProgressUpdateType = enum {
-    thinking,   // LLM is thinking
-    content,    // LLM produced text content
-    tool_call,  // Made a tool call
-    iteration,  // Starting new iteration
-    complete,   // Task finished
+    thinking,       // LLM is thinking
+    content,        // LLM produced text content
+    tool_call,      // Made a tool call (for stream detection)
+    tool_start,     // Tool execution starting
+    tool_complete,  // Tool execution finished with result
+    iteration,      // Starting new iteration
+    complete,       // Task finished
     // GraphRAG-specific types (backward compatible)
-    embedding,  // Creating embeddings (GraphRAG only)
-    storage,    // Storing in vector DB (GraphRAG only)
+    embedding,      // Creating embeddings (GraphRAG only)
+    storage,        // Storing in vector DB (GraphRAG only)
 };
 
 /// Task-specific metadata for progress display (GraphRAG stats, etc.)
@@ -46,11 +62,27 @@ pub const ProgressDisplayContext = struct {
 
     // Display metadata
     task_name: []const u8 = "Task",  // e.g., "File Curator", "GraphRAG Indexing"
+    task_name_owned: bool = false,   // Whether task_name was allocated and needs freeing
     task_icon: []const u8 = "🤔",    // Custom icon per task type
     start_time: i64 = 0,             // For execution time tracking
 
     // Optional task-specific metadata (for GraphRAG stats, etc.)
     metadata: ?TaskMetadata = null,
+
+    // Track current tool message for updating after completion
+    current_tool_message_idx: ?usize = null,
+
+    // Flag to indicate this is running in a background thread
+    // When true, UI operations (message appends, redraws) should be skipped
+    is_background_thread: bool = false,
+
+    pub fn deinit(self: *ProgressDisplayContext, allocator: std.mem.Allocator) void {
+        self.thinking_buffer.deinit(allocator);
+        self.content_buffer.deinit(allocator);
+        if (self.task_name_owned) {
+            allocator.free(self.task_name);
+        }
+    }
 };
 
 /// Agent capability and resource limits
@@ -78,6 +110,10 @@ pub const AgentCapabilities = struct {
 
     /// Response format (e.g., "json" for structured output)
     format: ?[]const u8 = null,
+
+    /// Conversation mode - agent waits for user input instead of completing
+    /// When true, agent returns .needs_input when it responds without tool calls
+    conversation_mode: bool = false,
 };
 
 /// Execution context provided to agents (controlled subset of AppContext)
@@ -105,6 +141,17 @@ pub const AgentContext = struct {
     conversation_db: ?*conversation_db_module.ConversationDB = null,
     session_id: ?i64 = null,
     current_task_id: ?[]const u8 = null, // Task ID from task_store if working on a specific task
+
+    // Task memory system (for agents that manage tasks)
+    task_store: ?*task_store_module.TaskStore = null,
+    task_db: ?*task_db_module.TaskDB = null,
+    git_sync: ?*git_sync_module.GitSync = null,
+
+    // Application state (for agents that use todos/file tracking)
+    state: *state_module.AppState,
+
+    // Agent registry (for agents that spawn other agents)
+    agent_registry: ?*AgentRegistry = null,
 };
 
 /// Statistics about agent execution
@@ -115,9 +162,19 @@ pub const AgentStats = struct {
     execution_time_ms: i64,
 };
 
+/// Status of agent execution
+pub const AgentStatus = enum {
+    complete, // Agent finished successfully
+    failed, // Agent failed with error
+    needs_input, // Agent responded but needs user input (conversation mode)
+};
+
 /// Result returned by agent execution
 pub const AgentResult = struct {
     success: bool,
+
+    /// Execution status (complete or failed)
+    status: AgentStatus = .complete,
 
     /// Main result data (JSON string or plain text)
     data: ?[]const u8,
@@ -138,6 +195,7 @@ pub const AgentResult = struct {
     pub fn ok(allocator: std.mem.Allocator, data: []const u8, stats: AgentStats, thinking_opt: ?[]const u8) !AgentResult {
         return .{
             .success = true,
+            .status = .complete,
             .data = try allocator.dupe(u8, data),
             .error_message = null,
             .thinking = if (thinking_opt) |t| try allocator.dupe(u8, t) else null,
@@ -149,6 +207,7 @@ pub const AgentResult = struct {
     pub fn err(allocator: std.mem.Allocator, error_msg: []const u8, stats: AgentStats) !AgentResult {
         return .{
             .success = false,
+            .status = .failed,
             .data = null,
             .error_message = try allocator.dupe(u8, error_msg),
             .stats = stats,
@@ -200,6 +259,26 @@ pub const AgentDefinition = struct {
         progress_callback: ?ProgressCallback,
         callback_user_data: ?*anyopaque,
     ) anyerror!AgentResult,
+};
+
+/// Interface for AgentExecutor to avoid circular imports and anyopaque casts
+/// Implemented by agent_executor.AgentExecutor
+pub const AgentExecutorInterface = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        deinit: *const fn (ptr: *anyopaque) void,
+        getMessageHistoryLen: *const fn (ptr: *anyopaque) usize,
+    };
+
+    pub fn deinit(self: AgentExecutorInterface) void {
+        self.vtable.deinit(self.ptr);
+    }
+
+    pub fn getMessageHistoryLen(self: AgentExecutorInterface) usize {
+        return self.vtable.getMessageHistoryLen(self.ptr);
+    }
 };
 
 /// Agent registry for looking up agents by name

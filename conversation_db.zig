@@ -77,6 +77,7 @@ pub const ConversationDB = struct {
             \\    agent_analysis_name TEXT,
             \\    agent_analysis_expanded INTEGER DEFAULT 0,
             \\    agent_analysis_completed INTEGER DEFAULT 0,
+            \\    agent_source TEXT,
             \\    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             \\)
         );
@@ -206,8 +207,9 @@ pub const ConversationDB = struct {
             \\    conversation_id, message_index, role, content, thinking_content,
             \\    timestamp, tool_call_id, thinking_expanded, tool_call_expanded,
             \\    tool_name, tool_success, tool_execution_time,
-            \\    agent_analysis_name, agent_analysis_expanded, agent_analysis_completed
-            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \\    agent_analysis_name, agent_analysis_expanded, agent_analysis_completed,
+            \\    agent_source
+            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         );
         defer sqlite.finalize(stmt);
 
@@ -261,6 +263,12 @@ pub const ConversationDB = struct {
 
         try sqlite.bindInt64(stmt, 14, if (message.agent_analysis_expanded) 1 else 0);
         try sqlite.bindInt64(stmt, 15, if (message.agent_analysis_completed) 1 else 0);
+
+        if (message.agent_source) |source| {
+            try sqlite.bindText(stmt, 16, source);
+        } else {
+            try sqlite.bindNull(stmt, 16);
+        }
 
         _ = try sqlite.step(stmt);
 

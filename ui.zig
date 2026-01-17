@@ -308,6 +308,8 @@ pub fn drawTaskbar(app: *const app_module.App, writer: anytype) !void {
         try writer.print("\x1b[33m⚠️  Permission Required:\x1b[0m Press \x1b[32mA\x1b[0m/\x1b[32mS\x1b[0m/\x1b[36mR\x1b[0m/\x1b[31mD\x1b[0m to respond", .{});
     } else if (app.streaming_active) {
         try writer.print("{s}AI is responding...\x1b[0m (wait for response to finish before sending) | Type '/quit' + Enter to exit", .{status_color});
+    } else if (app.agent_responding) {
+        try writer.print("{s}🤖 Agent is responding...\x1b[0m | Type '/quit' + Enter to exit", .{status_color});
     } else {
         try writer.print("Type '/quit' and press Enter to exit.", .{});
     }
@@ -533,6 +535,33 @@ pub fn handleInput(
                             .not_handled => {
                                 // Fall through to normal message handling
                             },
+                        }
+                    }
+
+                    // Check for agent slash commands (e.g., /agentname or /agentname task)
+                    if (mem.startsWith(u8, app.input_buffer.items, "/")) {
+                        const command = app.input_buffer.items[1..]; // Skip "/"
+
+                        // Check if it's an agent name
+                        if (app.app_context.agent_registry) |registry| {
+                            // Parse: "/agentname" or "/agentname task description"
+                            const space_idx = mem.indexOf(u8, command, " ");
+                            const agent_name = if (space_idx) |idx| command[0..idx] else command;
+
+                            if (registry.has(agent_name)) {
+                                // Handle agent command - pass full input for display
+                                // Treat empty task string as null (handles "/planner " with trailing space)
+                                const task = if (space_idx) |idx| blk: {
+                                    const t = command[idx + 1 ..];
+                                    break :blk if (t.len == 0) null else t;
+                                } else null;
+                                const full_input = try app.allocator.dupe(u8, app.input_buffer.items);
+                                defer app.allocator.free(full_input);
+                                app.input_buffer.clearRetainingCapacity();
+                                should_redraw.* = true;
+                                try app.handleAgentCommand(agent_name, task, full_input);
+                                return false;
+                            }
                         }
                     }
 

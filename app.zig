@@ -22,6 +22,7 @@ const embeddings_module = @import("embeddings");
 const embedder_interface = @import("embedder_interface");
 const lmstudio = @import("lmstudio");
 pub const agents_module = @import("agents"); // Re-export for agent_loader and agent_executor
+const agent_executor = @import("agent_executor");
 const config_editor_state = @import("config_editor_state");
 const config_editor_renderer = @import("config_editor_renderer");
 const config_editor_input = @import("config_editor_input");
@@ -62,9 +63,48 @@ const StreamThreadContext = struct {
     num_predict: isize,
 };
 
+// Thread function context for background agent execution
+const AgentThreadContext = struct {
+    allocator: mem.Allocator,
+    app: *App,
+    executor: *agent_executor.AgentExecutor,
+    agent_context: agents_module.AgentContext,
+    system_prompt: []const u8,
+    user_input: []const u8,
+    available_tools: []const ollama.Tool,
+    progress_ctx: *ProgressDisplayContext,
+    is_continuation: bool,
+
+    /// Clean up all owned allocations
+    pub fn deinit(self: *AgentThreadContext) void {
+        self.progress_ctx.deinit(self.allocator);
+        self.allocator.destroy(self.progress_ctx);
+        self.allocator.free(self.user_input);
+        freeOllamaTools(self.allocator, self.available_tools);
+    }
+};
+
+// Tool event for queuing from background thread to main thread
+const AgentToolEvent = struct {
+    event_type: enum { start, complete },
+    tool_name: []const u8, // Owned, must be freed
+    success: bool = true,
+    execution_time_ms: i64 = 0,
+};
+
 // Agent progress context for streaming sub-agent progress to UI
 // Now uses unified ProgressDisplayContext from agents.zig
 const ProgressDisplayContext = agents_module.ProgressDisplayContext;
+
+/// Free a slice of Ollama tools and their inner string allocations
+fn freeOllamaTools(allocator: mem.Allocator, tools: []const ollama.Tool) void {
+    for (tools) |tool| {
+        allocator.free(tool.function.name);
+        allocator.free(tool.function.description);
+        allocator.free(tool.function.parameters);
+    }
+    allocator.free(tools);
+}
 
 // Finalize agent message with nice formatting when agent completes
 // Now uses unified finalization from message_renderer
@@ -72,120 +112,105 @@ fn finalizeAgentMessage(ctx: *ProgressDisplayContext) !void {
     return message_renderer.finalizeProgressMessage(ctx);
 }
 
-// Progress callback for sub-agents (e.g., file curator) - streams to UI in real-time
-fn agentProgressCallback(user_data: ?*anyopaque, update_type: agents_module.ProgressUpdateType, message: []const u8) void {
+// Progress callback for sub-agents - only handles tool display messages
+// Thinking/content accumulation happens here but final response comes from handleAgentResult
+fn agentProgressCallback(user_data: ?*anyopaque, update_type: agents_module.ProgressUpdateType, message: []const u8, tool_data: ?*const agents_module.ToolProgressData) void {
     const ctx = @as(*ProgressDisplayContext, @ptrCast(@alignCast(user_data orelse return)));
     const allocator = ctx.app.allocator;
 
-    // Accumulate the message content based on type
     switch (update_type) {
         .thinking => {
+            // Accumulate thinking for potential use, but don't create streaming message
+            // The final response with thinking will come from handleAgentResult
+            // Silently ignore allocation failures in UI callback - non-critical path
             ctx.thinking_buffer.appendSlice(allocator, message) catch return;
         },
         .content => {
+            // Accumulate content for potential use, but don't create streaming message
+            // The final response will come from handleAgentResult
+            // Silently ignore allocation failures in UI callback - non-critical path
             ctx.content_buffer.appendSlice(allocator, message) catch return;
         },
         .complete => {
-            // Agent finished - finalize the message with nice formatting
-            if (!ctx.finalized and ctx.current_message_idx != null) {
-                ctx.finalized = true;
-                finalizeAgentMessage(ctx) catch return;
-                return;  // finalizeAgentMessage handles redraw
-            }
+            // Agent finished - nothing to do here
+            // handleAgentResult will create the final message
         },
         .iteration, .tool_call => {
-            // Status updates - could log these or show in UI
-            // For now, just continue accumulating
+            // Status updates - ignore
+        },
+        .tool_start => {
+            // Queue event for main thread when running in background
+            if (ctx.is_background_thread) {
+                const tool_name_copy = allocator.dupe(u8, message) catch return;
+                ctx.app.agent_result_mutex.lock();
+                defer ctx.app.agent_result_mutex.unlock();
+                ctx.app.agent_tool_events.append(allocator, .{
+                    .event_type = .start,
+                    .tool_name = tool_name_copy,
+                }) catch {
+                    allocator.free(tool_name_copy);
+                    return;
+                };
+                return;
+            }
+
+            // Add placeholder tool message (will be updated on complete)
+            // Silently ignore allocation failures in UI callback - non-critical path
+            const tool_name = allocator.dupe(u8, message) catch return;
+            errdefer allocator.free(tool_name);
+
+            const content = allocator.dupe(u8, "") catch return;
+            errdefer allocator.free(content);
+
+            ctx.app.messages.append(allocator, .{
+                .role = .display_only_data,
+                .content = content,
+                .processed_content = .{},
+                .timestamp = std.time.milliTimestamp(),
+                .tool_call_expanded = false,
+                .tool_name = tool_name,
+                .tool_success = null,
+                .tool_execution_time = null,
+            }) catch return;
+            // On success, ownership transferred to messages array
+            ctx.current_tool_message_idx = ctx.app.messages.items.len - 1;
+            // Silently ignore redraw failures - UI will update on next event
+            _ = message_renderer.redrawScreen(ctx.app) catch return;
+        },
+        .tool_complete => {
+            // Queue event for main thread when running in background
+            if (ctx.is_background_thread) {
+                const data = tool_data orelse return;
+                const tool_name_copy = allocator.dupe(u8, data.name) catch return;
+                ctx.app.agent_result_mutex.lock();
+                defer ctx.app.agent_result_mutex.unlock();
+                ctx.app.agent_tool_events.append(allocator, .{
+                    .event_type = .complete,
+                    .tool_name = tool_name_copy,
+                    .success = data.success,
+                    .execution_time_ms = data.execution_time_ms,
+                }) catch {
+                    allocator.free(tool_name_copy);
+                    return;
+                };
+                return;
+            }
+
+            // Read from structured tool_data instead of parsing string
+            const data = tool_data orelse return;
+            if (ctx.current_tool_message_idx) |idx| {
+                var msg = &ctx.app.messages.items[idx];
+                msg.tool_success = data.success;
+                msg.tool_execution_time = data.execution_time_ms;
+            }
+            ctx.current_tool_message_idx = null;
+            // Silently ignore redraw failures - UI will update on next event
+            _ = message_renderer.redrawScreen(ctx.app) catch return;
         },
         .embedding, .storage => {
             // Embedding/storage updates not used in current architecture
-            // Just ignore for agent callbacks
         },
     }
-
-    // Find or create the progress message
-    if (ctx.current_message_idx == null) {
-        // Capture start time if not already set
-        if (ctx.start_time == 0) {
-            ctx.start_time = std.time.milliTimestamp();
-        }
-
-        // Create new system message for this agent progress
-        // Start with simple message, will be formatted nicely on completion
-        const display_content = allocator.dupe(u8, "🤔 Analyzing...") catch return;
-        const content_processed = markdown.processMarkdown(allocator, display_content) catch return;
-
-        // Duplicate task name for message
-        const task_name_copy = allocator.dupe(u8, ctx.task_name) catch return;
-
-        ctx.app.messages.append(allocator, .{
-            .role = .display_only_data,
-            .content = display_content,
-            .processed_content = content_processed,
-            .thinking_content = null,
-            .processed_thinking_content = null,
-            .thinking_expanded = false,
-            .timestamp = std.time.milliTimestamp(),
-            // Agent analysis metadata (NEW - for streaming + collapsible display)
-            .agent_analysis_name = task_name_copy,
-            .agent_analysis_expanded = true,  // Expanded during streaming (shows content)
-            .agent_analysis_completed = false,  // Not done yet (no collapse button)
-            // Keep tool_execution_time for display (but not using tool collapse)
-            .tool_call_expanded = false,
-            .tool_name = null,
-            .tool_success = null,
-            .tool_execution_time = null,  // Will be set on completion
-        }) catch return;
-
-        ctx.current_message_idx = ctx.app.messages.items.len - 1;
-    } else {
-        // Update existing message with streaming content
-        const idx = ctx.current_message_idx.?;
-        var msg = &ctx.app.messages.items[idx];
-
-        // Free old content
-        allocator.free(msg.content);
-        for (msg.processed_content.items) |*item| {
-            item.deinit(allocator);
-        }
-        msg.processed_content.deinit(allocator);
-
-        if (msg.thinking_content) |tc| allocator.free(tc);
-        if (msg.processed_thinking_content) |*ptc| {
-            for (ptc.items) |*item| {
-                item.deinit(allocator);
-            }
-            ptc.deinit(allocator);
-        }
-
-        // During streaming, just show raw accumulated content (thinking + content)
-        var combined = std.ArrayListUnmanaged(u8){};
-        defer combined.deinit(allocator);
-
-        if (ctx.thinking_buffer.items.len > 0) {
-            combined.appendSlice(allocator, ctx.thinking_buffer.items) catch return;
-            if (ctx.content_buffer.items.len > 0) {
-                combined.appendSlice(allocator, "\n\n") catch return;
-            }
-        }
-        if (ctx.content_buffer.items.len > 0) {
-            combined.appendSlice(allocator, ctx.content_buffer.items) catch return;
-        }
-
-        const display_content = if (combined.items.len > 0)
-            allocator.dupe(u8, combined.items) catch return
-        else
-            allocator.dupe(u8, "🤔 Analyzing...") catch return;
-
-        msg.content = display_content;
-        msg.processed_content = markdown.processMarkdown(allocator, display_content) catch return;
-        msg.thinking_content = null;
-        msg.processed_thinking_content = null;
-    }
-
-    // Redraw screen to show progress
-    _ = message_renderer.redrawScreen(ctx.app) catch return;
-    ctx.app.updateCursorToBottom();
 }
 
 // Define available tools for the model
@@ -275,10 +300,19 @@ pub const App = struct {
     last_resize_time: i64 = 0,
     // Streaming state
     streaming_active: bool = false,
+    // Agent responding state (for status indicator)
+    agent_responding: bool = false,
     stream_mutex: std.Thread.Mutex = .{},
     stream_chunks: std.ArrayListUnmanaged(StreamChunk) = .{},
     stream_thread: ?std.Thread = null,
     stream_thread_ctx: ?*StreamThreadContext = null,
+    // Agent thread state (for non-blocking agent execution)
+    agent_thread: ?std.Thread = null,
+    agent_thread_ctx: ?*AgentThreadContext = null,
+    agent_result: ?agents_module.AgentResult = null,
+    agent_result_ready: bool = false,
+    agent_result_mutex: std.Thread.Mutex = .{},
+    agent_tool_events: std.ArrayListUnmanaged(AgentToolEvent) = .{},
     // Available tools for the model
     tools: []const ollama.Tool,
     // Tool execution state
@@ -323,9 +357,11 @@ pub const App = struct {
 
     pub fn init(allocator: mem.Allocator, config: Config) !App {
         const tools = try createTools(allocator);
+        errdefer freeOllamaTools(allocator, tools);
 
         // Initialize permission manager
         var perm_manager = try permission.PermissionManager.init(allocator, ".", null); // No audit log by default
+        errdefer perm_manager.deinit();
         const tool_metadata = try tools_module.getPermissionMetadata(allocator);
         defer allocator.free(tool_metadata);
         try perm_manager.registerTools(tool_metadata);
@@ -694,6 +730,52 @@ pub const App = struct {
         ctx.app.stream_chunks.append(ctx.allocator, done_chunk) catch return;
     }
 
+    // Background thread function for agent execution
+    fn agentThreadFn(ctx: *AgentThreadContext) void {
+        // Helper to create error result
+        const makeErrorResult = struct {
+            fn f(allocator: mem.Allocator, err: anyerror) agents_module.AgentResult {
+                return .{
+                    .success = false,
+                    .status = .failed,
+                    .data = null,
+                    .error_message = std.fmt.allocPrint(allocator, "Agent error: {s}", .{@errorName(err)}) catch null,
+                    .stats = .{
+                        .iterations_used = 0,
+                        .tool_calls_made = 0,
+                        .execution_time_ms = 0,
+                    },
+                };
+            }
+        }.f;
+
+        // Run the agent (blocking in this thread, non-blocking from main thread's perspective)
+        const result: agents_module.AgentResult = if (ctx.is_continuation)
+            ctx.executor.resumeWithUserInput(
+                ctx.agent_context,
+                ctx.system_prompt,
+                ctx.user_input,
+                ctx.available_tools,
+                agentProgressCallback,
+                @ptrCast(ctx.progress_ctx),
+            ) catch |err| makeErrorResult(ctx.allocator, err)
+        else
+            ctx.executor.run(
+                ctx.agent_context,
+                ctx.system_prompt,
+                ctx.user_input,
+                ctx.available_tools,
+                agentProgressCallback,
+                @ptrCast(ctx.progress_ctx),
+            ) catch |err| makeErrorResult(ctx.allocator, err);
+
+        // Store result for main thread to pick up
+        ctx.app.agent_result_mutex.lock();
+        defer ctx.app.agent_result_mutex.unlock();
+        ctx.app.agent_result = result;
+        ctx.app.agent_result_ready = true;
+    }
+
 
     // Compress message history by replacing read_file results with Graph RAG summaries
     // REMOVED: GraphRAG compression no longer needed
@@ -715,6 +797,9 @@ pub const App = struct {
         for (self.messages.items) |msg| {
             // Skip display_only_data messages - they're UI-only notifications
             if (msg.role == .display_only_data) continue;
+
+            // Skip subagent messages - they have their own isolated context
+            if (msg.agent_source != null) continue;
 
             const role_str = switch (msg.role) {
                 .user => "user",
@@ -793,6 +878,13 @@ pub const App = struct {
 
     // Send a message and get streaming response from Ollama (non-blocking)
     pub fn sendMessage(self: *App, user_text: []const u8, format: ?[]const u8) !void {
+        // If agent is active, route to agent instead
+        if (self.app_context.active_agent != null) {
+            // For continuation messages, display_text is same as user_text (no slash prefix)
+            try self.sendToAgent(user_text, null);
+            return;
+        }
+
         // Reset tool call depth for new user messages
         self.tool_call_depth = 0;
 
@@ -824,6 +916,272 @@ pub const App = struct {
 
         // 2. Start streaming
         try self.startStreaming(format);
+    }
+
+    /// Handle agent slash command (e.g., /agentname or /agentname task)
+    /// full_input is the complete user input for display (e.g., "/planner hello")
+    pub fn handleAgentCommand(self: *App, agent_name: []const u8, task: ?[]const u8, full_input: []const u8) !void {
+        // If this agent is already active, end the session
+        if (self.app_context.active_agent) |active| {
+            if (mem.eql(u8, active.agent_name, agent_name)) {
+                try self.endAgentSession();
+                return;
+            }
+        }
+
+        // If a different agent is active, end it first
+        if (self.app_context.active_agent != null) {
+            try self.endAgentSession();
+        }
+
+        // Start new agent session if task provided
+        if (task) |t| {
+            try self.startAgentSession(agent_name, t, full_input);
+        } else {
+            // Just `/agentname` with no task - show usage hint
+            const hint_content = try std.fmt.allocPrint(
+                self.allocator,
+                "🤖 **{s}** - Type `/{s} <your task>` to start a conversation, or `/{s}` to end an active session.",
+                .{ agent_name, agent_name, agent_name },
+            );
+            const hint_processed = try markdown.processMarkdown(self.allocator, hint_content);
+
+            try self.messages.append(self.allocator, .{
+                .role = .display_only_data,
+                .content = hint_content,
+                .processed_content = hint_processed,
+                .thinking_expanded = false,
+                .timestamp = std.time.milliTimestamp(),
+            });
+            _ = try message_renderer.redrawScreen(self);
+        }
+    }
+
+    /// Start a new agent conversation session
+    /// display_text is the full user input for display (e.g., "/planner hello")
+    fn startAgentSession(self: *App, agent_name: []const u8, initial_task: []const u8, display_text: []const u8) !void {
+        const registry = self.app_context.agent_registry orelse return;
+        const agent_def = registry.get(agent_name) orelse return;
+
+        // Create heap-allocated executor
+        const executor = try self.allocator.create(agent_executor.AgentExecutor);
+        executor.* = agent_executor.AgentExecutor.init(self.allocator, agent_def.capabilities);
+
+        // Create session state with type-safe executor interface
+        const session = try self.allocator.create(context_module.ActiveAgentSession);
+        session.* = .{
+            .executor = executor.interface(),
+            .agent_name = try self.allocator.dupe(u8, agent_name),
+            .system_prompt = agent_def.system_prompt,
+            .capabilities = agent_def.capabilities,
+        };
+        self.app_context.active_agent = session;
+
+        // Send initial task to agent - pass display_text for the user message
+        try self.sendToAgent(initial_task, display_text);
+    }
+
+    /// Send user input to the active agent (non-blocking)
+    /// display_text: optional text to show in UI (e.g., "/planner hello"), if null uses user_input
+    fn sendToAgent(self: *App, user_input: []const u8, display_text: ?[]const u8) !void {
+        const session = self.app_context.active_agent orelse return;
+
+        // Use display_text if provided, otherwise use user_input for display
+        const message_to_show = display_text orelse user_input;
+
+        // Display user message with full text (including slash command if initial)
+        const user_content = try self.allocator.dupe(u8, message_to_show);
+        const user_processed = try markdown.processMarkdown(self.allocator, user_content);
+
+        try self.messages.append(self.allocator, .{
+            .role = .user,
+            .content = user_content,
+            .agent_source = try self.allocator.dupe(u8, session.agent_name),
+            .processed_content = user_processed,
+            .thinking_expanded = true,
+            .timestamp = std.time.milliTimestamp(),
+        });
+        try self.persistMessage(self.messages.items.len - 1);
+
+        // Set agent responding flag BEFORE redraw so taskbar shows status
+        self.agent_responding = true;
+        _ = try message_renderer.redrawScreen(self);
+
+        // Get the executor through the type-safe interface
+        const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
+
+        // Check if this is initial message or continuation
+        const is_continuation = executor.message_history.items.len > 0;
+
+        // Allocate thread context and owned data
+        const thread_ctx = try self.allocator.create(AgentThreadContext);
+        errdefer self.allocator.destroy(thread_ctx);
+
+        // Allocate progress context on heap (owned by thread)
+        const progress_ctx = try self.allocator.create(ProgressDisplayContext);
+        errdefer self.allocator.destroy(progress_ctx);
+        progress_ctx.* = .{
+            .app = self,
+            .task_name = try self.allocator.dupe(u8, session.agent_name),
+            .task_name_owned = true,
+            .task_icon = "🤖",
+            .start_time = std.time.milliTimestamp(),
+            .is_background_thread = true, // Skip UI operations from background thread
+        };
+
+        // Get available tools (owned by thread context)
+        const available_tools = try tools_module.getOllamaTools(self.allocator);
+
+        // Dupe user_input for thread ownership
+        const owned_user_input = try self.allocator.dupe(u8, user_input);
+
+        // Build agent context with full access to app resources
+        const agent_context = agents_module.AgentContext{
+            .allocator = self.allocator,
+            .llm_provider = &self.llm_provider,
+            .config = &self.config,
+            .system_prompt = session.system_prompt,
+            .capabilities = session.capabilities,
+            .vector_store = self.app_context.vector_store,
+            .embedder = self.app_context.embedder,
+            .recent_messages = null,
+            .conversation_db = self.app_context.conversation_db,
+            .session_id = self.app_context.session_id,
+            // Task memory system
+            .task_store = self.app_context.task_store,
+            .task_db = self.app_context.task_db,
+            .git_sync = self.app_context.git_sync,
+            // Application state for todo/file tracking
+            .state = self.app_context.state,
+            // Agent registry for nested agent calls
+            .agent_registry = self.app_context.agent_registry,
+        };
+
+        thread_ctx.* = .{
+            .allocator = self.allocator,
+            .app = self,
+            .executor = executor,
+            .agent_context = agent_context,
+            .system_prompt = session.system_prompt,
+            .user_input = owned_user_input,
+            .available_tools = available_tools,
+            .progress_ctx = progress_ctx,
+            .is_continuation = is_continuation,
+        };
+
+        // Store context and spawn thread
+        self.agent_thread_ctx = thread_ctx;
+        self.agent_thread = try std.Thread.spawn(.{}, agentThreadFn, .{thread_ctx});
+
+        // Returns immediately - main event loop polls for completion
+    }
+
+    /// Helper to create and display an agent response message
+    fn createAgentResponseMessage(
+        self: *App,
+        agent_name: []const u8,
+        response_text: []const u8,
+        thinking: ?[]const u8,
+    ) !void {
+        const response_content = try self.allocator.dupe(u8, response_text);
+        const response_processed = try markdown.processMarkdown(self.allocator, response_content);
+
+        // Include thinking content if available
+        var thinking_content: ?[]const u8 = null;
+        var processed_thinking: ?std.ArrayListUnmanaged(markdown.RenderableItem) = null;
+        if (thinking) |t| {
+            thinking_content = try self.allocator.dupe(u8, t);
+            processed_thinking = try markdown.processMarkdown(self.allocator, thinking_content.?);
+        }
+
+        try self.messages.append(self.allocator, .{
+            .role = .assistant,
+            .content = response_content,
+            .agent_source = try self.allocator.dupe(u8, agent_name),
+            .processed_content = response_processed,
+            .thinking_content = thinking_content,
+            .processed_thinking_content = processed_thinking,
+            .thinking_expanded = false,
+            .timestamp = std.time.milliTimestamp(),
+        });
+        try self.persistMessage(self.messages.items.len - 1);
+        _ = try message_renderer.redrawScreen(self);
+    }
+
+    /// Handle the result from an agent execution
+    fn handleAgentResult(self: *App, result: *agents_module.AgentResult) !void {
+        defer result.deinit(self.allocator);
+        const session = self.app_context.active_agent orelse return;
+
+        if (result.status == .complete or result.status == .failed) {
+            // Agent finished - display result and end session
+            const response_text = if (result.success)
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "🤖 **{s}**:\n\n{s}",
+                    .{ session.agent_name, result.data orelse "(no output)" },
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "🤖 **{s}** failed:\n\n{s}",
+                    .{ session.agent_name, result.error_message orelse "unknown error" },
+                );
+            defer self.allocator.free(response_text);
+
+            try self.createAgentResponseMessage(session.agent_name, response_text, result.thinking);
+            try self.endAgentSession();
+        } else if (result.status == .needs_input) {
+            // Conversation mode: agent responded, waiting for user input
+            // Display response but keep session alive for follow-up messages
+            if (result.data) |data| {
+                const response_text = try std.fmt.allocPrint(
+                    self.allocator,
+                    "🤖 **{s}**:\n\n{s}",
+                    .{ session.agent_name, data },
+                );
+                defer self.allocator.free(response_text);
+
+                try self.createAgentResponseMessage(session.agent_name, response_text, result.thinking);
+            }
+        }
+    }
+
+    /// End the current agent conversation session
+    pub fn endAgentSession(self: *App) !void {
+        const session = self.app_context.active_agent orelse return;
+
+        // FIRST: Mark session as ended so new messages don't route here
+        // This must happen before any operations that can throw
+        self.app_context.active_agent = null;
+
+        // Ensure session cleanup happens regardless of later errors
+        defer {
+            self.allocator.free(session.agent_name);
+            self.allocator.destroy(session);
+        }
+
+        // Clean up executor through the type-safe interface
+        const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
+        session.executor.deinit(); // Use interface method for type safety
+        self.allocator.destroy(executor);
+
+        // Show session ended message (can throw, session cleanup is deferred)
+        const end_content = try std.fmt.allocPrint(
+            self.allocator,
+            "🤖 **{s}** session ended.",
+            .{session.agent_name},
+        );
+        const end_processed = try markdown.processMarkdown(self.allocator, end_content);
+
+        try self.messages.append(self.allocator, .{
+            .role = .display_only_data,
+            .content = end_content,
+            .processed_content = end_processed,
+            .thinking_expanded = false,
+            .timestamp = std.time.milliTimestamp(),
+        });
+        _ = try message_renderer.redrawScreen(self);
     }
 
     // Helper function to show permission prompt (non-blocking)
@@ -896,12 +1254,11 @@ pub const App = struct {
         var agent_progress_ctx = ProgressDisplayContext{
             .app = self,
             .task_name = try self.allocator.dupe(u8, "Agent Analysis"), // Generic default (will be updated by run_agent tool)
+            .task_name_owned = true, // We allocated task_name, so we own it
             .task_icon = "🤔", // Default icon for file analysis
             .start_time = std.time.milliTimestamp(), // Start tracking execution time
         };
-        defer agent_progress_ctx.thinking_buffer.deinit(self.allocator);
-        defer agent_progress_ctx.content_buffer.deinit(self.allocator);
-        defer self.allocator.free(agent_progress_ctx.task_name);
+        defer agent_progress_ctx.deinit(self.allocator);
 
         self.app_context.agent_progress_callback = agentProgressCallback;
         self.app_context.agent_progress_user_data = &agent_progress_ctx;
@@ -937,6 +1294,28 @@ pub const App = struct {
 
             self.allocator.destroy(ctx);
         }
+
+        // Wait for agent thread to finish if active
+        if (self.agent_thread) |thread| {
+            thread.join();
+        }
+
+        // Clean up agent thread context if it exists
+        if (self.agent_thread_ctx) |ctx| {
+            ctx.deinit();
+            self.allocator.destroy(ctx);
+        }
+
+        // Clean up agent result if pending
+        if (self.agent_result) |*result| {
+            result.deinit(self.allocator);
+        }
+
+        // Clean up any pending agent tool events
+        for (self.agent_tool_events.items) |event| {
+            self.allocator.free(event.tool_name);
+        }
+        self.agent_tool_events.deinit(self.allocator);
 
         // Clean up stream chunks
         for (self.stream_chunks.items) |chunk| {
@@ -995,6 +1374,11 @@ pub const App = struct {
             if (message.agent_analysis_name) |name| {
                 self.allocator.free(name);
             }
+
+            // Clean up agent source (for subagent message filtering)
+            if (message.agent_source) |source| {
+                self.allocator.free(source);
+            }
         }
         self.messages.deinit(self.allocator);
         self.llm_provider.deinit();
@@ -1004,12 +1388,7 @@ pub const App = struct {
         self.saved_expansion_states.deinit(self.allocator);
 
         // Clean up tools
-        for (self.tools) |tool| {
-            self.allocator.free(tool.function.name);
-            self.allocator.free(tool.function.description);
-            self.allocator.free(tool.function.parameters);
-        }
-        self.allocator.free(self.tools);
+        freeOllamaTools(self.allocator, self.tools);
 
         // Clean up pending tool calls if any
         if (self.pending_tool_calls) |calls| {
@@ -1082,6 +1461,17 @@ pub const App = struct {
             var task_db = db;
             task_db.deinit();
             self.allocator.destroy(db);
+        }
+
+        // Clean up git sync
+        if (self.git_sync) |sync| {
+            sync.deinit();
+            self.allocator.destroy(sync);
+        }
+
+        // Clean up git root path
+        if (self.git_root) |root| {
+            self.allocator.free(root);
         }
 
         // Clean up conversation database
@@ -1831,6 +2221,92 @@ pub const App = struct {
                 }
             }
 
+            // Check for agent completion (non-blocking poll)
+            if (self.agent_thread != null) {
+                // Process any queued tool events from background thread
+                self.agent_result_mutex.lock();
+                const events_to_process = self.agent_tool_events.toOwnedSlice(self.allocator) catch null;
+                const result_ready = self.agent_result_ready;
+                self.agent_result_mutex.unlock();
+
+                // Process tool events outside the mutex
+                if (events_to_process) |events| {
+                    defer self.allocator.free(events);
+                    var current_tool_idx: ?usize = null;
+
+                    for (events) |event| {
+                        defer self.allocator.free(event.tool_name);
+
+                        switch (event.event_type) {
+                            .start => {
+                                // Add placeholder tool message
+                                const tool_name = self.allocator.dupe(u8, event.tool_name) catch continue;
+                                const content = self.allocator.dupe(u8, "") catch {
+                                    self.allocator.free(tool_name);
+                                    continue;
+                                };
+
+                                self.messages.append(self.allocator, .{
+                                    .role = .display_only_data,
+                                    .content = content,
+                                    .processed_content = .{},
+                                    .timestamp = std.time.milliTimestamp(),
+                                    .tool_call_expanded = false,
+                                    .tool_name = tool_name,
+                                    .tool_success = null,
+                                    .tool_execution_time = null,
+                                }) catch continue;
+                                current_tool_idx = self.messages.items.len - 1;
+                            },
+                            .complete => {
+                                // Update the tool message with results
+                                if (current_tool_idx) |idx| {
+                                    var msg = &self.messages.items[idx];
+                                    msg.tool_success = event.success;
+                                    msg.tool_execution_time = event.execution_time_ms;
+                                }
+                                current_tool_idx = null;
+                            },
+                        }
+                    }
+
+                    // Redraw after processing events
+                    if (events.len > 0) {
+                        _ = message_renderer.redrawScreen(self) catch {};
+                    }
+                }
+
+                if (result_ready) {
+                    // Agent finished - join thread and process result
+                    if (self.agent_thread) |thread| {
+                        thread.join();
+                        self.agent_thread = null;
+                    }
+
+                    // Get the result (protected by mutex)
+                    self.agent_result_mutex.lock();
+                    var result = self.agent_result;
+                    self.agent_result = null;
+                    self.agent_result_ready = false;
+                    self.agent_result_mutex.unlock();
+
+                    // Clean up thread context
+                    if (self.agent_thread_ctx) |ctx| {
+                        ctx.deinit();
+                        self.allocator.destroy(ctx);
+                        self.agent_thread_ctx = null;
+                    }
+
+                    // Process the result
+                    if (result) |*r| {
+                        try self.handleAgentResult(r);
+                    }
+
+                    // Clear agent responding flag
+                    self.agent_responding = false;
+                }
+            }
+
             // Main render section - runs when NOT streaming or when streaming but no chunks
             // During streaming, we skip this to avoid double-render
             if (!self.streaming_active) {
@@ -1888,8 +2364,8 @@ pub const App = struct {
                 try buffered_writer.flush();
             }
 
-            // If streaming is active OR tools are executing, don't block - continue main loop to process chunks/tools
-            if (self.streaming_active or self.tool_executor.hasPendingWork()) {
+            // If streaming is active, tools are executing, or agent thread is running, don't block
+            if (self.streaming_active or self.tool_executor.hasPendingWork() or self.agent_thread != null) {
                 // Read input non-blocking
                 var read_buffer: [128]u8 = undefined;
                 const bytes_read = ui.c.read(ui.c.STDIN_FILENO, &read_buffer, read_buffer.len);
