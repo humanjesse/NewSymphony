@@ -1,4 +1,10 @@
-// Application logic - App struct and all related methods
+// Application logic - App struct and coordination
+// Extracted modules handle specific concerns:
+// - app_streaming.zig: LLM streaming thread and chunk processing
+// - app_agents.zig: Agent session lifecycle and result polling
+// - modal_dispatcher.zig: Unified modal UI dispatch
+// - app_tool_execution.zig: Tool permission prompts and execution
+
 const std = @import("std");
 const fs = std.fs;
 const mem = std.mem;
@@ -24,22 +30,20 @@ const lmstudio = @import("lmstudio");
 pub const agents_module = @import("agents"); // Re-export for agent_loader and agent_executor
 const agent_executor = @import("agent_executor");
 const config_editor_state = @import("config_editor_state");
-const config_editor_renderer = @import("config_editor_renderer");
-const config_editor_input = @import("config_editor_input");
 const agent_loader = @import("agent_loader");
 const agent_builder_state = @import("agent_builder_state");
-const agent_builder_renderer = @import("agent_builder_renderer");
-const agent_builder_input = @import("agent_builder_input");
 const help_state = @import("help_state");
-const help_renderer = @import("help_renderer");
-const help_input = @import("help_input");
 const profile_ui_state = @import("profile_ui_state");
-const profile_ui_renderer = @import("profile_ui_renderer");
-const profile_ui_input = @import("profile_ui_input");
 const conversation_db_module = @import("conversation_db");
 const task_store_module = @import("task_store");
 const task_db_module = @import("task_db");
 const git_sync_module = @import("git_sync");
+
+// Import extracted modules
+const app_streaming = @import("app_streaming.zig");
+const app_agents = @import("app_agents.zig");
+const modal_dispatcher = @import("modal_dispatcher.zig");
+const app_tool_execution = @import("app_tool_execution.zig");
 
 // Re-export types for convenience
 pub const Message = types.Message;
@@ -49,169 +53,10 @@ pub const Config = config_module.Config;
 pub const AppState = state_module.AppState;
 pub const AppContext = context_module.AppContext;
 
-// Thread function context for background streaming
-const StreamThreadContext = struct {
-    allocator: mem.Allocator,
-    app: *App,
-    llm_provider: *llm_provider_module.LLMProvider,
-    model: []const u8,
-    messages: []ollama.ChatMessage,
-    format: ?[]const u8,
-    tools: []const ollama.Tool,
-    keep_alive: []const u8,
-    num_ctx: usize,
-    num_predict: isize,
-};
-
-// Thread function context for background agent execution
-const AgentThreadContext = struct {
-    allocator: mem.Allocator,
-    app: *App,
-    executor: *agent_executor.AgentExecutor,
-    agent_context: agents_module.AgentContext,
-    system_prompt: []const u8,
-    user_input: []const u8,
-    available_tools: []const ollama.Tool,
-    progress_ctx: *ProgressDisplayContext,
-    is_continuation: bool,
-
-    /// Clean up all owned allocations
-    pub fn deinit(self: *AgentThreadContext) void {
-        self.progress_ctx.deinit(self.allocator);
-        self.allocator.destroy(self.progress_ctx);
-        self.allocator.free(self.user_input);
-        freeOllamaTools(self.allocator, self.available_tools);
-    }
-};
-
-// Tool event for queuing from background thread to main thread
-const AgentToolEvent = struct {
-    event_type: enum { start, complete },
-    tool_name: []const u8, // Owned, must be freed
-    success: bool = true,
-    execution_time_ms: i64 = 0,
-};
-
-// Agent progress context for streaming sub-agent progress to UI
-// Now uses unified ProgressDisplayContext from agents.zig
-const ProgressDisplayContext = agents_module.ProgressDisplayContext;
-
-/// Free a slice of Ollama tools and their inner string allocations
-fn freeOllamaTools(allocator: mem.Allocator, tools: []const ollama.Tool) void {
-    for (tools) |tool| {
-        allocator.free(tool.function.name);
-        allocator.free(tool.function.description);
-        allocator.free(tool.function.parameters);
-    }
-    allocator.free(tools);
-}
-
-// Finalize agent message with nice formatting when agent completes
-// Now uses unified finalization from message_renderer
-fn finalizeAgentMessage(ctx: *ProgressDisplayContext) !void {
-    return message_renderer.finalizeProgressMessage(ctx);
-}
-
-// Progress callback for sub-agents - only handles tool display messages
-// Thinking/content accumulation happens here but final response comes from handleAgentResult
-fn agentProgressCallback(user_data: ?*anyopaque, update_type: agents_module.ProgressUpdateType, message: []const u8, tool_data: ?*const agents_module.ToolProgressData) void {
-    const ctx = @as(*ProgressDisplayContext, @ptrCast(@alignCast(user_data orelse return)));
-    const allocator = ctx.app.allocator;
-
-    switch (update_type) {
-        .thinking => {
-            // Accumulate thinking for potential use, but don't create streaming message
-            // The final response with thinking will come from handleAgentResult
-            // Silently ignore allocation failures in UI callback - non-critical path
-            ctx.thinking_buffer.appendSlice(allocator, message) catch return;
-        },
-        .content => {
-            // Accumulate content for potential use, but don't create streaming message
-            // The final response will come from handleAgentResult
-            // Silently ignore allocation failures in UI callback - non-critical path
-            ctx.content_buffer.appendSlice(allocator, message) catch return;
-        },
-        .complete => {
-            // Agent finished - nothing to do here
-            // handleAgentResult will create the final message
-        },
-        .iteration, .tool_call => {
-            // Status updates - ignore
-        },
-        .tool_start => {
-            // Queue event for main thread when running in background
-            if (ctx.is_background_thread) {
-                const tool_name_copy = allocator.dupe(u8, message) catch return;
-                ctx.app.agent_result_mutex.lock();
-                defer ctx.app.agent_result_mutex.unlock();
-                ctx.app.agent_tool_events.append(allocator, .{
-                    .event_type = .start,
-                    .tool_name = tool_name_copy,
-                }) catch {
-                    allocator.free(tool_name_copy);
-                    return;
-                };
-                return;
-            }
-
-            // Add placeholder tool message (will be updated on complete)
-            // Silently ignore allocation failures in UI callback - non-critical path
-            const tool_name = allocator.dupe(u8, message) catch return;
-            errdefer allocator.free(tool_name);
-
-            const content = allocator.dupe(u8, "") catch return;
-            errdefer allocator.free(content);
-
-            ctx.app.messages.append(allocator, .{
-                .role = .display_only_data,
-                .content = content,
-                .processed_content = .{},
-                .timestamp = std.time.milliTimestamp(),
-                .tool_call_expanded = false,
-                .tool_name = tool_name,
-                .tool_success = null,
-                .tool_execution_time = null,
-            }) catch return;
-            // On success, ownership transferred to messages array
-            ctx.current_tool_message_idx = ctx.app.messages.items.len - 1;
-            // Silently ignore redraw failures - UI will update on next event
-            _ = message_renderer.redrawScreen(ctx.app) catch return;
-        },
-        .tool_complete => {
-            // Queue event for main thread when running in background
-            if (ctx.is_background_thread) {
-                const data = tool_data orelse return;
-                const tool_name_copy = allocator.dupe(u8, data.name) catch return;
-                ctx.app.agent_result_mutex.lock();
-                defer ctx.app.agent_result_mutex.unlock();
-                ctx.app.agent_tool_events.append(allocator, .{
-                    .event_type = .complete,
-                    .tool_name = tool_name_copy,
-                    .success = data.success,
-                    .execution_time_ms = data.execution_time_ms,
-                }) catch {
-                    allocator.free(tool_name_copy);
-                    return;
-                };
-                return;
-            }
-
-            // Read from structured tool_data instead of parsing string
-            const data = tool_data orelse return;
-            if (ctx.current_tool_message_idx) |idx| {
-                var msg = &ctx.app.messages.items[idx];
-                msg.tool_success = data.success;
-                msg.tool_execution_time = data.execution_time_ms;
-            }
-            ctx.current_tool_message_idx = null;
-            // Silently ignore redraw failures - UI will update on next event
-            _ = message_renderer.redrawScreen(ctx.app) catch return;
-        },
-        .embedding, .storage => {
-            // Embedding/storage updates not used in current architecture
-        },
-    }
-}
+// Re-export types from extracted modules for external access
+pub const StreamThreadContext = app_streaming.StreamThreadContext;
+pub const AgentThreadContext = app_agents.AgentThreadContext;
+pub const AgentToolEvent = app_agents.AgentToolEvent;
 
 // Define available tools for the model
 fn createTools(allocator: mem.Allocator) ![]const ollama.Tool {
@@ -221,10 +66,10 @@ fn createTools(allocator: mem.Allocator) ![]const ollama.Tool {
 // Incremental rendering support structures
 pub const MessageRenderInfo = struct {
     message_index: usize,
-    y_start: usize,           // Absolute Y position where message starts
-    y_end: usize,             // Absolute Y position where message ends
-    height: usize,            // Total lines this message occupies
-    content_hash: u64,        // Hash of message content for change detection (includes expansion states)
+    y_start: usize, // Absolute Y position where message starts
+    y_end: usize, // Absolute Y position where message ends
+    height: usize, // Total lines this message occupies
+    content_hash: u64, // Hash of message content for change detection (includes expansion states)
 };
 
 /// Simplified render cache - just tracks terminal size for resize detection
@@ -300,6 +145,7 @@ pub const App = struct {
     last_resize_time: i64 = 0,
     // Streaming state
     streaming_active: bool = false,
+    streaming_message_idx: ?usize = null, // Specific message to update (for agents with tool calls)
     // Agent responding state (for status indicator)
     agent_responding: bool = false,
     stream_mutex: std.Thread.Mutex = .{},
@@ -313,6 +159,8 @@ pub const App = struct {
     agent_result_ready: bool = false,
     agent_result_mutex: std.Thread.Mutex = .{},
     agent_tool_events: std.ArrayListUnmanaged(AgentToolEvent) = .{},
+    // Pending user messages (queued while agent/streaming is active)
+    pending_user_messages: std.ArrayListUnmanaged([]const u8) = .{},
     // Available tools for the model
     tools: []const ollama.Tool,
     // Tool execution state
@@ -329,7 +177,6 @@ pub const App = struct {
     state: AppState,
     app_context: AppContext,
     max_iterations: usize = 10, // Master loop iteration limit
-    // Auto-scroll state (receipt printer mode) - removed, now always auto-scrolls
     // Vector DB components (kept for future semantic search)
     vector_store: ?*zvdb.HNSW(f32) = null,
     embedder: ?*embedder_interface.Embedder = null, // Generic interface - works with both Ollama and LM Studio
@@ -357,7 +204,7 @@ pub const App = struct {
 
     pub fn init(allocator: mem.Allocator, config: Config) !App {
         const tools = try createTools(allocator);
-        errdefer freeOllamaTools(allocator, tools);
+        errdefer app_agents.freeOllamaTools(allocator, tools);
 
         // Initialize permission manager
         var perm_manager = try permission.PermissionManager.init(allocator, ".", null); // No audit log by default
@@ -549,7 +396,7 @@ pub const App = struct {
 
     // Persist a message to the database immediately
     // Fails fast if database persistence fails
-    fn persistMessage(self: *App, message_index: usize) !void {
+    pub fn persistMessage(self: *App, message_index: usize) !void {
         // Conversation ID must exist (created in init)
         const conv_id = self.current_conversation_id orelse return error.NoConversation;
 
@@ -571,8 +418,64 @@ pub const App = struct {
         return self.cursor_y == last_position;
     }
 
-    // Pre-calculate and apply scroll position to keep viewport anchored at bottom
-    // This should be called BEFORE redrawScreen() to avoid flashing
+    /// Process all queued user messages (Option C):
+    /// 1. Process agent slash commands first (in order) - they may change state
+    /// 2. Combine remaining regular messages with \n\n
+    /// 3. Send combined message (routes to agent or main chat automatically)
+    /// Returns true if any messages were processed
+    pub fn processQueuedMessages(self: *App) !bool {
+        if (self.pending_user_messages.items.len == 0) return false;
+
+        // First pass: process agent slash commands (they take priority and may change state)
+        var i: usize = 0;
+        while (i < self.pending_user_messages.items.len) {
+            const msg = self.pending_user_messages.items[i];
+            if (mem.startsWith(u8, msg, "/")) {
+                const command = msg[1..]; // Skip "/"
+                if (self.app_context.agent_registry) |registry| {
+                    const space_idx = mem.indexOf(u8, command, " ");
+                    const agent_name = if (space_idx) |idx| command[0..idx] else command;
+                    if (registry.has(agent_name)) {
+                        // Remove from queue and process
+                        const pending = self.pending_user_messages.orderedRemove(i);
+                        defer self.allocator.free(pending);
+                        const task = if (space_idx) |idx| blk: {
+                            const t = command[idx + 1 ..];
+                            break :blk if (t.len == 0) null else t;
+                        } else null;
+                        try self.handleAgentCommand(agent_name, task, pending);
+                        // Don't increment i - array shifted
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        // Second pass: combine remaining regular messages
+        if (self.pending_user_messages.items.len == 0) return true;
+
+        var combined = std.ArrayListUnmanaged(u8){};
+        defer combined.deinit(self.allocator);
+
+        for (self.pending_user_messages.items, 0..) |msg, idx| {
+            if (idx > 0) try combined.appendSlice(self.allocator, "\n\n");
+            try combined.appendSlice(self.allocator, msg);
+        }
+
+        // Clear the queue (free all messages)
+        for (self.pending_user_messages.items) |msg| {
+            self.allocator.free(msg);
+        }
+        self.pending_user_messages.clearRetainingCapacity();
+
+        // Send combined message (sendMessage routes to agent if active)
+        if (combined.items.len > 0) {
+            try self.sendMessage(combined.items, null);
+        }
+
+        return true;
+    }
 
     // Update cursor to track bottom position after redraw
     pub fn updateCursorToBottom(self: *App) void {
@@ -581,307 +484,22 @@ pub const App = struct {
         }
     }
 
-
-    fn streamingThreadFn(ctx: *StreamThreadContext) void {
-        // Callback that adds chunks to the queue
-        const ChunkCallback = struct {
-            fn callback(chunk_ctx: *StreamThreadContext, thinking_chunk: ?[]const u8, content_chunk: ?[]const u8, tool_calls_chunk: ?[]const ollama.ToolCall) void {
-                chunk_ctx.app.stream_mutex.lock();
-                defer chunk_ctx.app.stream_mutex.unlock();
-
-                // Free tool_calls_chunk after processing (we take ownership from ollama.zig)
-                defer if (tool_calls_chunk) |calls| {
-                    for (calls) |call| {
-                        if (call.id) |id| chunk_ctx.allocator.free(id);
-                        if (call.type) |t| chunk_ctx.allocator.free(t);
-                        chunk_ctx.allocator.free(call.function.name);
-                        chunk_ctx.allocator.free(call.function.arguments);
-                    }
-                    chunk_ctx.allocator.free(calls);
-                };
-
-                // Create a chunk and add to queue
-                const chunk = StreamChunk{
-                    .thinking = if (thinking_chunk) |t| chunk_ctx.allocator.dupe(u8, t) catch null else null,
-                    .content = if (content_chunk) |c| chunk_ctx.allocator.dupe(u8, c) catch null else null,
-                    .done = false,
-                };
-                chunk_ctx.app.stream_chunks.append(chunk_ctx.allocator, chunk) catch return;
-
-                // Store tool calls for execution after streaming completes
-                if (tool_calls_chunk) |calls| {
-                    // Duplicate the tool calls to keep them after streaming
-                    const owned_calls = chunk_ctx.allocator.alloc(ollama.ToolCall, calls.len) catch return;
-                    for (calls, 0..) |call, i| {
-                        // Generate ID if not provided by model
-                        const call_id = if (call.id) |id|
-                            chunk_ctx.allocator.dupe(u8, id) catch return
-                        else
-                            std.fmt.allocPrint(chunk_ctx.allocator, "call_{d}", .{i}) catch return;
-
-                        // Use "function" as default type if not provided
-                        const call_type = if (call.type) |t|
-                            chunk_ctx.allocator.dupe(u8, t) catch return
-                        else
-                            chunk_ctx.allocator.dupe(u8, "function") catch return;
-
-                        owned_calls[i] = ollama.ToolCall{
-                            .id = call_id,
-                            .type = call_type,
-                            .function = .{
-                                .name = chunk_ctx.allocator.dupe(u8, call.function.name) catch return,
-                                .arguments = chunk_ctx.allocator.dupe(u8, call.function.arguments) catch return,
-                            },
-                        };
-                    }
-                    chunk_ctx.app.pending_tool_calls = owned_calls;
-                }
-            }
-        };
-
-        // Get provider capabilities to check what's supported
-        const caps = ctx.llm_provider.getCapabilities();
-
-        // Only enable thinking if both config and provider support it
-        const enable_thinking = ctx.app.config.enable_thinking and caps.supports_thinking;
-
-        // Only pass keep_alive if provider supports it
-        const keep_alive = if (caps.supports_keep_alive) ctx.keep_alive else null;
-
-        // Run the streaming with retry logic for stale connections
-        ctx.llm_provider.chatStream(
-            ctx.model,
-            ctx.messages,
-            enable_thinking, // Capability-aware thinking mode
-            ctx.format,
-            if (ctx.tools.len > 0) ctx.tools else null, // Pass tools to model
-            keep_alive, // Capability-aware keep_alive
-            ctx.num_ctx,
-            ctx.num_predict,
-            null, // temperature - use model default for main chat
-            null, // repeat_penalty - use model default for main chat
-            ctx,
-            ChunkCallback.callback,
-        ) catch |err| {
-            // Handle stale connection errors with retry
-            if (err == error.EndOfStream or err == error.ConnectionResetByPeer) {
-                // Send retry message to user
-                ctx.app.stream_mutex.lock();
-                const retry_msg = std.fmt.allocPrint(
-                    ctx.allocator,
-                    "Connection failed: {s} - Retrying...",
-                    .{@errorName(err)},
-                ) catch "Connection failed - Retrying...";
-                const retry_chunk = StreamChunk{ .thinking = null, .content = retry_msg, .done = false };
-                ctx.app.stream_chunks.append(ctx.allocator, retry_chunk) catch {};
-                ctx.app.stream_mutex.unlock();
-
-                // Note: Provider-level retry not implemented yet
-                // Different providers may have different retry strategies
-
-                // Small delay before retry
-                std.Thread.sleep(100 * std.time.ns_per_ms);
-
-                // Retry the request (reuse capability checks from above)
-                ctx.llm_provider.chatStream(
-                    ctx.model,
-                    ctx.messages,
-                    enable_thinking, // Use capability-aware value
-                    ctx.format,
-                    if (ctx.tools.len > 0) ctx.tools else null,
-                    keep_alive, // Use capability-aware value
-                    ctx.num_ctx,
-                    ctx.num_predict,
-                    null, // temperature - use model default for main chat
-                    null, // repeat_penalty - use model default for main chat
-                    ctx,
-                    ChunkCallback.callback,
-                ) catch |retry_err| {
-                    // Second failure - report error to user
-                    ctx.app.stream_mutex.lock();
-                    const error_msg = std.fmt.allocPrint(
-                        ctx.allocator,
-                        "Failed to connect to Ollama: {s}",
-                        .{@errorName(retry_err)},
-                    ) catch "Failed to connect to Ollama";
-                    const error_chunk = StreamChunk{ .thinking = null, .content = error_msg, .done = false };
-                    ctx.app.stream_chunks.append(ctx.allocator, error_chunk) catch {};
-                    ctx.app.stream_mutex.unlock();
-                };
-            } else {
-                // Other errors - report directly to user
-                ctx.app.stream_mutex.lock();
-                const error_msg = std.fmt.allocPrint(
-                    ctx.allocator,
-                    "Connection error: {s}",
-                    .{@errorName(err)},
-                ) catch "Connection error occurred";
-                const error_chunk = StreamChunk{ .thinking = null, .content = error_msg, .done = false };
-                ctx.app.stream_chunks.append(ctx.allocator, error_chunk) catch {};
-                ctx.app.stream_mutex.unlock();
-            }
-        };
-
-        // ALWAYS add a "done" chunk, even if chatStream failed
-        // This ensures streaming_active gets set to false
-        ctx.app.stream_mutex.lock();
-        defer ctx.app.stream_mutex.unlock();
-        const done_chunk = StreamChunk{ .thinking = null, .content = null, .done = true };
-        ctx.app.stream_chunks.append(ctx.allocator, done_chunk) catch return;
-    }
-
-    // Background thread function for agent execution
-    fn agentThreadFn(ctx: *AgentThreadContext) void {
-        // Helper to create error result
-        const makeErrorResult = struct {
-            fn f(allocator: mem.Allocator, err: anyerror) agents_module.AgentResult {
-                return .{
-                    .success = false,
-                    .status = .failed,
-                    .data = null,
-                    .error_message = std.fmt.allocPrint(allocator, "Agent error: {s}", .{@errorName(err)}) catch null,
-                    .stats = .{
-                        .iterations_used = 0,
-                        .tool_calls_made = 0,
-                        .execution_time_ms = 0,
-                    },
-                };
-            }
-        }.f;
-
-        // Run the agent (blocking in this thread, non-blocking from main thread's perspective)
-        const result: agents_module.AgentResult = if (ctx.is_continuation)
-            ctx.executor.resumeWithUserInput(
-                ctx.agent_context,
-                ctx.system_prompt,
-                ctx.user_input,
-                ctx.available_tools,
-                agentProgressCallback,
-                @ptrCast(ctx.progress_ctx),
-            ) catch |err| makeErrorResult(ctx.allocator, err)
-        else
-            ctx.executor.run(
-                ctx.agent_context,
-                ctx.system_prompt,
-                ctx.user_input,
-                ctx.available_tools,
-                agentProgressCallback,
-                @ptrCast(ctx.progress_ctx),
-            ) catch |err| makeErrorResult(ctx.allocator, err);
-
-        // Store result for main thread to pick up
-        ctx.app.agent_result_mutex.lock();
-        defer ctx.app.agent_result_mutex.unlock();
-        ctx.app.agent_result = result;
-        ctx.app.agent_result_ready = true;
-    }
-
-
-    // Compress message history by replacing read_file results with Graph RAG summaries
-    // REMOVED: GraphRAG compression no longer needed
-    // Curator caching handles this better - instant cache hits for same conversation context
-
-    // Internal method to start streaming with current message history
-    fn startStreaming(self: *App, format: ?[]const u8) !void {
-        // Set streaming flag FIRST - before any redraws
-        // This ensures the status bar shows "AI is responding..." immediately
-        self.streaming_active = true;
-
-        // Reset tool call depth when starting a new user message
-        // (This will be set correctly by continueStreaming for tool calls)
-
-        // Copy messages to ollama_messages
-        var ollama_messages = std.ArrayListUnmanaged(ollama.ChatMessage){};
-        defer ollama_messages.deinit(self.allocator);
-
-        for (self.messages.items) |msg| {
-            // Skip display_only_data messages - they're UI-only notifications
-            if (msg.role == .display_only_data) continue;
-
-            // Skip subagent messages - they have their own isolated context
-            if (msg.agent_source != null) continue;
-
-            const role_str = switch (msg.role) {
-                .user => "user",
-                .assistant => "assistant",
-                .system => "system",
-                .tool => "tool",
-                .display_only_data => unreachable, // Already filtered above
-            };
-            try ollama_messages.append(self.allocator, .{
-                .role = role_str,
-                .content = msg.content,
-                .tool_call_id = msg.tool_call_id,
-                .tool_calls = msg.tool_calls,
-            });
-        }
-
-        // DEBUG: Print what we're sending to the API
-        if (std.posix.getenv("DEBUG_TOOLS")) |_| {
-            std.debug.print("\n=== DEBUG: Sending {d} messages to API ===\n", .{ollama_messages.items.len});
-            for (ollama_messages.items, 0..) |msg, i| {
-                std.debug.print("[{d}] role={s}", .{i, msg.role});
-                if (msg.tool_calls) |_| std.debug.print(" [HAS_TOOL_CALLS]", .{});
-                if (msg.tool_call_id) |id| std.debug.print(" [tool_call_id={s}]", .{id});
-                std.debug.print("\n", .{});
-
-                const preview_len = @min(msg.content.len, 80);
-                std.debug.print("    content: {s}{s}\n", .{
-                    msg.content[0..preview_len],
-                    if (msg.content.len > 80) "..." else "",
-                });
-            }
-            std.debug.print("=== END DEBUG ===\n\n", .{});
-        }
-
-        // Create placeholder for assistant response (empty initially)
-        const assistant_content = try self.allocator.dupe(u8, "");
-        const assistant_processed = try markdown.processMarkdown(self.allocator, assistant_content);
-        try self.messages.append(self.allocator, .{
-            .role = .assistant,
-            .content = assistant_content,
-            .processed_content = assistant_processed,
-            .thinking_content = null,
-            .processed_thinking_content = null,
-            .thinking_expanded = true,
-            .timestamp = std.time.milliTimestamp(),
-        });
-
-        // Mark all dirty - new message changes layout
-        // Removed dirty state tracking - rendering is now always automatic
-
-        // Redraw to show empty placeholder (receipt printer mode)
-        _ = try message_renderer.redrawScreen(self);
-        self.updateCursorToBottom();
-
-        // Prepare thread context
-        const messages_slice = try ollama_messages.toOwnedSlice(self.allocator);
-
-        const thread_ctx = try self.allocator.create(StreamThreadContext);
-        thread_ctx.* = .{
-            .allocator = self.allocator,
-            .app = self,
-            .llm_provider = &self.llm_provider,
-            .model = self.config.model,
-            .messages = messages_slice,
-            .format = format,
-            .tools = self.tools,
-            .keep_alive = self.config.model_keep_alive,
-            .num_ctx = self.config.num_ctx,
-            .num_predict = self.config.num_predict,
-        };
-
-        // Start streaming in background thread
-        self.stream_thread_ctx = thread_ctx;
-        self.stream_thread = try std.Thread.spawn(.{}, streamingThreadFn, .{thread_ctx});
-    }
-
     // Send a message and get streaming response from Ollama (non-blocking)
     pub fn sendMessage(self: *App, user_text: []const u8, format: ?[]const u8) !void {
         // If agent is active, route to agent instead
         if (self.app_context.active_agent != null) {
             // For continuation messages, display_text is same as user_text (no slash prefix)
-            try self.sendToAgent(user_text, null);
+            app_agents.sendToAgent(self, user_text, null) catch |err| {
+                if (err == error.AgentThreadAlreadyRunning) {
+                    // Queue message for processing after current agent completes
+                    try self.pending_user_messages.append(
+                        self.allocator,
+                        try self.allocator.dupe(u8, user_text),
+                    );
+                    return;
+                }
+                return err;
+            };
             return;
         }
 
@@ -890,8 +508,6 @@ pub const App = struct {
 
         // Phase 1: Reset iteration count for new user messages (master loop)
         self.state.iteration_count = 0;
-
-        // Reset auto-scroll state - no longer needed, now always auto-scrolls
 
         // 1. Add user message
         const user_content = try self.allocator.dupe(u8, user_text);
@@ -908,379 +524,25 @@ pub const App = struct {
         // Persist user message immediately
         try self.persistMessage(self.messages.items.len - 1);
 
-        // Mark all dirty - new message changes layout
-        // Removed dirty state tracking - rendering is now always automatic
-
         // Show user message right away (receipt printer mode)
         _ = try message_renderer.redrawScreen(self);
 
         // 2. Start streaming
-        try self.startStreaming(format);
+        try app_streaming.startStreaming(self, format);
     }
 
     /// Handle agent slash command (e.g., /agentname or /agentname task)
     /// full_input is the complete user input for display (e.g., "/planner hello")
     pub fn handleAgentCommand(self: *App, agent_name: []const u8, task: ?[]const u8, full_input: []const u8) !void {
-        // If this agent is already active, end the session
-        if (self.app_context.active_agent) |active| {
-            if (mem.eql(u8, active.agent_name, agent_name)) {
-                try self.endAgentSession();
-                return;
-            }
-        }
-
-        // If a different agent is active, end it first
-        if (self.app_context.active_agent != null) {
-            try self.endAgentSession();
-        }
-
-        // Start new agent session if task provided
-        if (task) |t| {
-            try self.startAgentSession(agent_name, t, full_input);
-        } else {
-            // Just `/agentname` with no task - show usage hint
-            const hint_content = try std.fmt.allocPrint(
-                self.allocator,
-                "🤖 **{s}** - Type `/{s} <your task>` to start a conversation, or `/{s}` to end an active session.",
-                .{ agent_name, agent_name, agent_name },
-            );
-            const hint_processed = try markdown.processMarkdown(self.allocator, hint_content);
-
-            try self.messages.append(self.allocator, .{
-                .role = .display_only_data,
-                .content = hint_content,
-                .processed_content = hint_processed,
-                .thinking_expanded = false,
-                .timestamp = std.time.milliTimestamp(),
-            });
-            _ = try message_renderer.redrawScreen(self);
-        }
-    }
-
-    /// Start a new agent conversation session
-    /// display_text is the full user input for display (e.g., "/planner hello")
-    fn startAgentSession(self: *App, agent_name: []const u8, initial_task: []const u8, display_text: []const u8) !void {
-        const registry = self.app_context.agent_registry orelse return;
-        const agent_def = registry.get(agent_name) orelse return;
-
-        // Create heap-allocated executor
-        const executor = try self.allocator.create(agent_executor.AgentExecutor);
-        executor.* = agent_executor.AgentExecutor.init(self.allocator, agent_def.capabilities);
-
-        // Create session state with type-safe executor interface
-        const session = try self.allocator.create(context_module.ActiveAgentSession);
-        session.* = .{
-            .executor = executor.interface(),
-            .agent_name = try self.allocator.dupe(u8, agent_name),
-            .system_prompt = agent_def.system_prompt,
-            .capabilities = agent_def.capabilities,
-        };
-        self.app_context.active_agent = session;
-
-        // Send initial task to agent - pass display_text for the user message
-        try self.sendToAgent(initial_task, display_text);
-    }
-
-    /// Send user input to the active agent (non-blocking)
-    /// display_text: optional text to show in UI (e.g., "/planner hello"), if null uses user_input
-    fn sendToAgent(self: *App, user_input: []const u8, display_text: ?[]const u8) !void {
-        const session = self.app_context.active_agent orelse return;
-
-        // Use display_text if provided, otherwise use user_input for display
-        const message_to_show = display_text orelse user_input;
-
-        // Display user message with full text (including slash command if initial)
-        const user_content = try self.allocator.dupe(u8, message_to_show);
-        const user_processed = try markdown.processMarkdown(self.allocator, user_content);
-
-        try self.messages.append(self.allocator, .{
-            .role = .user,
-            .content = user_content,
-            .agent_source = try self.allocator.dupe(u8, session.agent_name),
-            .processed_content = user_processed,
-            .thinking_expanded = true,
-            .timestamp = std.time.milliTimestamp(),
-        });
-        try self.persistMessage(self.messages.items.len - 1);
-
-        // Set agent responding flag BEFORE redraw so taskbar shows status
-        self.agent_responding = true;
-        _ = try message_renderer.redrawScreen(self);
-
-        // Get the executor through the type-safe interface
-        const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
-
-        // Check if this is initial message or continuation
-        const is_continuation = executor.message_history.items.len > 0;
-
-        // Allocate thread context and owned data
-        const thread_ctx = try self.allocator.create(AgentThreadContext);
-        errdefer self.allocator.destroy(thread_ctx);
-
-        // Allocate progress context on heap (owned by thread)
-        const progress_ctx = try self.allocator.create(ProgressDisplayContext);
-        errdefer self.allocator.destroy(progress_ctx);
-        progress_ctx.* = .{
-            .app = self,
-            .task_name = try self.allocator.dupe(u8, session.agent_name),
-            .task_name_owned = true,
-            .task_icon = "🤖",
-            .start_time = std.time.milliTimestamp(),
-            .is_background_thread = true, // Skip UI operations from background thread
-        };
-
-        // Get available tools (owned by thread context)
-        const available_tools = try tools_module.getOllamaTools(self.allocator);
-
-        // Dupe user_input for thread ownership
-        const owned_user_input = try self.allocator.dupe(u8, user_input);
-
-        // Build agent context with full access to app resources
-        const agent_context = agents_module.AgentContext{
-            .allocator = self.allocator,
-            .llm_provider = &self.llm_provider,
-            .config = &self.config,
-            .system_prompt = session.system_prompt,
-            .capabilities = session.capabilities,
-            .vector_store = self.app_context.vector_store,
-            .embedder = self.app_context.embedder,
-            .recent_messages = null,
-            .conversation_db = self.app_context.conversation_db,
-            .session_id = self.app_context.session_id,
-            // Task memory system
-            .task_store = self.app_context.task_store,
-            .task_db = self.app_context.task_db,
-            .git_sync = self.app_context.git_sync,
-            // Application state for todo/file tracking
-            .state = self.app_context.state,
-            // Agent registry for nested agent calls
-            .agent_registry = self.app_context.agent_registry,
-        };
-
-        thread_ctx.* = .{
-            .allocator = self.allocator,
-            .app = self,
-            .executor = executor,
-            .agent_context = agent_context,
-            .system_prompt = session.system_prompt,
-            .user_input = owned_user_input,
-            .available_tools = available_tools,
-            .progress_ctx = progress_ctx,
-            .is_continuation = is_continuation,
-        };
-
-        // Store context and spawn thread
-        self.agent_thread_ctx = thread_ctx;
-        self.agent_thread = try std.Thread.spawn(.{}, agentThreadFn, .{thread_ctx});
-
-        // Returns immediately - main event loop polls for completion
-    }
-
-    /// Helper to create and display an agent response message
-    fn createAgentResponseMessage(
-        self: *App,
-        agent_name: []const u8,
-        response_text: []const u8,
-        thinking: ?[]const u8,
-    ) !void {
-        const response_content = try self.allocator.dupe(u8, response_text);
-        const response_processed = try markdown.processMarkdown(self.allocator, response_content);
-
-        // Include thinking content if available
-        var thinking_content: ?[]const u8 = null;
-        var processed_thinking: ?std.ArrayListUnmanaged(markdown.RenderableItem) = null;
-        if (thinking) |t| {
-            thinking_content = try self.allocator.dupe(u8, t);
-            processed_thinking = try markdown.processMarkdown(self.allocator, thinking_content.?);
-        }
-
-        try self.messages.append(self.allocator, .{
-            .role = .assistant,
-            .content = response_content,
-            .agent_source = try self.allocator.dupe(u8, agent_name),
-            .processed_content = response_processed,
-            .thinking_content = thinking_content,
-            .processed_thinking_content = processed_thinking,
-            .thinking_expanded = false,
-            .timestamp = std.time.milliTimestamp(),
-        });
-        try self.persistMessage(self.messages.items.len - 1);
-        _ = try message_renderer.redrawScreen(self);
-    }
-
-    /// Handle the result from an agent execution
-    fn handleAgentResult(self: *App, result: *agents_module.AgentResult) !void {
-        defer result.deinit(self.allocator);
-        const session = self.app_context.active_agent orelse return;
-
-        if (result.status == .complete or result.status == .failed) {
-            // Agent finished - display result and end session
-            const response_text = if (result.success)
-                try std.fmt.allocPrint(
-                    self.allocator,
-                    "🤖 **{s}**:\n\n{s}",
-                    .{ session.agent_name, result.data orelse "(no output)" },
-                )
-            else
-                try std.fmt.allocPrint(
-                    self.allocator,
-                    "🤖 **{s}** failed:\n\n{s}",
-                    .{ session.agent_name, result.error_message orelse "unknown error" },
-                );
-            defer self.allocator.free(response_text);
-
-            try self.createAgentResponseMessage(session.agent_name, response_text, result.thinking);
-            try self.endAgentSession();
-        } else if (result.status == .needs_input) {
-            // Conversation mode: agent responded, waiting for user input
-            // Display response but keep session alive for follow-up messages
-            if (result.data) |data| {
-                const response_text = try std.fmt.allocPrint(
-                    self.allocator,
-                    "🤖 **{s}**:\n\n{s}",
-                    .{ session.agent_name, data },
-                );
-                defer self.allocator.free(response_text);
-
-                try self.createAgentResponseMessage(session.agent_name, response_text, result.thinking);
-            }
-        }
+        return app_agents.handleAgentCommand(self, agent_name, task, full_input);
     }
 
     /// End the current agent conversation session
     pub fn endAgentSession(self: *App) !void {
-        const session = self.app_context.active_agent orelse return;
-
-        // FIRST: Mark session as ended so new messages don't route here
-        // This must happen before any operations that can throw
-        self.app_context.active_agent = null;
-
-        // Ensure session cleanup happens regardless of later errors
-        defer {
-            self.allocator.free(session.agent_name);
-            self.allocator.destroy(session);
-        }
-
-        // Clean up executor through the type-safe interface
-        const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
-        session.executor.deinit(); // Use interface method for type safety
-        self.allocator.destroy(executor);
-
-        // Show session ended message (can throw, session cleanup is deferred)
-        const end_content = try std.fmt.allocPrint(
-            self.allocator,
-            "🤖 **{s}** session ended.",
-            .{session.agent_name},
-        );
-        const end_processed = try markdown.processMarkdown(self.allocator, end_content);
-
-        try self.messages.append(self.allocator, .{
-            .role = .display_only_data,
-            .content = end_content,
-            .processed_content = end_processed,
-            .thinking_expanded = false,
-            .timestamp = std.time.milliTimestamp(),
-        });
-        _ = try message_renderer.redrawScreen(self);
+        return app_agents.endAgentSession(self);
     }
-
-    // Helper function to show permission prompt (non-blocking)
-    fn showPermissionPrompt(
-        self: *App,
-        tool_call: ollama.ToolCall,
-        eval_result: permission.PolicyEngine.EvaluationResult,
-    ) !void {
-        // Create permission request message
-        const prompt_text = try std.fmt.allocPrint(
-            self.allocator,
-            "Permission requested for tool: {s}",
-            .{tool_call.function.name},
-        );
-        const prompt_processed = try markdown.processMarkdown(self.allocator, prompt_text);
-
-        // Duplicate tool call for storage in message
-        const stored_tool_call = ollama.ToolCall{
-            .id = if (tool_call.id) |id| try self.allocator.dupe(u8, id) else null,
-            .type = if (tool_call.type) |t| try self.allocator.dupe(u8, t) else null,
-            .function = .{
-                .name = try self.allocator.dupe(u8, tool_call.function.name),
-                .arguments = try self.allocator.dupe(u8, tool_call.function.arguments),
-            },
-        };
-
-        try self.messages.append(self.allocator, .{
-            .role = .display_only_data,
-            .content = prompt_text,
-            .processed_content = prompt_processed,
-            .thinking_expanded = false,
-            .timestamp = std.time.milliTimestamp(),
-            .permission_request = .{
-                .tool_call = stored_tool_call,
-                .eval_result = .{
-                    .allowed = eval_result.allowed,
-                    .reason = try self.allocator.dupe(u8, eval_result.reason),
-                    .ask_user = eval_result.ask_user,
-                    .show_preview = eval_result.show_preview,
-                },
-                .timestamp = std.time.milliTimestamp(),
-            },
-        });
-
-        // Persist permission request immediately
-        try self.persistMessage(self.messages.items.len - 1);
-
-        // Set permission pending state (non-blocking - main loop will handle response)
-        self.permission_pending = true;
-        self.permission_response = null;
-    }
-
-    // Execute a tool call and return the result (Phase 1: passes AppContext)
-    fn executeTool(self: *App, tool_call: ollama.ToolCall) !tools_module.ToolResult {
-        // Populate conversation context for context-aware tools
-        // Extract last 5 messages (or fewer if conversation is shorter)
-        const start_idx = if (self.messages.items.len > 5)
-            self.messages.items.len - 5
-        else
-            0;
-
-        // IMPORTANT: Allocate a COPY of the messages slice to avoid use-after-free
-        // During tool execution, self.messages may grow and reallocate its backing buffer
-        // This would invalidate any slice pointing into the old buffer
-        const messages_copy = try self.allocator.dupe(types.Message, self.messages.items[start_idx..]);
-        self.app_context.recent_messages = messages_copy;
-        defer self.allocator.free(messages_copy);
-
-        // Set up agent progress streaming for sub-agents (like file curator)
-        var agent_progress_ctx = ProgressDisplayContext{
-            .app = self,
-            .task_name = try self.allocator.dupe(u8, "Agent Analysis"), // Generic default (will be updated by run_agent tool)
-            .task_name_owned = true, // We allocated task_name, so we own it
-            .task_icon = "🤔", // Default icon for file analysis
-            .start_time = std.time.milliTimestamp(), // Start tracking execution time
-        };
-        defer agent_progress_ctx.deinit(self.allocator);
-
-        self.app_context.agent_progress_callback = agentProgressCallback;
-        self.app_context.agent_progress_user_data = &agent_progress_ctx;
-
-        // Execute tool with conversation context and progress streaming
-        const result = try tools_module.executeToolCall(self.allocator, tool_call, &self.app_context);
-
-        // Note: Progress message is kept as permanent "Agent Analysis" message
-        // It was already finalized by the progress callback when agent completed
-
-        // Clear conversation context and progress callback after use
-        self.app_context.recent_messages = null;
-        self.app_context.agent_progress_callback = null;
-        self.app_context.agent_progress_user_data = null;
-
-        return result;
-    }
-
 
     pub fn deinit(self: *App) void {
-        // GraphRAG indexing queue removed - context queue handles async tasks now
-
         // Wait for streaming thread to finish if active
         if (self.stream_thread) |thread| {
             thread.join();
@@ -1288,10 +550,7 @@ pub const App = struct {
 
         // Clean up thread context if it exists
         if (self.stream_thread_ctx) |ctx| {
-            // Note: msg.role and msg.content are NOT owned by the context
-            // They are pointers to existing message data, so we only free the array
             self.allocator.free(ctx.messages);
-
             self.allocator.destroy(ctx);
         }
 
@@ -1316,6 +575,12 @@ pub const App = struct {
             self.allocator.free(event.tool_name);
         }
         self.agent_tool_events.deinit(self.allocator);
+
+        // Clean up pending user messages if any
+        for (self.pending_user_messages.items) |msg| {
+            self.allocator.free(msg);
+        }
+        self.pending_user_messages.deinit(self.allocator);
 
         // Clean up stream chunks
         for (self.stream_chunks.items) |chunk| {
@@ -1388,7 +653,7 @@ pub const App = struct {
         self.saved_expansion_states.deinit(self.allocator);
 
         // Clean up tools
-        freeOllamaTools(self.allocator, self.tools);
+        app_agents.freeOllamaTools(self.allocator, self.tools);
 
         // Clean up pending tool calls if any
         if (self.pending_tool_calls) |calls| {
@@ -1490,10 +755,7 @@ pub const App = struct {
         self.config.deinit(self.allocator);
     }
 
-
-
-
-
+    /// Main event loop - thin dispatcher that coordinates extracted modules
     pub fn run(self: *App, app_tui: *ui.Tui) !void {
         _ = app_tui; // Will be used later for editor integration
 
@@ -1504,813 +766,61 @@ pub const App = struct {
         defer content_accumulator.deinit(self.allocator);
 
         while (true) {
-            // CONFIG EDITOR MODE (modal - takes priority over normal app)
-            if (self.config_editor) |*editor| {
-                // Render editor (renderer will clear screen)
-                var stdout_buffer: [8192]u8 = undefined;
-                var buffered_writer = ui.BufferedStdoutWriter.init(&stdout_buffer);
-                const writer = buffered_writer.writer();
-
-                try config_editor_renderer.render(
-                    editor,
-                    writer,
-                    self.terminal_size.width,
-                    self.terminal_size.height,
-                );
-                try buffered_writer.flush();
-
-                // Wait for input (blocking)
-                var read_buffer: [128]u8 = undefined;
-                const bytes_read = ui.c.read(ui.c.STDIN_FILENO, &read_buffer, read_buffer.len);
-
-                if (bytes_read > 0) {
-                    const input = read_buffer[0..@intCast(bytes_read)];
-                    const result = try config_editor_input.handleInput(editor, input);
-
-                    switch (result) {
-                        .save_and_close => {
-                            // Validate config before saving
-                            editor.temp_config.validate() catch |err| {
-                                std.debug.print("\n⚠ Config validation warning: {s}\n", .{@errorName(err)});
-                                std.debug.print("   Saving anyway, but please review your settings.\n\n", .{});
-                            };
-
-                            // Check if profile name changed
-                            const profile_manager = @import("profile_manager");
-                            const original_profile = try profile_manager.getActiveProfileName(self.allocator);
-                            defer self.allocator.free(original_profile);
-
-                            var profile_changed = !std.mem.eql(u8, editor.profile_name, original_profile);
-
-                            // If profile name changed, validate it
-                            if (profile_changed) {
-                                if (!profile_manager.validateProfileName(editor.profile_name)) {
-                                    std.debug.print("\n⚠ Invalid profile name: '{s}'\n", .{editor.profile_name});
-                                    std.debug.print("   Profile names must be alphanumeric with dashes/underscores only.\n", .{});
-                                    std.debug.print("   Saving to original profile instead.\n\n", .{});
-                                    // Revert to original profile name
-                                    self.allocator.free(editor.profile_name);
-                                    editor.profile_name = try self.allocator.dupe(u8, original_profile);
-                                    profile_changed = false;
-                                }
-                            }
-
-                            // Save based on whether name actually changed
-                            if (profile_changed) {
-                                // Save to new profile name
-                                try profile_manager.saveProfile(self.allocator, editor.profile_name, editor.temp_config);
-
-                                // Set as active profile
-                                try profile_manager.setActiveProfileName(self.allocator, editor.profile_name);
-
-                                std.debug.print("\n✓ Saved as new profile: {s}\n", .{editor.profile_name});
-                            } else {
-                                // Save to current profile
-                                try profile_manager.saveProfile(self.allocator, editor.profile_name, editor.temp_config);
-
-                                std.debug.print("\n✓ Saved profile: {s}\n", .{editor.profile_name});
-                            }
-
-                            // Apply changes to running config (transfer ownership)
-                            self.config.deinit(self.allocator);
-                            self.config = editor.temp_config;
-
-                            // Re-initialize markdown and UI colors with new config
-                            // CRITICAL: This must be done after config is replaced, since the old
-                            // config strings were just freed and markdown.COLOR_INLINE_CODE_BG
-                            // would be a dangling pointer otherwise
-                            markdown.initColors(self.config.color_inline_code_bg);
-                            ui.initUIColors(self.config.color_status);
-
-                            // Recreate LLM provider with new config
-                            self.llm_provider.deinit();
-                            self.llm_provider = try llm_provider_module.createProvider(
-                                self.config.provider,
-                                self.allocator,
-                                self.config,
-                            );
-
-                            // Close editor (but DON'T deinit temp_config - we transferred it to app.config!)
-                            // Manually free only the editor's sections, fields, and profile_name
-                            self.allocator.free(editor.profile_name);
-
-                            for (editor.sections) |section| {
-                                // Free section title (dynamically allocated)
-                                self.allocator.free(section.title);
-
-                                for (section.fields) |field| {
-                                    if (field.edit_buffer) |buffer| {
-                                        self.allocator.free(buffer);
-                                    }
-                                    // Free options array (allocated by listIdentifiers, etc.)
-                                    if (field.options) |options| {
-                                        self.allocator.free(options);
-                                    }
-                                }
-                                self.allocator.free(section.fields);
-                            }
-                            self.allocator.free(editor.sections);
-                            self.config_editor = null;
-                        },
-                        .cancel => {
-                            // Discard changes and close editor
-                            editor.deinit();
-                            self.config_editor = null;
-                        },
-                        .redraw, .@"continue" => {},
-                    }
-                }
-
-                continue; // Skip normal app logic - editor owns the screen
+            // 1. Modal modes take priority
+            switch (try modal_dispatcher.handleModals(self)) {
+                .consumed => continue,
+                .closed, .none => {},
             }
 
-            // AGENT BUILDER MODE (modal - similar to config editor)
-            if (self.agent_builder) |*builder| {
-                // Render builder
-                var stdout_buffer: [8192]u8 = undefined;
-                var buffered_writer = ui.BufferedStdoutWriter.init(&stdout_buffer);
-                const writer = buffered_writer.writer();
-
-                try agent_builder_renderer.render(
-                    builder,
-                    writer,
-                    self.terminal_size.width,
-                    self.terminal_size.height,
-                );
-                try buffered_writer.flush();
-
-                // Wait for input (blocking)
-                var read_buffer: [128]u8 = undefined;
-                const bytes_read = ui.c.read(ui.c.STDIN_FILENO, &read_buffer, read_buffer.len);
-
-                if (bytes_read > 0) {
-                    const input = read_buffer[0..@intCast(bytes_read)];
-                    const result = try agent_builder_input.handleInput(builder, input);
-
-                    switch (result) {
-                        .save_and_close => {
-                            // Save agent
-                            agent_builder_input.saveAgent(builder) catch |err| {
-                                std.debug.print("Failed to save agent: {}\n", .{err});
-                                // Show error to user (TODO: add error display)
-                            };
-
-                            // Close builder
-                            builder.deinit();
-                            self.agent_builder = null;
-
-                            // Reload agents to include the new one
-                            try self.agent_loader.loadAllAgents();
-                        },
-                        .cancel => {
-                            // Close without saving
-                            builder.deinit();
-                            self.agent_builder = null;
-                        },
-                        .redraw, .@"continue" => {
-                            // Just re-render next iteration
-                        },
-                    }
-                }
-                continue; // Skip normal app rendering
+            // 2. Tool execution state machine
+            switch (try app_tool_execution.tickToolExecution(self)) {
+                .iteration_complete => {
+                    // Streaming already started by tickToolExecution
+                },
+                .iteration_limit => {
+                    // Already displayed message
+                },
+                .needs_redraw => {
+                    // Redraw already done by tickToolExecution
+                },
+                .no_action => {},
             }
 
-            // HELP VIEWER MODE (modal - simple read-only display)
-            if (self.help_viewer) |*viewer| {
-                // Render help
-                var stdout_buffer: [8192]u8 = undefined;
-                var buffered_writer = ui.BufferedStdoutWriter.init(&stdout_buffer);
-                const writer = buffered_writer.writer();
-
-                try help_renderer.render(
-                    viewer,
-                    writer,
-                    self.terminal_size.width,
-                    self.terminal_size.height,
-                );
-                try buffered_writer.flush();
-
-                // Wait for input (blocking)
-                var read_buffer: [128]u8 = undefined;
-                const bytes_read = ui.c.read(ui.c.STDIN_FILENO, &read_buffer, read_buffer.len);
-
-                if (bytes_read > 0) {
-                    const input = read_buffer[0..@intCast(bytes_read)];
-                    // Calculate visible lines for scrolling
-                    const visible_lines = self.terminal_size.height -| 6; // Account for borders and footer
-                    const result = try help_input.handleInput(viewer, input, visible_lines);
-
-                    switch (result) {
-                        .close => {
-                            // Close help viewer
-                            viewer.deinit();
-                            self.help_viewer = null;
-                        },
-                        .redraw, .@"continue" => {
-                            // Just re-render next iteration
-                        },
-                    }
-                }
-                continue; // Skip normal app rendering
-            }
-
-            // PROFILE MANAGER MODE (modal - interactive profile management)
-            if (self.profile_ui) |*profile_ui| {
-                // Render profile UI
-                var stdout_buffer: [8192]u8 = undefined;
-                var buffered_writer = ui.BufferedStdoutWriter.init(&stdout_buffer);
-                const writer = buffered_writer.writer();
-
-                try profile_ui_renderer.render(
-                    profile_ui,
-                    writer,
-                    self.terminal_size.width,
-                    self.terminal_size.height,
-                );
-                try buffered_writer.flush();
-
-                // Wait for input (blocking)
-                var read_buffer: [128]u8 = undefined;
-                const bytes_read = ui.c.read(ui.c.STDIN_FILENO, &read_buffer, read_buffer.len);
-
-                if (bytes_read > 0) {
-                    const input = read_buffer[0..@intCast(bytes_read)];
-                    const result = try profile_ui_input.handleInput(profile_ui, self, input);
-
-                    switch (result) {
-                        .close, .profile_switched => {
-                            // Close profile UI
-                            profile_ui.deinit();
-                            self.profile_ui = null;
-                        },
-                        .redraw, .@"continue" => {
-                            // Just re-render next iteration
-                        },
-                    }
-                }
-                continue; // Skip normal app rendering
-            }
-
-            // Handle pending tool executions using state machine (async - doesn't block input)
-            if (self.tool_executor.hasPendingWork()) {
-                // Forward permission response from App to tool_executor if available
-                if (self.permission_response) |response| {
-                    self.tool_executor.setPermissionResponse(response);
-                    self.permission_response = null;
-                }
-
-                // Advance the state machine
-                const tick_result = try self.tool_executor.tick(
-                    &self.permission_manager,
-                    self.state.iteration_count,
-                    self.max_iterations,
-                );
-
-                switch (tick_result) {
-                    .no_action => {
-                        // Nothing to do - waiting for user input or other event
-                    },
-
-                    .show_permission_prompt => {
-                        // Tool executor needs to ask user for permission
-                        if (self.tool_executor.getPendingPermissionTool()) |tool_call| {
-                            if (self.tool_executor.getPendingPermissionEval()) |eval_result| {
-                                try self.showPermissionPrompt(tool_call, eval_result);
-                                self.permission_pending = true;
-                                _ = try message_renderer.redrawScreen(self);
-                                self.updateCursorToBottom();
-                            }
-                        }
-                    },
-
-                    .render_requested => {
-                        // Tool executor is ready to execute current tool (if in executing state)
-                        if (self.tool_executor.getCurrentState() == .executing) {
-                            if (self.tool_executor.getCurrentToolCall()) |tool_call| {
-                                const call_idx = self.tool_executor.current_index;
-
-                                // Execute tool and get structured result
-                                var result = self.executeTool(tool_call) catch |err| blk: {
-                                    const msg = try std.fmt.allocPrint(self.allocator, "Runtime error: {}", .{err});
-                                    defer self.allocator.free(msg);
-                                    break :blk try tools_module.ToolResult.err(self.allocator, .internal_error, msg, std.time.milliTimestamp());
-                                };
-                                defer result.deinit(self.allocator);
-
-                                // Create user-facing display message (FULL TRANSPARENCY)
-                                const display_content = try result.formatDisplay(
-                                    self.allocator,
-                                    tool_call.function.name,
-                                    tool_call.function.arguments,
-                                );
-                                const display_processed = try markdown.processMarkdown(self.allocator, display_content);
-
-                                // Note: Agent thinking is shown in separate "Agent Analysis" message above
-                                // No need to duplicate it in tool result
-
-                                try self.messages.append(self.allocator, .{
-                                    .role = .display_only_data,
-                                    .content = display_content,
-                                    .processed_content = display_processed,
-                                    .thinking_content = null,  // Thinking shown separately
-                                    .processed_thinking_content = null,
-                                    .thinking_expanded = false,
-                                    .timestamp = std.time.milliTimestamp(),
-                                    // Tool execution metadata for collapsible display
-                                    .tool_call_expanded = false,
-                                    .tool_name = try self.allocator.dupe(u8, tool_call.function.name),
-                                    .tool_success = result.success,
-                                    .tool_execution_time = result.metadata.execution_time_ms,
-                                });
-
-                                // Persist tool execution display immediately
-                                try self.persistMessage(self.messages.items.len - 1);
-
-                                // Don't redraw yet - wait until tool result is also added
-                                // to avoid double-redraw per tool (reduces flashing)
-
-                                // Create model-facing result (JSON for LLM)
-                                const tool_id_copy = if (tool_call.id) |id|
-                                    try self.allocator.dupe(u8, id)
-                                else
-                                    try std.fmt.allocPrint(self.allocator, "call_{d}", .{call_idx});
-
-                                const model_result = if (result.success and result.data != null)
-                                    try self.allocator.dupe(u8, result.data.?)
-                                else
-                                    try result.toJSON(self.allocator);
-
-                                const result_processed = try markdown.processMarkdown(self.allocator, model_result);
-
-                                try self.messages.append(self.allocator, .{
-                                    .role = .tool,
-                                    .content = model_result,
-                                    .processed_content = result_processed,
-                                    .thinking_expanded = false,
-                                    .timestamp = std.time.milliTimestamp(),
-                                    .tool_call_id = tool_id_copy,
-                                });
-
-                                // Persist tool result immediately
-                                try self.persistMessage(self.messages.items.len - 1);
-
-                                // Now redraw once for both messages (display + tool result)
-                                // Single redraw instead of two reduces flashing
-                                _ = try message_renderer.redrawScreen(self);
-                                self.updateCursorToBottom();
-
-                                // Tell executor to advance to next tool
-                                self.tool_executor.advanceAfterExecution();
-                                
-                                // DEBUG: Log state after advancing
-                                if (std.posix.getenv("DEBUG_TOOLS")) |_| {
-                                    std.debug.print("[TOOL_EXEC] After advance: state={s}, hasPending={}\n", .{
-                                        @tagName(self.tool_executor.getCurrentState()),
-                                        self.tool_executor.hasPendingWork(),
-                                    });
-                                }
-                            }
-                        } else if (self.tool_executor.getCurrentState() == .creating_denial_result) {
-                            // User denied permission - create error result for LLM
-                            if (self.tool_executor.getCurrentToolCall()) |tool_call| {
-                                const call_idx = self.tool_executor.current_index;
-
-                                // Create permission denied error result
-                                var result = try tools_module.ToolResult.err(
-                                    self.allocator,
-                                    .permission_denied,
-                                    "User denied permission for this operation",
-                                    std.time.milliTimestamp(),
-                                );
-                                defer result.deinit(self.allocator);
-
-                                // Create user-facing display message
-                                const display_content = try result.formatDisplay(
-                                    self.allocator,
-                                    tool_call.function.name,
-                                    tool_call.function.arguments,
-                                );
-                                const display_processed = try markdown.processMarkdown(self.allocator, display_content);
-
-                                try self.messages.append(self.allocator, .{
-                                    .role = .display_only_data,
-                                    .content = display_content,
-                                    .processed_content = display_processed,
-                                    .thinking_content = null,
-                                    .processed_thinking_content = null,
-                                    .thinking_expanded = false,
-                                    .timestamp = std.time.milliTimestamp(),
-                                    .tool_call_expanded = false,
-                                    .tool_name = try self.allocator.dupe(u8, tool_call.function.name),
-                                    .tool_success = false,
-                                    .tool_execution_time = result.metadata.execution_time_ms,
-                                });
-
-                                // Persist tool error display immediately
-                                try self.persistMessage(self.messages.items.len - 1);
-
-                                // Receipt printer mode: auto-scroll
-                                _ = try message_renderer.redrawScreen(self);
-                                self.updateCursorToBottom();
-
-                                // Create model-facing result (JSON for LLM)
-                                const tool_id_copy = if (tool_call.id) |id|
-                                    try self.allocator.dupe(u8, id)
-                                else
-                                    try std.fmt.allocPrint(self.allocator, "call_{d}", .{call_idx});
-
-                                const model_result = try result.toJSON(self.allocator);
-                                const result_processed = try markdown.processMarkdown(self.allocator, model_result);
-
-                                try self.messages.append(self.allocator, .{
-                                    .role = .tool,
-                                    .content = model_result,
-                                    .processed_content = result_processed,
-                                    .thinking_expanded = false,
-                                    .timestamp = std.time.milliTimestamp(),
-                                    .tool_call_id = tool_id_copy,
-                                });
-
-                                // Persist tool error result immediately
-                                try self.persistMessage(self.messages.items.len - 1);
-
-                                // Receipt printer mode: auto-scroll
-                                _ = try message_renderer.redrawScreen(self);
-                                self.updateCursorToBottom();
-
-                                // Tell executor to advance to next tool
-                                self.tool_executor.advanceAfterExecution();
-                            }
-                        } else {
-                            // Just redraw for other states
-                            _ = try message_renderer.redrawScreen(self);
-                        }
-                    },
-
-                    .iteration_complete => {
-                        // All tools executed - increment iteration and continue streaming
-                        self.state.iteration_count += 1;
-                        self.tool_call_depth = 0; // Reset for next iteration
-
-                        _ = try message_renderer.redrawScreen(self);
-
-                        // NOTE: Do NOT process Graph RAG queue here!
-                        // Queue processing happens only when the entire conversation turn is done,
-                        // not between tool iterations. See line ~1492 where we process after
-                        // streaming completes with no tool calls.
-
-                        try self.startStreaming(null);
-                    },
-
-                    .iteration_limit_reached => {
-                        // Max iterations reached - stop master loop
-                        const msg = try std.fmt.allocPrint(
-                            self.allocator,
-                            "⚠️  Reached maximum iteration limit ({d}). Stopping master loop to prevent infinite execution.",
-                            .{self.max_iterations},
-                        );
-                        const processed = try markdown.processMarkdown(self.allocator, msg);
-                        try self.messages.append(self.allocator, .{
-                            .role = .display_only_data,
-                            .content = msg,
-                            .processed_content = processed,
-                            .thinking_expanded = false,
-                            .timestamp = std.time.milliTimestamp(),
-                        });
-
-                        // Persist error message immediately
-                        try self.persistMessage(self.messages.items.len - 1);
-
-                        _ = try message_renderer.redrawScreen(self);
-                    },
-                }
-            }
-
-            // Process stream chunks if streaming is active
+            // 3. Process stream chunks
             if (self.streaming_active) {
-                self.stream_mutex.lock();
-
-                var chunks_were_processed = false;
-
-                // Process all pending chunks
-                for (self.stream_chunks.items) |chunk| {
-                    chunks_were_processed = true;
-                    if (chunk.done) {
-                        // Streaming complete - clean up
-                        self.streaming_active = false;
-
-                        thinking_accumulator.clearRetainingCapacity();
-                        content_accumulator.clearRetainingCapacity();
-
-                        // Auto-collapse thinking box when streaming finishes
-                        if (self.messages.items.len > 0) {
-                            self.messages.items[self.messages.items.len - 1].thinking_expanded = false;
-                        }
-
-                        // Wait for thread to finish and clean up context
-                        if (self.stream_thread) |thread| {
-                            self.stream_mutex.unlock();
-                            thread.join();
-                            self.stream_mutex.lock();
-                            self.stream_thread = null;
-
-                            // Free thread context and its data
-                            if (self.stream_thread_ctx) |ctx| {
-                                // Note: msg.role and msg.content are NOT owned by the context
-                                // They are pointers to existing message data, so we only free the array
-                                self.allocator.free(ctx.messages);
-                                self.allocator.destroy(ctx);
-                                self.stream_thread_ctx = null;
-                            }
-                        }
-
-                        // Check if model requested tool calls
-                        const tool_calls_to_execute = self.pending_tool_calls;
-                        self.pending_tool_calls = null; // Clear pending calls
-
-                        if (tool_calls_to_execute) |tool_calls| {
-                            // Check recursion depth
-                            if (self.tool_call_depth >= self.max_tool_depth) {
-                                // Too many recursive tool calls - show error and stop
-                                self.stream_mutex.unlock();
-
-                                const error_msg = try self.allocator.dupe(u8, "Error: Maximum tool call depth reached. Stopping to prevent infinite loop.");
-                                const error_processed = try markdown.processMarkdown(self.allocator, error_msg);
-                                try self.messages.append(self.allocator, .{
-                                    .role = .display_only_data,
-                                    .content = error_msg,
-                                    .processed_content = error_processed,
-                                    .thinking_expanded = false,
-                                    .timestamp = std.time.milliTimestamp(),
-                                });
-
-                                // Persist streaming error immediately
-                                try self.persistMessage(self.messages.items.len - 1);
-
-                                // Clean up tool calls
-                                for (tool_calls) |call| {
-                                    if (call.id) |id| self.allocator.free(id);
-                                    if (call.type) |call_type| self.allocator.free(call_type);
-                                    self.allocator.free(call.function.name);
-                                    self.allocator.free(call.function.arguments);
-                                }
-                                self.allocator.free(tool_calls);
-
-                                self.stream_mutex.lock();
-                            } else {
-                                self.stream_mutex.unlock();
-
-                                // Increment depth
-                                self.tool_call_depth += 1;
-
-                                // Attach tool calls to the last assistant message
-                                if (self.messages.items.len > 0) {
-                                    var last_message = &self.messages.items[self.messages.items.len - 1];
-                                    if (last_message.role == .assistant) {
-                                        last_message.tool_calls = tool_calls;
-                                    }
-                                }
-
-                                // Persist assistant message with tool_calls attached
-                                try self.persistMessage(self.messages.items.len - 1);
-
-                                // Update display to show tool call
-                                _ = try message_renderer.redrawScreen(self);
-                                self.updateCursorToBottom();
-
-                                // Start tool executor with new tool calls
-                                self.tool_executor.startExecution(tool_calls);
-
-                                // Re-lock mutex before continuing
-                                self.stream_mutex.lock();
-                            }
-                        } else {
-                            // No tool calls - response is complete
-                            // Persist completed assistant message
-                            try self.persistMessage(self.messages.items.len - 1);
-
-                            // ==========================================
-                            // SECONDARY LOOP: Process Graph RAG queue
-                            // ==========================================
-                            // This is the ONLY place where Graph RAG indexing runs.
-                            // It processes all files queued by read_file tool during the main loop.
-                            // This ensures indexing happens AFTER the conversation turn is complete,
-                            // keeping the main loop responsive to the user.
-                            if (std.posix.getenv("DEBUG_GRAPHRAG")) |_| {
-                                std.debug.print("[GRAPHRAG] Main loop complete, starting secondary loop...\n", .{});
-                            }
-
-                            self.stream_mutex.unlock();
-
-                            self.stream_mutex.lock();
-                        }
-                    } else {
-                        // Accumulate chunks
-                        if (chunk.thinking) |t| {
-                            try thinking_accumulator.appendSlice(self.allocator, t);
-                        }
-                        if (chunk.content) |c| {
-                            try content_accumulator.appendSlice(self.allocator, c);
-                        }
-
-                        // Update the last message
-                        if (self.messages.items.len > 0) {
-                            var last_message = &self.messages.items[self.messages.items.len - 1];
-
-                            // Update thinking content if we have any
-                            if (thinking_accumulator.items.len > 0) {
-                                if (last_message.thinking_content) |old_thinking| {
-                                    self.allocator.free(old_thinking);
-                                }
-                                if (last_message.processed_thinking_content) |*old_processed| {
-                                    for (old_processed.items) |*item| {
-                                        item.deinit(self.allocator);
-                                    }
-                                    old_processed.deinit(self.allocator);
-                                }
-
-                                last_message.thinking_content = try self.allocator.dupe(u8, thinking_accumulator.items);
-                                last_message.processed_thinking_content = try markdown.processMarkdown(self.allocator, last_message.thinking_content.?);
-                            }
-
-                            // Update main content
-                            self.allocator.free(last_message.content);
-                            for (last_message.processed_content.items) |*item| {
-                                item.deinit(self.allocator);
-                            }
-                            last_message.processed_content.deinit(self.allocator);
-
-                            last_message.content = try self.allocator.dupe(u8, content_accumulator.items);
-
-                            // DEBUG: Check content encoding
-                            if (std.posix.getenv("DEBUG_LMSTUDIO") != null and last_message.content.len > 0) {
-                                const preview_len = @min(100, last_message.content.len);
-                                std.debug.print("\nDEBUG APP: Raw content ({d} bytes): {s}\n", .{last_message.content.len, last_message.content[0..preview_len]});
-
-                                // Show hex dump of raw content
-                                const hex_len = @min(100, last_message.content.len);
-                                std.debug.print("DEBUG APP: Raw content hex: ", .{});
-                                for (last_message.content[0..hex_len]) |byte| {
-                                    std.debug.print("{x:0>2} ", .{byte});
-                                }
-                                std.debug.print("\n", .{});
-
-                                // Check for ANSI escape codes
-                                if (std.mem.indexOf(u8, last_message.content, "\x1b")) |idx| {
-                                    std.debug.print("WARNING: Found ANSI escape code at position {d}!\n", .{idx});
-                                }
-
-                                // Check for high bytes (> 127) that might be problematic
-                                for (last_message.content[0..@min(100, last_message.content.len)], 0..) |byte, i| {
-                                    if (byte >= 128) {
-                                        std.debug.print("DEBUG: High byte 0x{x:0>2} at position {d}\n", .{byte, i});
-                                    }
-                                }
-                            }
-
-                            last_message.processed_content = try markdown.processMarkdown(self.allocator, last_message.content);
-
-                            // Removed dirty state tracking - rendering is now automatic
-
-                            // DEBUG: Check if markdown processing worked
-                            if (std.posix.getenv("DEBUG_LMSTUDIO") != null) {
-                                std.debug.print("DEBUG APP: Processed markdown - got {d} items\n", .{last_message.processed_content.items.len});
-                                if (last_message.processed_content.items.len > 0) {
-                                    std.debug.print("DEBUG APP: First item type: {s}\n", .{@tagName(last_message.processed_content.items[0].tag)});
-
-                                    // Check what's in the styled_text
-                                    if (last_message.processed_content.items[0].tag == .styled_text) {
-                                        const styled = last_message.processed_content.items[0].payload.styled_text;
-                                        if (styled.len < 100) {
-                                            std.debug.print("DEBUG APP: Styled text content: {s}\n", .{styled});
-                                            // Show hex of first 50 bytes
-                                            const hex_len = @min(50, styled.len);
-                                            std.debug.print("DEBUG APP: Hex: ", .{});
-                                            for (styled[0..hex_len]) |byte| {
-                                                std.debug.print("{x:0>2} ", .{byte});
-                                            }
-                                            std.debug.print("\n", .{});
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                const result = try app_streaming.processStreamChunks(
+                    self,
+                    &thinking_accumulator,
+                    &content_accumulator,
+                );
+                if (result.streaming_complete and result.has_pending_tool_calls) {
+                    // pending_tool_calls was set by processStreamChunks, start execution
+                    if (self.pending_tool_calls) |tool_calls| {
+                        self.tool_executor.startExecution(tool_calls);
+                        self.pending_tool_calls = null;
                     }
-
-                    // Free the chunk's data
-                    if (chunk.thinking) |t| self.allocator.free(t);
-                    if (chunk.content) |c| self.allocator.free(c);
                 }
-
-                // Clear processed chunks
-                self.stream_chunks.clearRetainingCapacity();
-                self.stream_mutex.unlock();
-
-                // Only render when chunks arrive (avoid busy loop)
-                if (chunks_were_processed) {
-                    // Update scroll position to keep content in view
-                    // (Needed when streaming ends - done chunk sets streaming_active=false,
-                    //  collapses thinking, and changes message hash/height)
-
+                // Process queued messages after main streaming completes (no tool calls)
+                if (result.streaming_complete and !result.has_pending_tool_calls) {
+                    _ = try self.processQueuedMessages();
+                }
+                if (result.needs_redraw) {
                     _ = try message_renderer.redrawScreen(self);
-
-                    // Update cursor to bottom after redraw
-
-                    // Input handling happens after this block - no continue/skip!
-                    // This allows scroll wheel to work immediately
                 }
             }
 
-            // Check for agent completion (non-blocking poll)
-            if (self.agent_thread != null) {
-                // Process any queued tool events from background thread
-                self.agent_result_mutex.lock();
-                const events_to_process = self.agent_tool_events.toOwnedSlice(self.allocator) catch null;
-                const result_ready = self.agent_result_ready;
-                self.agent_result_mutex.unlock();
+            // 4. Poll agent results
+            try app_agents.processAgentToolEvents(self);
+            if (try app_agents.pollAgentResult(self)) {
+                self.agent_responding = false;
 
-                // Process tool events outside the mutex
-                if (events_to_process) |events| {
-                    defer self.allocator.free(events);
-                    var current_tool_idx: ?usize = null;
-
-                    for (events) |event| {
-                        defer self.allocator.free(event.tool_name);
-
-                        switch (event.event_type) {
-                            .start => {
-                                // Add placeholder tool message
-                                const tool_name = self.allocator.dupe(u8, event.tool_name) catch continue;
-                                const content = self.allocator.dupe(u8, "") catch {
-                                    self.allocator.free(tool_name);
-                                    continue;
-                                };
-
-                                self.messages.append(self.allocator, .{
-                                    .role = .display_only_data,
-                                    .content = content,
-                                    .processed_content = .{},
-                                    .timestamp = std.time.milliTimestamp(),
-                                    .tool_call_expanded = false,
-                                    .tool_name = tool_name,
-                                    .tool_success = null,
-                                    .tool_execution_time = null,
-                                }) catch continue;
-                                current_tool_idx = self.messages.items.len - 1;
-                            },
-                            .complete => {
-                                // Update the tool message with results
-                                if (current_tool_idx) |idx| {
-                                    var msg = &self.messages.items[idx];
-                                    msg.tool_success = event.success;
-                                    msg.tool_execution_time = event.execution_time_ms;
-                                }
-                                current_tool_idx = null;
-                            },
-                        }
-                    }
-
-                    // Redraw after processing events
-                    if (events.len > 0) {
-                        _ = message_renderer.redrawScreen(self) catch {};
-                    }
-                }
-
-                if (result_ready) {
-                    // Agent finished - join thread and process result
-                    if (self.agent_thread) |thread| {
-                        thread.join();
-                        self.agent_thread = null;
-                    }
-
-                    // Get the result (protected by mutex)
-                    self.agent_result_mutex.lock();
-                    var result = self.agent_result;
-                    self.agent_result = null;
-                    self.agent_result_ready = false;
-                    self.agent_result_mutex.unlock();
-
-                    // Clean up thread context
-                    if (self.agent_thread_ctx) |ctx| {
-                        ctx.deinit();
-                        self.allocator.destroy(ctx);
-                        self.agent_thread_ctx = null;
-                    }
-
-                    // Process the result
-                    if (result) |*r| {
-                        try self.handleAgentResult(r);
-                    }
-
-                    // Clear agent responding flag
-                    self.agent_responding = false;
-                }
+                // Process queued user messages
+                _ = try self.processQueuedMessages();
             }
 
-            // Main render section - runs when NOT streaming or when streaming but no chunks
-            // During streaming, we skip this to avoid double-render
+            // 5. Render (when not streaming)
             if (!self.streaming_active) {
-                // Handle resize signals (main content always expanded, no special handling needed)
+                // Handle resize signals
                 if (ui.resize_pending) {
                     ui.resize_pending = false;
                 }
@@ -2349,7 +859,6 @@ pub const App = struct {
                     1;
 
                 // Only clear if there's space between content and input field
-                // input_field_height includes separator, +1 for taskbar
                 const input_area_start = if (self.terminal_size.height > input_field_height + 1)
                     self.terminal_size.height - input_field_height
                 else
@@ -2364,7 +873,7 @@ pub const App = struct {
                 try buffered_writer.flush();
             }
 
-            // If streaming is active, tools are executing, or agent thread is running, don't block
+            // 6. Input handling
             if (self.streaming_active or self.tool_executor.hasPendingWork() or self.agent_thread != null) {
                 // Read input non-blocking
                 var read_buffer: [128]u8 = undefined;
@@ -2375,17 +884,14 @@ pub const App = struct {
                     if (try ui.handleInput(self, input, &should_redraw)) {
                         return;
                     }
-                    // Check if we need to redraw (e.g., after toggling settings)
                     if (should_redraw) {
                         _ = try message_renderer.redrawScreen(self);
                     }
                 }
-                // Continue main loop immediately to check for more chunks or execute next tool
-                // Small sleep to avoid busy-waiting and reduce CPU usage
-                std.Thread.sleep(10 * std.time.ns_per_ms); // 10ms
+                // Small sleep to avoid busy-waiting
+                std.Thread.sleep(10 * std.time.ns_per_ms);
             } else {
                 // Normal blocking mode when not streaming
-
                 var should_redraw = false;
                 while (!should_redraw) {
                     // Check for resize signal before blocking on input
@@ -2411,7 +917,6 @@ pub const App = struct {
                             should_redraw = true;
                             break;
                         }
-                        // Also check resize timeout after read returns
                         if (self.resize_in_progress) {
                             const now = std.time.milliTimestamp();
                             if (now - self.last_resize_time > 200) {
@@ -2428,9 +933,8 @@ pub const App = struct {
                 }
             }
 
-            // View height accounts for input field + status bar (dynamic based on input length)
             // Adjust viewport to keep cursor in view
-            const input_field_height = message_renderer.calculateInputFieldHeight(self) catch 2; // fallback to minimum
+            const input_field_height = message_renderer.calculateInputFieldHeight(self) catch 2;
             const view_height = if (self.terminal_size.height > input_field_height + 1)
                 self.terminal_size.height - input_field_height - 1
             else

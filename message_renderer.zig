@@ -1401,8 +1401,16 @@ pub fn drawMessage(
 pub fn calculateInputFieldHeight(app: *App) !usize {
     const max_visible_lines = 7;
 
-    // If input buffer is empty, we still show one line
-    if (app.input_buffer.items.len == 0) {
+    // Determine what to display: current input, or first queued message if input is empty
+    const display_text = if (app.input_buffer.items.len > 0)
+        app.input_buffer.items
+    else if (app.pending_user_messages.items.len > 0)
+        app.pending_user_messages.items[0]
+    else
+        "";
+
+    // If nothing to display, show one line
+    if (display_text.len == 0) {
         return 3; // 1 top separator + 1 input line + 1 bottom border
     }
 
@@ -1413,9 +1421,9 @@ pub fn calculateInputFieldHeight(app: *App) !usize {
         return 3; // 1 top separator + 1 input line + 1 bottom border
     }
 
-    // Wrap the input buffer text to see how many lines it takes
+    // Wrap the display text to see how many lines it takes
     const max_width = width - 3; // Account for "> " or "  " indent
-    var wrapped_lines = try render.wrapRawText(app.allocator, app.input_buffer.items, max_width);
+    var wrapped_lines = try render.wrapRawText(app.allocator, display_text, max_width);
     defer {
         for (wrapped_lines.items) |line| app.allocator.free(line);
         wrapped_lines.deinit(app.allocator);
@@ -1434,10 +1442,20 @@ pub fn drawInputField(app: *App, writer: anytype) !void {
     const width = app.terminal_size.width;
     const max_visible_lines = 7;
 
-    // Wrap the input buffer text
+    // Determine what to display: current input, or first queued message if input is empty
+    const num_queued = app.pending_user_messages.items.len;
+    const is_showing_queued = app.input_buffer.items.len == 0 and num_queued > 0;
+    const display_text = if (app.input_buffer.items.len > 0)
+        app.input_buffer.items
+    else if (num_queued > 0)
+        app.pending_user_messages.items[0]
+    else
+        "";
+
+    // Wrap the display text
     const max_width = if (width > 3) width - 3 else 1; // Account for "> " or "  " indent
-    var wrapped_lines = if (app.input_buffer.items.len > 0)
-        try render.wrapRawText(app.allocator, app.input_buffer.items, max_width)
+    var wrapped_lines = if (display_text.len > 0)
+        try render.wrapRawText(app.allocator, display_text, max_width)
     else
         std.ArrayListUnmanaged([]const u8){};
     defer {
@@ -1445,7 +1463,7 @@ pub fn drawInputField(app: *App, writer: anytype) !void {
         wrapped_lines.deinit(app.allocator);
     }
 
-    // If buffer is empty, we still need at least one line for the prompt
+    // If nothing to display, we still need at least one line for the prompt
     const total_lines = if (wrapped_lines.items.len == 0) 1 else wrapped_lines.items.len;
     const num_visible_lines = @min(total_lines, max_visible_lines);
     const num_hidden_lines = if (total_lines > max_visible_lines) total_lines - max_visible_lines else 0;
@@ -1456,9 +1474,27 @@ pub fn drawInputField(app: *App, writer: anytype) !void {
     const first_input_row = last_input_row - (num_visible_lines - 1);
     const separator_row = first_input_row - 1;
 
-    // Draw separator with indicator if there are hidden lines
+    // Draw separator with indicator if there are hidden lines or queued message
     try writer.print("\x1b[{d};1H", .{separator_row});
-    if (num_hidden_lines > 0) {
+    if (is_showing_queued) {
+        // Show queued indicator with count if multiple
+        if (num_queued > 1) {
+            const indicator = try std.fmt.allocPrint(app.allocator, "──── ⏳ queued ({d}) ", .{num_queued});
+            defer app.allocator.free(indicator);
+            const indicator_len = ui.AnsiParser.getVisibleLength(indicator);
+            try writer.writeAll(indicator);
+            if (indicator_len < width) {
+                for (0..(width - indicator_len)) |_| try writer.writeAll("─");
+            }
+        } else {
+            const indicator = "──── ⏳ queued ";
+            try writer.writeAll(indicator);
+            const indicator_len = ui.AnsiParser.getVisibleLength(indicator);
+            if (indicator_len < width) {
+                for (0..(width - indicator_len)) |_| try writer.writeAll("─");
+            }
+        }
+    } else if (num_hidden_lines > 0) {
         // Show indicator for hidden lines
         const indicator = try std.fmt.allocPrint(app.allocator, "──── ↑ {d} more line{s} ", .{
             num_hidden_lines,
@@ -1494,18 +1530,36 @@ pub fn drawInputField(app: *App, writer: anytype) !void {
             const is_first_visible_line = (i == 0);
 
             if (is_first_visible_line) {
-                try writer.writeAll("> ");
+                // Show dimmed text for queued messages
+                if (is_showing_queued) {
+                    try writer.writeAll("\x1b[90m> "); // Dim gray
+                } else {
+                    try writer.writeAll("> ");
+                }
             } else {
-                try writer.writeAll("  "); // Indent continuation lines
+                if (is_showing_queued) {
+                    try writer.writeAll("\x1b[90m  "); // Dim gray
+                } else {
+                    try writer.writeAll("  "); // Indent continuation lines
+                }
             }
 
             if (line_idx < wrapped_lines.items.len) {
                 try writer.writeAll(wrapped_lines.items[line_idx]);
 
-                // Show cursor on the last line
+                // Show cursor on the last line (only for active input, not queued)
                 if (line_idx == wrapped_lines.items.len - 1) {
-                    try writer.writeAll("_");
+                    if (is_showing_queued) {
+                        try writer.writeAll("\x1b[0m"); // Reset color
+                    } else {
+                        try writer.writeAll("_");
+                    }
                 }
+            }
+
+            // Reset color for queued messages (last line already reset above)
+            if (is_showing_queued and line_idx != wrapped_lines.items.len - 1) {
+                try writer.writeAll("\x1b[0m");
             }
         }
 

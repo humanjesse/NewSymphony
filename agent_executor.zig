@@ -99,6 +99,7 @@ fn streamCallback(
 pub const AgentExecutor = struct {
     allocator: std.mem.Allocator,
     message_history: std.ArrayListUnmanaged(ollama.ChatMessage),
+    message_history_mutex: std.Thread.Mutex = .{},
     capabilities: AgentCapabilities,
 
     // Statistics
@@ -124,6 +125,8 @@ pub const AgentExecutor = struct {
 
     fn vtableGetMessageHistoryLen(ptr: *anyopaque) usize {
         const self: *AgentExecutor = @ptrCast(@alignCast(ptr));
+        self.message_history_mutex.lock();
+        defer self.message_history_mutex.unlock();
         return self.message_history.items.len;
     }
 
@@ -189,10 +192,14 @@ pub const AgentExecutor = struct {
         }
 
         // Add user task message
-        try self.message_history.append(self.allocator, .{
-            .role = "user",
-            .content = try self.allocator.dupe(u8, user_task),
-        });
+        {
+            self.message_history_mutex.lock();
+            defer self.message_history_mutex.unlock();
+            try self.message_history.append(self.allocator, .{
+                .role = "user",
+                .content = try self.allocator.dupe(u8, user_task),
+            });
+        }
 
         // Persist user message
         if (context.conversation_db) |db| {
@@ -225,10 +232,14 @@ pub const AgentExecutor = struct {
         self.start_time = std.time.milliTimestamp();
 
         // Add the user's response to message history
-        try self.message_history.append(self.allocator, .{
-            .role = "user",
-            .content = try self.allocator.dupe(u8, user_response),
-        });
+        {
+            self.message_history_mutex.lock();
+            defer self.message_history_mutex.unlock();
+            try self.message_history.append(self.allocator, .{
+                .role = "user",
+                .content = try self.allocator.dupe(u8, user_response),
+            });
+        }
 
         // Persist user message
         if (context.conversation_db) |db| {
@@ -357,14 +368,18 @@ pub const AgentExecutor = struct {
                 null;
 
             // Add assistant message to history
-            try self.message_history.append(self.allocator, .{
-                .role = "assistant",
-                .content = try self.allocator.dupe(u8, response_content),
-                .tool_calls = if (stream_ctx.tool_calls.items.len > 0)
-                    try stream_ctx.tool_calls.toOwnedSlice(self.allocator)
-                else
-                    null,
-            });
+            {
+                self.message_history_mutex.lock();
+                defer self.message_history_mutex.unlock();
+                try self.message_history.append(self.allocator, .{
+                    .role = "assistant",
+                    .content = try self.allocator.dupe(u8, response_content),
+                    .tool_calls = if (stream_ctx.tool_calls.items.len > 0)
+                        try stream_ctx.tool_calls.toOwnedSlice(self.allocator)
+                    else
+                        null,
+                });
+            }
 
             // Persist assistant message
             if (context.conversation_db) |db| {
@@ -402,11 +417,15 @@ pub const AgentExecutor = struct {
 
                     // Add tool result to message history
                     const tool_call_id = tool_call.id orelse "unknown";
-                    try self.message_history.append(self.allocator, .{
-                        .role = "tool",
-                        .content = try self.allocator.dupe(u8, tool_result),
-                        .tool_call_id = try self.allocator.dupe(u8, tool_call_id),
-                    });
+                    {
+                        self.message_history_mutex.lock();
+                        defer self.message_history_mutex.unlock();
+                        try self.message_history.append(self.allocator, .{
+                            .role = "tool",
+                            .content = try self.allocator.dupe(u8, tool_result),
+                            .tool_call_id = try self.allocator.dupe(u8, tool_call_id),
+                        });
+                    }
 
                     // Persist tool message
                     if (context.conversation_db) |db| {

@@ -306,10 +306,11 @@ pub fn drawTaskbar(app: *const app_module.App, writer: anytype) !void {
 
     if (app.permission_pending) {
         try writer.print("\x1b[33m⚠️  Permission Required:\x1b[0m Press \x1b[32mA\x1b[0m/\x1b[32mS\x1b[0m/\x1b[36mR\x1b[0m/\x1b[31mD\x1b[0m to respond", .{});
+    } else if (app.agent_responding) {
+        // Check agent_responding first - agents also set streaming_active for the streaming mechanism
+        try writer.print("{s}🤖 Agent is responding...\x1b[0m | Type '/quit' + Enter to exit", .{status_color});
     } else if (app.streaming_active) {
         try writer.print("{s}AI is responding...\x1b[0m (wait for response to finish before sending) | Type '/quit' + Enter to exit", .{status_color});
-    } else if (app.agent_responding) {
-        try writer.print("{s}🤖 Agent is responding...\x1b[0m | Type '/quit' + Enter to exit", .{status_color});
     } else {
         try writer.print("Type '/quit' and press Enter to exit.", .{});
     }
@@ -416,9 +417,22 @@ pub fn handleInput(
             '\r', '\n' => {
                 // Enter key - check for commands or send message
                 if (app.input_buffer.items.len > 0) {
-                    // Check for /quit command
+                    // Check for /quit command (always immediate, even while streaming)
                     if (mem.eql(u8, app.input_buffer.items, "/quit")) {
                         return true; // Quit the application
+                    }
+
+                    // Queue ALL other input if agent/streaming is active
+                    // This prevents blocking the UI when ending agent sessions
+                    if (app.streaming_active or app.agent_thread != null) {
+                        // Append to queue (supports multiple queued messages)
+                        try app.pending_user_messages.append(
+                            app.allocator,
+                            try app.allocator.dupe(u8, app.input_buffer.items),
+                        );
+                        app.input_buffer.clearRetainingCapacity();
+                        should_redraw.* = true;
+                        return false;
                     }
 
                     // Check for /context command
@@ -563,14 +577,6 @@ pub fn handleInput(
                                 return false;
                             }
                         }
-                    }
-
-                    // Don't send new messages while streaming is active
-                    // User can type, but the message won't be sent until current stream finishes
-                    if (app.streaming_active) {
-                        // Optionally: could show a visual indicator or just ignore the Enter
-                        // For now, we just don't send the message
-                        return false;
                     }
 
                     // Send the message

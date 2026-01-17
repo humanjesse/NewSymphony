@@ -392,6 +392,71 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("task_db", task_db_module);
     app_module.addImport("git_sync", git_sync_module);
 
+    // Extracted app modules (Phase 1-4 of app.zig refactoring)
+    const app_streaming_module = b.createModule(.{
+        .root_source_file = b.path("app_streaming.zig"),
+    });
+    app_streaming_module.addImport("app", app_module);
+    app_streaming_module.addImport("ollama", ollama_module);
+    app_streaming_module.addImport("llm_provider", llm_provider_module);
+    app_streaming_module.addImport("markdown", markdown_module);
+    app_streaming_module.addImport("types", types_module);
+    app_streaming_module.addImport("message_renderer", message_renderer_module);
+
+    const app_agents_module = b.createModule(.{
+        .root_source_file = b.path("app_agents.zig"),
+    });
+    app_agents_module.addImport("app", app_module);
+    app_agents_module.addImport("ollama", ollama_module);
+    app_agents_module.addImport("markdown", markdown_module);
+    app_agents_module.addImport("tools", tools_module);
+    app_agents_module.addImport("message_renderer", message_renderer_module);
+    app_agents_module.addImport("context", context_module);
+    app_agents_module.addImport("agents", agents_module);
+    app_agents_module.addImport("agent_executor", agent_executor_module);
+
+    const modal_dispatcher_module = b.createModule(.{
+        .root_source_file = b.path("modal_dispatcher.zig"),
+    });
+    modal_dispatcher_module.addImport("app", app_module);
+    modal_dispatcher_module.addImport("ui", ui_module);
+    modal_dispatcher_module.addImport("markdown", markdown_module);
+    modal_dispatcher_module.addImport("llm_provider", llm_provider_module);
+    modal_dispatcher_module.addImport("config_editor_state", config_editor_state_module);
+    modal_dispatcher_module.addImport("config_editor_renderer", config_editor_renderer_module);
+    modal_dispatcher_module.addImport("config_editor_input", config_editor_input_module);
+    modal_dispatcher_module.addImport("agent_builder_state", agent_builder_state_module);
+    modal_dispatcher_module.addImport("agent_builder_renderer", agent_builder_renderer_module);
+    modal_dispatcher_module.addImport("agent_builder_input", agent_builder_input_module);
+    modal_dispatcher_module.addImport("help_state", help_state_module);
+    modal_dispatcher_module.addImport("help_renderer", help_renderer_module);
+    modal_dispatcher_module.addImport("help_input", help_input_module);
+    modal_dispatcher_module.addImport("profile_ui_state", profile_ui_state_module);
+    modal_dispatcher_module.addImport("profile_ui_renderer", profile_ui_renderer_module);
+    modal_dispatcher_module.addImport("profile_ui_input", profile_ui_input_module);
+    modal_dispatcher_module.addImport("profile_manager", profile_manager_module);
+
+    const app_tool_execution_module = b.createModule(.{
+        .root_source_file = b.path("app_tool_execution.zig"),
+    });
+    app_tool_execution_module.addImport("app", app_module);
+    app_tool_execution_module.addImport("ollama", ollama_module);
+    app_tool_execution_module.addImport("markdown", markdown_module);
+    app_tool_execution_module.addImport("permission", permission_module);
+    app_tool_execution_module.addImport("tools", tools_module);
+    app_tool_execution_module.addImport("message_renderer", message_renderer_module);
+    app_tool_execution_module.addImport("tool_executor", tool_executor_module);
+    app_tool_execution_module.addImport("agents", agents_module);
+    app_tool_execution_module.addImport("types", types_module);
+    app_tool_execution_module.addImport("app_streaming", app_streaming_module);
+    app_tool_execution_module.addImport("app_agents", app_agents_module);
+
+    // Add extracted modules to app_module
+    app_module.addImport("app_streaming", app_streaming_module);
+    app_module.addImport("app_agents", app_agents_module);
+    app_module.addImport("modal_dispatcher", modal_dispatcher_module);
+    app_module.addImport("app_tool_execution", app_tool_execution_module);
+
     // Now add app and types to agents and agent modules (circular dependency is OK with modules)
     agents_module.addImport("app", app_module);
     agents_module.addImport("types", types_module);
