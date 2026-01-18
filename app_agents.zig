@@ -399,6 +399,7 @@ pub fn handleAgentCommand(app: *App, agent_name: []const u8, task: ?[]const u8, 
             .timestamp = std.time.milliTimestamp(),
         });
         _ = try message_renderer.redrawScreen(app);
+        app.updateCursorToBottom();
     }
 }
 
@@ -477,6 +478,7 @@ pub fn sendToAgent(app: *App, user_input: []const u8, display_text: ?[]const u8)
     app.streaming_message_idx = app.messages.items.len - 1;
 
     _ = try message_renderer.redrawScreen(app);
+    app.updateCursorToBottom();
 
     // Get the executor through the type-safe interface
     const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
@@ -588,6 +590,7 @@ fn finalizeAgentStreamedMessage(
     // Persist the finalized message
     try app.persistMessage(app.messages.items.len - 1);
     _ = try message_renderer.redrawScreen(app);
+    app.updateCursorToBottom();
 }
 
 /// Handle the result from an agent execution
@@ -982,6 +985,7 @@ pub fn endAgentSession(app: *App) !void {
         .timestamp = std.time.milliTimestamp(),
     });
     _ = try message_renderer.redrawScreen(app);
+    app.updateCursorToBottom();
 }
 
 /// Process any queued tool events from background agent thread
@@ -1062,6 +1066,7 @@ pub fn processAgentToolEvents(app: *App) !void {
         // Redraw after processing events
         if (events.len > 0) {
             _ = message_renderer.redrawScreen(app) catch {};
+            app.updateCursorToBottom();
         }
     }
 }

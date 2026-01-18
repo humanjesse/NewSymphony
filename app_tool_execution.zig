@@ -208,6 +208,7 @@ pub fn tickToolExecution(app: *App) !ToolTickResult {
             try app.persistMessage(app.messages.items.len - 1);
 
             _ = try message_renderer.redrawScreen(app);
+            app.updateCursorToBottom();
             return .iteration_limit;
         },
     }
