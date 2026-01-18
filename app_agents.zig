@@ -363,12 +363,12 @@ pub fn handleAgentCommand(app: *App, agent_name: []const u8, task: ?[]const u8, 
     // If this agent is already active, end the session
     if (app.app_context.active_agent) |active| {
         if (mem.eql(u8, active.agent_name, agent_name)) {
-            // Check if this was the planner being ended - trigger kickback
+            // Check if this was the planner being ended - trigger questioner
             const was_planner = mem.eql(u8, active.agent_name, "planner");
             try endAgentSession(app);
             if (was_planner) {
-                // Queue kickback event for main loop dispatch
-                triggerKickbackLoop(app);
+                // Queue questioner event for main loop dispatch
+                triggerQuestioner(app);
             }
             return;
         }
@@ -631,9 +631,9 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
         try finalizeAgentStreamedMessage(app, agent_name_copy, result.success);
         try endAgentSession(app);
 
-        // Kickback orchestration: trigger questioner after planner completes successfully
+        // Trigger questioner after planner completes successfully
         if (result.success and mem.eql(u8, agent_name_copy, "planner")) {
-            triggerKickbackLoop(app);
+            triggerQuestioner(app);
         }
 
         // Kickback orchestration: when questioner completes, check for blocked tasks
@@ -657,19 +657,14 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
     }
 }
 
-/// Kickback orchestration: planner -> questioner -> planner loop
-/// Queues a questioner start event instead of direct call (avoids recursive error set)
-pub fn triggerKickbackLoop(app: *App) void {
-    // Check if questioner agent exists in registry
+/// Trigger Questioner to evaluate the next ready task
+/// Used after Planner completes and after Judge approves a task
+pub fn triggerQuestioner(app: *App) void {
     const registry = app.app_context.agent_registry orelse return;
-    if (registry.get("questioner") == null) {
-        // Questioner not configured, skip kickback
-        return;
-    }
+    if (registry.get("questioner") == null) return;
 
-    // Queue event for main loop dispatch (avoids recursive error set resolution)
-    const task = app.allocator.dupe(u8, "Evaluate all ready tasks") catch return;
-    const display = app.allocator.dupe(u8, "/questioner Evaluate all ready tasks") catch {
+    const task = app.allocator.dupe(u8, "Evaluate next task") catch return;
+    const display = app.allocator.dupe(u8, "/questioner Evaluate next task") catch {
         app.allocator.free(task);
         return;
     };
@@ -756,8 +751,8 @@ pub fn handleJudgeComplete(app: *App) void {
     defer app.allocator.free(ready_tasks);
 
     if (ready_tasks.len > 0) {
-        // More tasks to do - trigger Tinkerer for next one
-        triggerTinkerer(app);
+        // More tasks to do - questioner evaluates before tinkerer implements
+        triggerQuestioner(app);
     }
     // else: All tasks complete, execution loop ends
 }
@@ -800,8 +795,8 @@ pub fn handleTinkererIncomplete(app: *App) void {
     defer app.allocator.free(blocked);
 
     if (blocked.len > 0) {
-        // Task was blocked - trigger Planner kickback for decomposition
-        triggerKickbackLoop(app);
+        // Task was blocked - questioner will trigger planner for decomposition
+        triggerQuestioner(app);
     }
     // else: Tinkerer hit max iterations without blocking or completing
     // Let the loop end - user can manually retry or check status
