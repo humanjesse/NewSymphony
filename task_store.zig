@@ -80,6 +80,18 @@ pub const TaskType = enum {
     }
 };
 
+/// A comment on a task (append-only audit trail - Beads philosophy)
+pub const Comment = struct {
+    agent: []const u8, // Which agent made the comment (owned)
+    content: []const u8, // The message content (owned)
+    timestamp: i64, // When the comment was made
+
+    pub fn deinit(self: *Comment, allocator: Allocator) void {
+        allocator.free(self.agent);
+        allocator.free(self.content);
+    }
+};
+
 /// Dependency type between tasks
 pub const DependencyType = enum {
     blocks, // Hard dependency - blocked task cannot start
@@ -128,7 +140,7 @@ pub const Task = struct {
     completed_at: ?i64,
     parent_id: ?TaskId, // For molecules (epics)
     blocked_by_count: usize, // Cached count of blocking dependencies
-    blocked_reason: ?[]const u8, // Why this task is blocked (owned)
+    comments: []Comment = &.{}, // Append-only audit trail (Beads philosophy)
 
     /// Free all owned memory
     pub fn deinit(self: *Task, allocator: Allocator) void {
@@ -140,8 +152,13 @@ pub const Task = struct {
             allocator.free(label);
         }
         allocator.free(self.labels);
-        if (self.blocked_reason) |reason| {
-            allocator.free(reason);
+        // Free comments (Beads audit trail)
+        for (self.comments) |*comment| {
+            var c = comment.*;
+            c.deinit(allocator);
+        }
+        if (self.comments.len > 0) {
+            allocator.free(self.comments);
         }
     }
 };
@@ -400,7 +417,6 @@ pub const TaskStore = struct {
             .completed_at = null,
             .parent_id = params.parent_id,
             .blocked_by_count = 0,
-            .blocked_reason = null,
         };
 
         try self.tasks.put(id, task);
@@ -464,40 +480,78 @@ pub const TaskStore = struct {
         self.ready_cache_valid = false;
     }
 
-    /// Update blocked_reason for a task (used by questioner/evaluator agents)
-    pub fn updateBlockedReason(self: *Self, task_id: TaskId, reason: ?[]const u8) !void {
+    /// Add a comment to a task (Beads philosophy - append-only audit trail)
+    pub fn addComment(self: *Self, task_id: TaskId, agent: []const u8, content: []const u8) !void {
         const task = self.tasks.getPtr(task_id) orelse return error.TaskNotFound;
-        // Free existing reason if any
-        if (task.blocked_reason) |old_reason| {
-            self.allocator.free(old_reason);
+
+        // Create new comment
+        const new_comment = Comment{
+            .agent = try self.allocator.dupe(u8, agent),
+            .content = try self.allocator.dupe(u8, content),
+            .timestamp = std.time.timestamp(),
+        };
+
+        // Grow comments array
+        const old_comments = task.comments;
+        const new_comments = try self.allocator.alloc(Comment, old_comments.len + 1);
+        @memcpy(new_comments[0..old_comments.len], old_comments);
+        new_comments[old_comments.len] = new_comment;
+
+        // Free old array if it was allocated (not the default empty slice)
+        if (old_comments.len > 0) {
+            self.allocator.free(old_comments);
         }
-        // Set new reason (or null)
-        task.blocked_reason = if (reason) |r|
-            try self.allocator.dupe(u8, r)
-        else
-            null;
+
+        task.comments = new_comments;
         task.updated_at = std.time.timestamp();
     }
 
-    /// Clear blocked_reason for a task (convenience wrapper)
-    pub fn clearBlockedReason(self: *Self, task_id: TaskId) !void {
-        try self.updateBlockedReason(task_id, null);
+    /// Get the last comment from a specific agent (useful for checking latest feedback)
+    pub fn getLastCommentFrom(self: *Self, task_id: TaskId, agent: []const u8) ?*const Comment {
+        const task = self.tasks.get(task_id) orelse return null;
+
+        // Iterate backwards to find most recent
+        var i = task.comments.len;
+        while (i > 0) {
+            i -= 1;
+            if (mem.eql(u8, task.comments[i].agent, agent)) {
+                return &task.comments[i];
+            }
+        }
+        return null;
     }
 
-    /// Get all blocked tasks that have a blocked_reason set
-    /// Returns tasks that need decomposition by planner
-    pub fn getBlockedTasksWithReasons(self: *Self) ![]Task {
+    /// Get tasks that have comments containing a specific prefix (e.g., "BLOCKED:", "REJECTED:")
+    /// Used by orchestration to find tasks needing attention
+    pub fn getTasksWithCommentPrefix(self: *Self, prefix: []const u8) ![]Task {
         var result = std.ArrayListUnmanaged(Task){};
         errdefer result.deinit(self.allocator);
 
         var iter = self.tasks.valueIterator();
         while (iter.next()) |task| {
-            if (task.status == .blocked and task.blocked_reason != null) {
-                try result.append(self.allocator, task.*);
+            // Check if any comment starts with prefix
+            for (task.comments) |comment| {
+                if (mem.startsWith(u8, comment.content, prefix)) {
+                    try result.append(self.allocator, task.*);
+                    break; // Only add task once
+                }
             }
         }
 
         return result.toOwnedSlice(self.allocator);
+    }
+
+    /// Count comments from a specific agent with a prefix (e.g., count rejections)
+    pub fn countCommentsWithPrefix(self: *Self, task_id: TaskId, agent: []const u8, prefix: []const u8) usize {
+        const task = self.tasks.get(task_id) orelse return 0;
+
+        var match_count: usize = 0;
+        for (task.comments) |comment| {
+            if (mem.eql(u8, comment.agent, agent) and mem.startsWith(u8, comment.content, prefix)) {
+                match_count += 1;
+            }
+        }
+        return match_count;
     }
 
     /// Add a dependency between tasks
@@ -675,6 +729,17 @@ pub const TaskStore = struct {
         }
 
         return result.toOwnedSlice(self.allocator);
+    }
+
+    /// Get the current in_progress task (if any)
+    pub fn getCurrentInProgressTask(self: *Self) ?*Task {
+        var iter = self.tasks.valueIterator();
+        while (iter.next()) |task| {
+            if (task.status == .in_progress) {
+                return task;
+            }
+        }
+        return null;
     }
 
     /// Get all ready tasks (pending with no blockers), sorted by priority

@@ -6,4 +6,6 @@ DEBUG_TOOLS=1 ./zig-out/bin/localharness 2> /tmp/debug_output.log
 
 
 Clear tasks
-rm -rf /home/wassie/Desktop/localharness/.tasks/
+rm -rf /home/wassie/Desktop/localharness/.tasks/tasks.db
+
+

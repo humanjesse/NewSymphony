@@ -111,6 +111,32 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         // Add blocked_by count
         try json.writer(allocator).print(", \"blocked_by_count\": {d}", .{task.blocked_by_count});
 
+        // Add comments (Beads audit trail)
+        try json.writer(allocator).print(", \"comments\": [", .{});
+        for (task.comments, 0..) |comment, i| {
+            if (i > 0) try json.writer(allocator).print(",", .{});
+
+            // Escape comment content for JSON
+            var escaped_content = std.ArrayListUnmanaged(u8){};
+            defer escaped_content.deinit(allocator);
+            for (comment.content) |c| {
+                switch (c) {
+                    '"' => try escaped_content.appendSlice(allocator, "\\\""),
+                    '\\' => try escaped_content.appendSlice(allocator, "\\\\"),
+                    '\n' => try escaped_content.appendSlice(allocator, "\\n"),
+                    '\r' => try escaped_content.appendSlice(allocator, "\\r"),
+                    '\t' => try escaped_content.appendSlice(allocator, "\\t"),
+                    else => try escaped_content.append(allocator, c),
+                }
+            }
+
+            try json.writer(allocator).print(
+                "{{\"agent\": \"{s}\", \"content\": \"{s}\", \"timestamp\": {d}}}",
+                .{ comment.agent, escaped_content.items, comment.timestamp },
+            );
+        }
+        try json.writer(allocator).print("]", .{});
+
         // Get ready count for context
         const counts = store.getTaskCounts();
         try json.writer(allocator).print("}}, \"ready_count\": {d}, \"blocked_count\": {d}}}", .{

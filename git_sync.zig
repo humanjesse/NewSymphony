@@ -10,6 +10,7 @@ const Task = task_store_module.Task;
 const TaskId = task_store_module.TaskId;
 const TaskStatus = task_store_module.TaskStatus;
 const Dependency = task_store_module.Dependency;
+const Comment = task_store_module.Comment;
 
 /// Session state summary for cold start
 pub const SessionState = struct {
@@ -182,6 +183,18 @@ pub const GitSync = struct {
             try writer.print(",\"parent_id\":\"{s}\"", .{&pid});
         }
 
+        // comments (Beads audit trail)
+        try writer.writeAll(",\"comments\":[");
+        for (task.comments, 0..) |comment, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"agent\":\"");
+            try self.writeEscaped(buf, comment.agent);
+            try writer.writeAll("\",\"content\":\"");
+            try self.writeEscaped(buf, comment.content);
+            try writer.print("\",\"timestamp\":{d}}}", .{comment.timestamp});
+        }
+        try writer.writeByte(']');
+
         try writer.writeByte('}');
     }
 
@@ -271,6 +284,12 @@ pub const GitSync = struct {
 
     /// Parse a JSON line and add task to store
     fn parseAndAddTask(self: *Self, json_line: []const u8, store: *TaskStore) !bool {
+        const CommentJson = struct {
+            agent: []const u8,
+            content: []const u8,
+            timestamp: i64,
+        };
+
         const TaskJson = struct {
             id: []const u8,
             title: []const u8,
@@ -283,6 +302,7 @@ pub const GitSync = struct {
             updated_at: i64,
             completed_at: ?i64 = null,
             parent_id: ?[]const u8 = null,
+            comments: ?[]const CommentJson = null,
         };
 
         const parsed = std.json.parseFromSlice(TaskJson, self.allocator, json_line, .{
@@ -325,6 +345,28 @@ pub const GitSync = struct {
             break :blk cloned;
         } else try self.allocator.alloc([]const u8, 0);
 
+        // Clone comments (Beads audit trail)
+        const comments: []Comment = if (data.comments) |cmts| blk: {
+            const cloned = try self.allocator.alloc(Comment, cmts.len);
+            errdefer self.allocator.free(cloned);
+            var i: usize = 0;
+            errdefer {
+                for (cloned[0..i]) |*c| {
+                    self.allocator.free(c.agent);
+                    self.allocator.free(c.content);
+                }
+            }
+            for (cmts) |cmt| {
+                cloned[i] = .{
+                    .agent = try self.allocator.dupe(u8, cmt.agent),
+                    .content = try self.allocator.dupe(u8, cmt.content),
+                    .timestamp = cmt.timestamp,
+                };
+                i += 1;
+            }
+            break :blk cloned;
+        } else try self.allocator.alloc(Comment, 0);
+
         // Parse parent_id
         var parent_id: ?TaskId = null;
         if (data.parent_id) |pid_str| {
@@ -347,8 +389,8 @@ pub const GitSync = struct {
             .updated_at = data.updated_at,
             .completed_at = data.completed_at,
             .parent_id = parent_id,
+            .comments = comments,
             .blocked_by_count = 0, // Will be computed when loading dependencies
-            .blocked_reason = null, // Not persisted in git sync format
         };
 
         try store.tasks.put(id, task);

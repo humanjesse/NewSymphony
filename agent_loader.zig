@@ -8,6 +8,8 @@ const agent_executor = @import("agent_executor");
 // Embedded hardcoded agents (compiled into binary)
 const embedded_planner = @embedFile("agents_hardcoded/planner.md");
 const embedded_questioner = @embedFile("agents_hardcoded/questioner.md");
+const embedded_tinkerer = @embedFile("agents_hardcoded/tinkerer.md");
+const embedded_judge = @embedFile("agents_hardcoded/judge.md");
 
 const AgentDefinition = agents_module.AgentDefinition;
 const AgentRegistry = agents_module.AgentRegistry;
@@ -104,6 +106,8 @@ pub const AgentLoader = struct {
         const embedded_agents = [_][]const u8{
             embedded_planner,
             embedded_questioner,
+            embedded_tinkerer,
+            embedded_judge,
         };
 
         for (embedded_agents) |embedded_content| {

@@ -152,11 +152,24 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
             },
         );
 
-        // Add blocked_reason if present and task is blocked
-        if (task.status == .blocked and task.blocked_reason != null) {
-            const escaped_reason = try html_utils.escapeJSON(allocator, task.blocked_reason.?);
-            defer allocator.free(escaped_reason);
-            try json.writer(allocator).print(",\"blocked_reason\":\"{s}\"", .{escaped_reason});
+        // Add blocked_reason from comments if task is blocked (Beads philosophy)
+        if (task.status == .blocked) {
+            // Find most recent BLOCKED: comment
+            var j = task.comments.len;
+            while (j > 0) {
+                j -= 1;
+                if (std.mem.startsWith(u8, task.comments[j].content, "BLOCKED:")) {
+                    var blocked_reason = task.comments[j].content[8..];
+                    // Trim leading whitespace
+                    while (blocked_reason.len > 0 and blocked_reason[0] == ' ') {
+                        blocked_reason = blocked_reason[1..];
+                    }
+                    const escaped_reason = try html_utils.escapeJSON(allocator, blocked_reason);
+                    defer allocator.free(escaped_reason);
+                    try json.writer(allocator).print(",\"blocked_reason\":\"{s}\"", .{escaped_reason});
+                    break;
+                }
+            }
         }
 
         // Close the object

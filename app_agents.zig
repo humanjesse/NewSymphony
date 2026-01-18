@@ -57,6 +57,14 @@ pub const AgentCommandEvent = union(enum) {
         prompt: []const u8, // Owned, must be freed
         display_text: []const u8, // Owned, must be freed
     },
+    start_tinkerer: struct {
+        task: []const u8, // Owned, must be freed
+        display_text: []const u8, // Owned, must be freed
+    },
+    start_judge: struct {
+        task: []const u8, // Owned, must be freed
+        display_text: []const u8, // Owned, must be freed
+    },
 
     pub fn deinit(self: *AgentCommandEvent, allocator: mem.Allocator) void {
         switch (self.*) {
@@ -66,6 +74,14 @@ pub const AgentCommandEvent = union(enum) {
             },
             .start_planner => |data| {
                 allocator.free(data.prompt);
+                allocator.free(data.display_text);
+            },
+            .start_tinkerer => |data| {
+                allocator.free(data.task);
+                allocator.free(data.display_text);
+            },
+            .start_judge => |data| {
+                allocator.free(data.task);
                 allocator.free(data.display_text);
             },
         }
@@ -395,6 +411,7 @@ fn startAgentSession(app: *App, agent_name: []const u8, initial_task: []const u8
     // Create heap-allocated executor
     const executor = try app.allocator.create(agent_executor.AgentExecutor);
     executor.* = agent_executor.AgentExecutor.init(app.allocator, agent_def.capabilities);
+    executor.agent_name = try app.allocator.dupe(u8, agent_name);
 
     // Create session state with type-safe executor interface
     const session = try app.allocator.create(context_module.ActiveAgentSession);
@@ -582,6 +599,11 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
     const agent_name_copy = try app.allocator.dupe(u8, session.agent_name);
     defer app.allocator.free(agent_name_copy);
 
+    // Capture executor flags BEFORE session cleanup (endAgentSession destroys the executor)
+    var tinkering_complete = false;
+    const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
+    tinkering_complete = executor.tinkering_complete;
+
     if (result.status == .complete or result.status == .failed) {
         // Agent finished - finalize the streamed message and end session
         // The message content was already populated via streaming
@@ -618,6 +640,16 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
         if (result.success and mem.eql(u8, agent_name_copy, "questioner")) {
             handleQuestionerComplete(app);
         }
+
+        // Tinkerer → Judge: trigger Judge on successful tinkerer completion
+        if (result.success and mem.eql(u8, agent_name_copy, "tinkerer")) {
+            triggerJudge(app);
+        }
+
+        // Judge completion: either move to next task or trigger revision retry
+        if (result.success and mem.eql(u8, agent_name_copy, "judge")) {
+            handleJudgeComplete(app);
+        }
     } else if (result.status == .needs_input) {
         // Conversation mode: agent responded, waiting for user input
         // Finalize the streamed message but keep session alive
@@ -650,6 +682,131 @@ pub fn triggerKickbackLoop(app: *App) void {
     };
 }
 
+/// Trigger Tinkerer to work on next ready task
+pub fn triggerTinkerer(app: *App) void {
+    const registry = app.app_context.agent_registry orelse return;
+    if (registry.get("tinkerer") == null) return;
+
+    const task = app.allocator.dupe(u8, "Implement the next ready task") catch return;
+    const display = app.allocator.dupe(u8, "/tinkerer Implement next ready task") catch {
+        app.allocator.free(task);
+        return;
+    };
+
+    app.agent_command_events.append(app.allocator, .{
+        .start_tinkerer = .{ .task = task, .display_text = display },
+    }) catch {
+        app.allocator.free(task);
+        app.allocator.free(display);
+    };
+}
+
+/// Trigger Judge to review Tinkerer's implementation
+pub fn triggerJudge(app: *App) void {
+    const registry = app.app_context.agent_registry orelse return;
+    if (registry.get("judge") == null) return;
+
+    const task = app.allocator.dupe(u8, "Review the staged implementation") catch return;
+    const display = app.allocator.dupe(u8, "/judge Review implementation") catch {
+        app.allocator.free(task);
+        return;
+    };
+
+    app.agent_command_events.append(app.allocator, .{
+        .start_judge = .{ .task = task, .display_text = display },
+    }) catch {
+        app.allocator.free(task);
+        app.allocator.free(display);
+    };
+}
+
+/// Handle Judge completion - either move to next task or retry Tinkerer
+pub fn handleJudgeComplete(app: *App) void {
+    const task_store = app.app_context.task_store orelse return;
+
+    // Check if Judge rejected (look for REJECTED: comment from judge)
+    // Note: complete_task changes status to completed, so if still in_progress
+    // with recent rejection, it means Judge rejected
+    if (task_store.getCurrentInProgressTask()) |task| {
+        // Find most recent REJECTED: comment
+        var i = task.comments.len;
+        while (i > 0) {
+            i -= 1;
+            const comment = task.comments[i];
+            if (std.mem.startsWith(u8, comment.content, "REJECTED:")) {
+                // Extract feedback from comment
+                var feedback = comment.content[9..]; // Skip "REJECTED:"
+                while (feedback.len > 0 and feedback[0] == ' ') {
+                    feedback = feedback[1..];
+                }
+                // Judge rejected - trigger Tinkerer to retry
+                triggerTinkererRevision(app, &task.id, feedback);
+                return;
+            } else if (std.mem.startsWith(u8, comment.content, "SUMMARY:") or
+                std.mem.startsWith(u8, comment.content, "APPROVED:"))
+            {
+                // If we see SUMMARY or APPROVED before REJECTED, no rejection pending
+                break;
+            }
+        }
+    }
+
+    // Judge approved (or no current task) - check for next ready task
+    const ready_tasks = task_store.getReadyTasks() catch return;
+    defer app.allocator.free(ready_tasks);
+
+    if (ready_tasks.len > 0) {
+        // More tasks to do - trigger Tinkerer for next one
+        triggerTinkerer(app);
+    }
+    // else: All tasks complete, execution loop ends
+}
+
+/// Trigger Tinkerer to retry with revision feedback
+pub fn triggerTinkererRevision(app: *App, task_id: *const [8]u8, feedback: []const u8) void {
+    const registry = app.app_context.agent_registry orelse return;
+    if (registry.get("tinkerer") == null) return;
+
+    const prompt = std.fmt.allocPrint(
+        app.allocator,
+        "REVISION: Your previous implementation was rejected.\n\nFeedback:\n{s}\n\nPlease address these issues.",
+        .{feedback},
+    ) catch return;
+
+    const display = std.fmt.allocPrint(
+        app.allocator,
+        "/tinkerer [REVISION] Fix task {s}",
+        .{task_id},
+    ) catch {
+        app.allocator.free(prompt);
+        return;
+    };
+
+    app.agent_command_events.append(app.allocator, .{
+        .start_tinkerer = .{ .task = prompt, .display_text = display },
+    }) catch {
+        app.allocator.free(prompt);
+        app.allocator.free(display);
+    };
+}
+
+/// Handle Tinkerer completing without calling tinkering_done
+/// This happens when Tinkerer hits max_iterations or calls block_task
+pub fn handleTinkererIncomplete(app: *App) void {
+    const task_store = app.app_context.task_store orelse return;
+
+    // Check for tasks with BLOCKED: comments (need decomposition by Planner)
+    const blocked = task_store.getTasksWithCommentPrefix("BLOCKED:") catch return;
+    defer app.allocator.free(blocked);
+
+    if (blocked.len > 0) {
+        // Task was blocked - trigger Planner kickback for decomposition
+        triggerKickbackLoop(app);
+    }
+    // else: Tinkerer hit max iterations without blocking or completing
+    // Let the loop end - user can manually retry or check status
+}
+
 /// Handle questioner completion - queue planner event to decompose blocked tasks
 pub fn handleQuestionerComplete(app: *App) void {
     const task_store = app.app_context.task_store orelse return;
@@ -660,12 +817,13 @@ pub fn handleQuestionerComplete(app: *App) void {
         return;
     }
 
-    // Get blocked tasks that have reasons (need decomposition)
-    const blocked_tasks = task_store.getBlockedTasksWithReasons() catch return;
+    // Get tasks with BLOCKED: comments (need decomposition)
+    const blocked_tasks = task_store.getTasksWithCommentPrefix("BLOCKED:") catch return;
     defer app.allocator.free(blocked_tasks);
 
     if (blocked_tasks.len == 0) {
-        // No blocked tasks, kickback loop complete
+        // No blocked tasks - trigger Tinkerer for next ready task
+        triggerTinkerer(app);
         return;
     }
 
@@ -676,16 +834,28 @@ pub fn handleQuestionerComplete(app: *App) void {
     prompt.appendSlice(app.allocator, "KICKBACK: The following tasks were blocked by the questioner and need decomposition:\n\n") catch return;
 
     for (blocked_tasks) |task| {
+        // Find most recent BLOCKED: comment to extract reason
+        var blocked_reason: []const u8 = "No reason provided";
+        var i = task.comments.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.startsWith(u8, task.comments[i].content, "BLOCKED:")) {
+                var reason = task.comments[i].content[8..];
+                while (reason.len > 0 and reason[0] == ' ') {
+                    reason = reason[1..];
+                }
+                blocked_reason = reason;
+                break;
+            }
+        }
+
         prompt.writer(app.allocator).print("- Task {s}: \"{s}\"\n  Reason: {s}\n\n", .{
             &task.id,
             task.title,
-            task.blocked_reason orelse "No reason provided",
+            blocked_reason,
         }) catch return;
 
-        // Clear the blocked_reason so we don't re-process this task
-        task_store.clearBlockedReason(task.id) catch |err| {
-            std.log.warn("Failed to clear blocked reason for task {s}: {}", .{ &task.id, err });
-        };
+        // Note: We don't need to clear comments - they're an append-only audit trail (Beads philosophy)
     }
 
     prompt.appendSlice(app.allocator, "Please decompose these tasks into smaller, executable subtasks.") catch return;
@@ -729,6 +899,18 @@ pub fn processAgentCommandEvents(app: *App) !bool {
         .start_planner => |data| {
             handleAgentCommand(app, "planner", data.prompt, data.display_text) catch |err| {
                 std.log.warn("Failed to start planner in kickback: {}", .{err});
+            };
+            return true;
+        },
+        .start_tinkerer => |data| {
+            handleAgentCommand(app, "tinkerer", data.task, data.display_text) catch |err| {
+                std.log.warn("Failed to start tinkerer: {}", .{err});
+            };
+            return true;
+        },
+        .start_judge => |data| {
+            handleAgentCommand(app, "judge", data.task, data.display_text) catch |err| {
+                std.log.warn("Failed to start judge: {}", .{err});
             };
             return true;
         },

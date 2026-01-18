@@ -11,6 +11,7 @@ const TaskPriority = task_store.TaskPriority;
 const TaskType = task_store.TaskType;
 const Dependency = task_store.Dependency;
 const DependencyType = task_store.DependencyType;
+const Comment = task_store.Comment;
 
 pub const TaskDB = struct {
     db: *sqlite.Db,
@@ -83,14 +84,14 @@ pub const TaskDB = struct {
             \\)
         );
 
-        // Comments table
+        // Comments table (Beads audit trail)
         try sqlite.exec(self.db,
             \\CREATE TABLE IF NOT EXISTS task_comments (
             \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
             \\    task_id TEXT NOT NULL,
+            \\    agent TEXT NOT NULL,
             \\    content TEXT NOT NULL,
-            \\    author TEXT,
-            \\    created_at INTEGER NOT NULL,
+            \\    timestamp INTEGER NOT NULL,
             \\    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             \\)
         );
@@ -157,8 +158,8 @@ pub const TaskDB = struct {
         const stmt = try sqlite.prepare(self.db,
             \\INSERT OR REPLACE INTO tasks (
             \\    id, title, description, status, priority, task_type,
-            \\    labels, created_at, updated_at, completed_at, parent_id, blocked_reason
-            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \\    labels, created_at, updated_at, completed_at, parent_id
+            \\) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         );
         defer sqlite.finalize(stmt);
 
@@ -216,23 +217,17 @@ pub const TaskDB = struct {
             try sqlite.bindNull(stmt, 11);
         }
 
-        // Bind blocked_reason
-        if (task.blocked_reason) |reason| {
-            const reason_z = try self.allocator.dupeZ(u8, reason);
-            defer self.allocator.free(reason_z);
-            try sqlite.bindText(stmt, 12, reason_z);
-        } else {
-            try sqlite.bindNull(stmt, 12);
-        }
-
         _ = try sqlite.step(stmt);
+
+        // Save comments to separate table (Beads audit trail)
+        try self.saveComments(&task.id, task.comments);
     }
 
     /// Load a task from the database by ID
     pub fn loadTask(self: *Self, task_id: TaskId) !?Task {
         const stmt = try sqlite.prepare(self.db,
             \\SELECT id, title, description, status, priority, task_type,
-            \\       labels, created_at, updated_at, completed_at, parent_id, blocked_reason
+            \\       labels, created_at, updated_at, completed_at, parent_id
             \\FROM tasks WHERE id = ?
         );
         defer sqlite.finalize(stmt);
@@ -362,14 +357,8 @@ pub const TaskDB = struct {
             }
         }
 
-        // Blocked reason (column 11)
-        const blocked_reason = if (sqlite.columnType(stmt, 11) != sqlite.SQLITE_NULL)
-            if (sqlite.columnText(stmt, 11)) |r|
-                try self.allocator.dupe(u8, r)
-            else
-                null
-        else
-            null;
+        // Load comments from separate table (Beads audit trail)
+        const comments = try self.loadComments(&id);
 
         return Task{
             .id = id,
@@ -384,7 +373,7 @@ pub const TaskDB = struct {
             .completed_at = completed_at,
             .parent_id = parent_id,
             .blocked_by_count = 0, // Will be recalculated when loading dependencies
-            .blocked_reason = blocked_reason,
+            .comments = comments,
         };
     }
 
@@ -502,6 +491,113 @@ pub const TaskDB = struct {
         try sqlite.bindText(stmt, 3, type_str);
 
         _ = try sqlite.step(stmt);
+    }
+
+    /// Save comments for a task (replaces existing comments)
+    fn saveComments(self: *Self, task_id: *const TaskId, comments: []const Comment) !void {
+        // Delete existing comments for this task
+        const delete_stmt = try sqlite.prepare(self.db, "DELETE FROM task_comments WHERE task_id = ?");
+        defer sqlite.finalize(delete_stmt);
+
+        const id_str = try self.allocator.dupeZ(u8, task_id);
+        defer self.allocator.free(id_str);
+        try sqlite.bindText(delete_stmt, 1, id_str);
+        _ = try sqlite.step(delete_stmt);
+
+        // Insert new comments
+        for (comments) |comment| {
+            const insert_stmt = try sqlite.prepare(self.db,
+                \\INSERT INTO task_comments (task_id, agent, content, timestamp)
+                \\VALUES (?, ?, ?, ?)
+            );
+            defer sqlite.finalize(insert_stmt);
+
+            try sqlite.bindText(insert_stmt, 1, id_str);
+
+            const agent_z = try self.allocator.dupeZ(u8, comment.agent);
+            defer self.allocator.free(agent_z);
+            try sqlite.bindText(insert_stmt, 2, agent_z);
+
+            const content_z = try self.allocator.dupeZ(u8, comment.content);
+            defer self.allocator.free(content_z);
+            try sqlite.bindText(insert_stmt, 3, content_z);
+
+            try sqlite.bindInt64(insert_stmt, 4, comment.timestamp);
+
+            _ = try sqlite.step(insert_stmt);
+        }
+    }
+
+    /// Append a single comment to a task (O(1) instead of O(n) delete+reinsert)
+    pub fn appendComment(self: *Self, task_id: *const TaskId, comment: Comment) !void {
+        const stmt = try sqlite.prepare(self.db,
+            \\INSERT INTO task_comments (task_id, agent, content, timestamp)
+            \\VALUES (?, ?, ?, ?)
+        );
+        defer sqlite.finalize(stmt);
+
+        const id_str = try self.allocator.dupeZ(u8, task_id);
+        defer self.allocator.free(id_str);
+        try sqlite.bindText(stmt, 1, id_str);
+
+        const agent_z = try self.allocator.dupeZ(u8, comment.agent);
+        defer self.allocator.free(agent_z);
+        try sqlite.bindText(stmt, 2, agent_z);
+
+        const content_z = try self.allocator.dupeZ(u8, comment.content);
+        defer self.allocator.free(content_z);
+        try sqlite.bindText(stmt, 3, content_z);
+
+        try sqlite.bindInt64(stmt, 4, comment.timestamp);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    /// Load comments for a task
+    fn loadComments(self: *Self, task_id: *const TaskId) ![]Comment {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT agent, content, timestamp FROM task_comments
+            \\WHERE task_id = ? ORDER BY timestamp ASC
+        );
+        defer sqlite.finalize(stmt);
+
+        const id_str = try self.allocator.dupeZ(u8, task_id);
+        defer self.allocator.free(id_str);
+        try sqlite.bindText(stmt, 1, id_str);
+
+        var comments = std.ArrayListUnmanaged(Comment){};
+        errdefer {
+            for (comments.items) |*c| {
+                self.allocator.free(c.agent);
+                self.allocator.free(c.content);
+            }
+            comments.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            const agent = if (sqlite.columnText(stmt, 0)) |a|
+                try self.allocator.dupe(u8, a)
+            else
+                try self.allocator.dupe(u8, "unknown");
+
+            const content = if (sqlite.columnText(stmt, 1)) |c|
+                try self.allocator.dupe(u8, c)
+            else
+                try self.allocator.dupe(u8, "");
+
+            const timestamp = sqlite.columnInt64(stmt, 2);
+
+            try comments.append(self.allocator, .{
+                .agent = agent,
+                .content = content,
+                .timestamp = timestamp,
+            });
+        }
+
+        return comments.toOwnedSlice(self.allocator);
     }
 
     /// Set a metadata key-value pair

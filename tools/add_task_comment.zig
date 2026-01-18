@@ -1,4 +1,4 @@
-// Block Task Tool - Mark a task as blocked with a reason
+// Add Task Comment Tool - Append a comment to a task's audit trail (Beads philosophy)
 const std = @import("std");
 const json = std.json;
 const ollama = @import("ollama");
@@ -16,33 +16,29 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
         .ollama_tool = .{
             .type = "function",
             .function = .{
-                .name = try allocator.dupe(u8, "block_task"),
-                .description = try allocator.dupe(u8, "Mark a task as blocked. Optionally specify what's blocking it."),
+                .name = try allocator.dupe(u8, "add_task_comment"),
+                .description = try allocator.dupe(u8, "Add a comment to a task's audit trail. Use prefixes like 'BLOCKED:', 'REJECTED:', 'APPROVED:', 'SUMMARY:' for structured communication between agents."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
                     \\  "properties": {
                     \\    "task_id": {
                     \\      "type": "string",
-                    \\      "description": "Task to block. Defaults to current task if not specified."
+                    \\      "description": "Task to comment on. Defaults to current task if not specified."
                     \\    },
-                    \\    "reason": {
+                    \\    "comment": {
                     \\      "type": "string",
-                    \\      "description": "Why this task is blocked"
-                    \\    },
-                    \\    "blocked_by": {
-                    \\      "type": "string",
-                    \\      "description": "Task ID that is blocking this task"
+                    \\      "description": "The comment to add. Use prefixes for structured feedback: BLOCKED:, REJECTED:, APPROVED:, SUMMARY:"
                     \\    }
                     \\  },
-                    \\  "required": ["reason"]
+                    \\  "required": ["comment"]
                     \\}
                 ),
             },
         },
         .permission_metadata = .{
-            .name = "block_task",
-            .description = "Block a task",
+            .name = "add_task_comment",
+            .description = "Add comment to task",
             .risk_level = .safe,
             .required_scopes = &.{.todo_management},
             .validator = null,
@@ -64,18 +60,17 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     };
     defer parsed.deinit();
 
-    const reason = if (parsed.value.object.get("reason")) |v|
+    const comment = if (parsed.value.object.get("comment")) |v|
         if (v == .string) v.string else null
     else
         null;
 
-    if (reason == null) {
-        return ToolResult.err(allocator, .invalid_arguments, "reason is required", start_time);
+    if (comment == null) {
+        return ToolResult.err(allocator, .invalid_arguments, "comment is required", start_time);
     }
 
     // Get task_id - either from args or current task
     var task_id: task_store.TaskId = undefined;
-    var is_current_task = false;
 
     if (parsed.value.object.get("task_id")) |v| {
         if (v == .string and v.string.len == 8) {
@@ -87,53 +82,35 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         // Use current task
         if (store.getCurrentTaskId()) |cid| {
             task_id = cid;
-            is_current_task = true;
         } else {
             return ToolResult.err(allocator, .invalid_arguments, "No current task. Specify task_id explicitly.", start_time);
         }
     }
 
-    // Get the task
+    // Get the task (verify it exists)
     const task = store.getTask(task_id) orelse {
         return ToolResult.err(allocator, .internal_error, "Task not found", start_time);
     };
 
-    // Update status to blocked
-    store.updateStatus(task_id, .blocked) catch {
-        return ToolResult.err(allocator, .internal_error, "Failed to update task status", start_time);
-    };
-
-    // Add a comment with the block reason (Beads philosophy)
+    // Determine agent name from context (default to "unknown")
     const agent_name = context.current_agent_name orelse "unknown";
-    const block_comment = try std.fmt.allocPrint(allocator, "BLOCKED: {s}", .{reason.?});
-    defer allocator.free(block_comment);
-    store.addComment(task_id, agent_name, block_comment) catch {
-        return ToolResult.err(allocator, .internal_error, "Failed to add block comment", start_time);
+
+    // Add the comment
+    store.addComment(task_id, agent_name, comment.?) catch {
+        return ToolResult.err(allocator, .internal_error, "Failed to add comment", start_time);
     };
 
-    // If blocked_by is specified, add a dependency
-    if (parsed.value.object.get("blocked_by")) |v| {
-        if (v == .string and v.string.len == 8) {
-            var blocker_id: task_store.TaskId = undefined;
-            @memcpy(&blocker_id, v.string[0..8]);
-            store.addDependency(blocker_id, task_id, .blocks) catch {
-                // Dependency might already exist or task might not exist
-            };
-        }
-    }
+    // Get the updated task to access the newly added comment
+    const updated_task = store.getTask(task_id) orelse {
+        return ToolResult.err(allocator, .internal_error, "Task not found after adding comment", start_time);
+    };
 
-    // Clear current task if we blocked it
-    if (is_current_task) {
-        store.clearCurrentTask();
-    }
-
-    // Persist to database if available
-    // Note: block_task needs to save the task status change, so we use saveTask
-    // The comment is already in the in-memory store and will be saved with the task
+    // Persist comment to database if available (O(1) append instead of O(n) replace)
     if (context.task_db) |db| {
-        if (store.getTask(task_id)) |t| {
-            db.saveTask(t) catch |err| {
-                std.log.warn("Failed to persist blocked task to SQLite: {}", .{err});
+        if (updated_task.comments.len > 0) {
+            const new_comment = updated_task.comments[updated_task.comments.len - 1];
+            db.appendComment(&task_id, new_comment) catch |err| {
+                std.log.warn("Failed to persist comment to SQLite: {}", .{err});
             };
         }
     }
@@ -153,24 +130,28 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         }
     }
 
-    var escaped_reason = std.ArrayListUnmanaged(u8){};
-    defer escaped_reason.deinit(allocator);
-    for (reason.?) |c| {
+    // Escape comment for JSON
+    var escaped_comment = std.ArrayListUnmanaged(u8){};
+    defer escaped_comment.deinit(allocator);
+    for (comment.?) |c| {
         switch (c) {
-            '"' => try escaped_reason.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_reason.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_reason.appendSlice(allocator, "\\n"),
-            else => try escaped_reason.append(allocator, c),
+            '"' => try escaped_comment.appendSlice(allocator, "\\\""),
+            '\\' => try escaped_comment.appendSlice(allocator, "\\\\"),
+            '\n' => try escaped_comment.appendSlice(allocator, "\\n"),
+            '\r' => try escaped_comment.appendSlice(allocator, "\\r"),
+            '\t' => try escaped_comment.appendSlice(allocator, "\\t"),
+            else => try escaped_comment.append(allocator, c),
         }
     }
 
     try result_json.writer(allocator).print(
-        "{{\"blocked\": true, \"task\": {{\"id\": \"{s}\", \"title\": \"{s}\"}}, \"reason\": \"{s}\", \"current_task_cleared\": {s}}}",
+        "{{\"success\": true, \"task\": {{\"id\": \"{s}\", \"title\": \"{s}\"}}, \"agent\": \"{s}\", \"comment\": \"{s}\", \"total_comments\": {d}}}",
         .{
             &task_id,
             escaped_title.items,
-            escaped_reason.items,
-            if (is_current_task) "true" else "false",
+            agent_name,
+            escaped_comment.items,
+            updated_task.comments.len,
         },
     );
 

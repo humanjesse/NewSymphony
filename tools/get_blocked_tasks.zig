@@ -45,8 +45,8 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         return ToolResult.err(allocator, .internal_error, "Task store not initialized", start_time);
     };
 
-    // Get blocked tasks that have a reason (need decomposition)
-    const blocked_tasks = store.getBlockedTasksWithReasons() catch {
+    // Get tasks with BLOCKED: comments (need decomposition)
+    const blocked_tasks = store.getTasksWithCommentPrefix("BLOCKED:") catch {
         return ToolResult.err(allocator, .internal_error, "Failed to get blocked tasks", start_time);
     };
     defer allocator.free(blocked_tasks);
@@ -64,11 +64,23 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         const escaped_title = try html_utils.escapeJSON(allocator, task.title);
         defer allocator.free(escaped_title);
 
-        // Escape blocked_reason for JSON
-        const escaped_reason = if (task.blocked_reason) |reason|
-            try html_utils.escapeJSON(allocator, reason)
-        else
-            try allocator.dupe(u8, "");
+        // Find the most recent BLOCKED: comment to extract reason
+        var blocked_reason: []const u8 = "";
+        var j = task.comments.len;
+        while (j > 0) {
+            j -= 1;
+            if (std.mem.startsWith(u8, task.comments[j].content, "BLOCKED:")) {
+                // Extract reason after "BLOCKED:" prefix
+                blocked_reason = task.comments[j].content[8..]; // Skip "BLOCKED:"
+                // Trim leading whitespace
+                while (blocked_reason.len > 0 and blocked_reason[0] == ' ') {
+                    blocked_reason = blocked_reason[1..];
+                }
+                break;
+            }
+        }
+
+        const escaped_reason = try html_utils.escapeJSON(allocator, blocked_reason);
         defer allocator.free(escaped_reason);
 
         try json.writer(allocator).print(

@@ -30,6 +30,8 @@ const update_task = @import("tools/update_task.zig");
 const get_current_task = @import("tools/get_current_task.zig");
 const start_task = @import("tools/start_task.zig");
 const block_task = @import("tools/block_task.zig");
+const add_task_comment = @import("tools/add_task_comment.zig");
+const list_task_comments = @import("tools/list_task_comments.zig");
 const add_subtask = @import("tools/add_subtask.zig");
 const get_session_context = @import("tools/get_session_context.zig");
 const land_the_plane = @import("tools/land_the_plane.zig");
@@ -41,6 +43,8 @@ const sync_to_git = @import("tools/sync_to_git.zig");
 const run_agent = @import("tools/run_agent.zig");
 const list_agents = @import("tools/list_agents.zig");
 const planning_done = @import("tools/planning_done.zig");
+const tinkering_done = @import("tools/tinkering_done.zig");
+const request_revision = @import("tools/request_revision.zig");
 const git_status = @import("tools/git_status.zig");
 const git_diff = @import("tools/git_diff.zig");
 const git_log = @import("tools/git_log.zig");
@@ -256,6 +260,8 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try get_current_task.getDefinition(allocator));
     try tools.append(allocator, try start_task.getDefinition(allocator));
     try tools.append(allocator, try block_task.getDefinition(allocator));
+    try tools.append(allocator, try add_task_comment.getDefinition(allocator));
+    try tools.append(allocator, try list_task_comments.getDefinition(allocator));
     try tools.append(allocator, try add_subtask.getDefinition(allocator));
     try tools.append(allocator, try get_session_context.getDefinition(allocator));
     try tools.append(allocator, try land_the_plane.getDefinition(allocator));
@@ -270,6 +276,8 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try run_agent.getDefinition(allocator));
     try tools.append(allocator, try list_agents.getDefinition(allocator));
     try tools.append(allocator, try planning_done.getDefinition(allocator));
+    try tools.append(allocator, try tinkering_done.getDefinition(allocator));
+    try tools.append(allocator, try request_revision.getDefinition(allocator));
 
     // Web tools
     try tools.append(allocator, try web_search.getDefinition(allocator));

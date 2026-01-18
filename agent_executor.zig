@@ -115,6 +115,12 @@ pub const AgentExecutor = struct {
     // Planning completion flag (set by planning_done tool)
     planning_complete: bool = false,
 
+    // Tinkering completion flag (set by tinkering_done tool)
+    tinkering_complete: bool = false,
+
+    // Current agent name (for attributing comments)
+    agent_name: ?[]const u8 = null,
+
     // VTable for AgentExecutorInterface
     const vtable = AgentExecutorInterface.VTable{
         .deinit = vtableDeinit,
@@ -150,6 +156,11 @@ pub const AgentExecutor = struct {
     }
 
     pub fn deinit(self: *AgentExecutor) void {
+        // Free agent_name if allocated
+        if (self.agent_name) |name| {
+            self.allocator.free(name);
+        }
+
         // Free message history
         for (self.message_history.items) |msg| {
             self.allocator.free(msg.content);
@@ -583,6 +594,8 @@ pub const AgentExecutor = struct {
             .git_sync = agent_context.git_sync,
             .agent_registry = agent_context.agent_registry,
             .planning_complete_ptr = &self.planning_complete,
+            .tinkering_complete_ptr = &self.tinkering_complete,
+            .current_agent_name = self.agent_name,
         };
 
         // Execute tool (look up in tools module)
