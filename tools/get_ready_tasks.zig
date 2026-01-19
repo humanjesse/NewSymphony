@@ -10,6 +10,21 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const ReadyTask = struct {
+    id: []const u8,
+    title: []const u8,
+    priority: u8,
+    type: []const u8,
+};
+
+const Response = struct {
+    ready: []const ReadyTask,
+    ready_count: usize,
+    total_pending: usize,
+    total_blocked: usize,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -49,49 +64,29 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
     };
     defer allocator.free(ready_tasks);
 
-    // Build JSON response
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
+    // Build ready tasks array
+    var ready_array = std.ArrayListUnmanaged(ReadyTask){};
+    defer ready_array.deinit(allocator);
 
-    try json.appendSlice(allocator, "{\"ready\": [");
-
-    for (ready_tasks, 0..) |task, i| {
-        if (i > 0) try json.append(allocator, ',');
-
-        // Escape title for JSON
-        var escaped_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_title.deinit(allocator);
-        for (task.title) |c| {
-            switch (c) {
-                '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                '\r' => try escaped_title.appendSlice(allocator, "\\r"),
-                '\t' => try escaped_title.appendSlice(allocator, "\\t"),
-                else => try escaped_title.append(allocator, c),
-            }
-        }
-
-        try json.writer(allocator).print(
-            "{{\"id\":\"{s}\",\"title\":\"{s}\",\"priority\":{d},\"type\":\"{s}\"}}",
-            .{
-                &task.id,
-                escaped_title.items,
-                task.priority.toInt(),
-                task.task_type.toString(),
-            },
-        );
+    for (ready_tasks) |task| {
+        try ready_array.append(allocator, .{
+            .id = &task.id,
+            .title = task.title,
+            .priority = task.priority.toInt(),
+            .type = task.task_type.toString(),
+        });
     }
 
-    // Add counts
     const counts = store.getTaskCounts();
-    try json.writer(allocator).print("], \"ready_count\": {d}, \"total_pending\": {d}, \"total_blocked\": {d}}}", .{
-        ready_tasks.len,
-        counts.pending,
-        counts.blocked,
-    });
 
-    const result = try allocator.dupe(u8, json.items);
+    const response = Response{
+        .ready = ready_array.items,
+        .ready_count = ready_tasks.len,
+        .total_pending = counts.pending,
+        .total_blocked = counts.blocked,
+    };
+
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

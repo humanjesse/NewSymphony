@@ -7,7 +7,6 @@ const ollama = @import("ollama");
 const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
-const html_utils = @import("html_utils");
 const task_store_module = @import("task_store");
 
 const AppContext = context_module.AppContext;
@@ -83,21 +82,20 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         }
     }
 
-    // Build JSON response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
+    // Response struct for JSON serialization
+    const Response = struct {
+        tinkering_done: bool,
+        message: []const u8,
+        summary: []const u8,
+    };
 
-    try result_json.appendSlice(allocator, "{\"tinkering_done\": true, \"message\": \"Implementation complete. Submitting for review.\"");
+    const response = Response{
+        .tinkering_done = true,
+        .message = "Implementation complete. Submitting for review.",
+        .summary = summary,
+    };
 
-    const escaped_summary = try html_utils.escapeJSON(allocator, summary);
-    defer allocator.free(escaped_summary);
-    try result_json.appendSlice(allocator, ", \"summary\": \"");
-    try result_json.appendSlice(allocator, escaped_summary);
-    try result_json.appendSlice(allocator, "\"");
-
-    try result_json.appendSlice(allocator, "}");
-
-    const json_result = try allocator.dupe(u8, result_json.items);
+    const json_result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(json_result);
 
     return ToolResult.ok(allocator, json_result, start_time, null);

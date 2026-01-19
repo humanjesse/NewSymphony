@@ -6,7 +6,6 @@ const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
 const task_store = @import("task_store");
-const html_utils = @import("html_utils");
 
 const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
@@ -51,18 +50,29 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
     };
     defer allocator.free(blocked_tasks);
 
-    // Build JSON response
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
+    // Response structs for JSON serialization
+    const BlockedTaskInfo = struct {
+        id: []const u8,
+        title: []const u8,
+        priority: u8,
+        @"type": []const u8,
+        blocked_reason: []const u8,
+    };
 
-    try json.appendSlice(allocator, "{\"blocked\": [");
+    const Response = struct {
+        blocked: []const BlockedTaskInfo,
+        count: usize,
+    };
+
+    // Build blocked task info array
+    var task_infos = std.ArrayListUnmanaged(BlockedTaskInfo){};
+    defer task_infos.deinit(allocator);
+
+    var id_bufs = try allocator.alloc([8]u8, blocked_tasks.len);
+    defer allocator.free(id_bufs);
 
     for (blocked_tasks, 0..) |task, i| {
-        if (i > 0) try json.append(allocator, ',');
-
-        // Escape title for JSON
-        const escaped_title = try html_utils.escapeJSON(allocator, task.title);
-        defer allocator.free(escaped_title);
+        @memcpy(&id_bufs[i], &task.id);
 
         // Find the most recent BLOCKED: comment to extract reason
         var blocked_reason: []const u8 = "";
@@ -70,9 +80,7 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         while (j > 0) {
             j -= 1;
             if (std.mem.startsWith(u8, task.comments[j].content, "BLOCKED:")) {
-                // Extract reason after "BLOCKED:" prefix
-                blocked_reason = task.comments[j].content[8..]; // Skip "BLOCKED:"
-                // Trim leading whitespace
+                blocked_reason = task.comments[j].content[8..];
                 while (blocked_reason.len > 0 and blocked_reason[0] == ' ') {
                     blocked_reason = blocked_reason[1..];
                 }
@@ -80,25 +88,21 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
             }
         }
 
-        const escaped_reason = try html_utils.escapeJSON(allocator, blocked_reason);
-        defer allocator.free(escaped_reason);
-
-        try json.writer(allocator).print(
-            "{{\"id\":\"{s}\",\"title\":\"{s}\",\"priority\":{d},\"type\":\"{s}\",\"blocked_reason\":\"{s}\"}}",
-            .{
-                &task.id,
-                escaped_title,
-                task.priority.toInt(),
-                task.task_type.toString(),
-                escaped_reason,
-            },
-        );
+        try task_infos.append(allocator, .{
+            .id = &id_bufs[i],
+            .title = task.title,
+            .priority = task.priority.toInt(),
+            .@"type" = task.task_type.toString(),
+            .blocked_reason = blocked_reason,
+        });
     }
 
-    // Add count
-    try json.writer(allocator).print("], \"count\": {d}}}", .{blocked_tasks.len});
+    const response = Response{
+        .blocked = task_infos.items,
+        .count = blocked_tasks.len,
+    };
 
-    const result = try allocator.dupe(u8, json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

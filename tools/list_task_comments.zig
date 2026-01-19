@@ -11,6 +11,20 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const Comment = struct {
+    agent: []const u8,
+    content: []const u8,
+    timestamp: i64,
+};
+
+const Response = struct {
+    task_id: []const u8,
+    task_title: []const u8,
+    comments: []const Comment,
+    count: usize,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -78,54 +92,26 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         return ToolResult.err(allocator, .internal_error, "Task not found", start_time);
     };
 
-    // Build response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
+    // Build comments array
+    var comments_array = std.ArrayListUnmanaged(Comment){};
+    defer comments_array.deinit(allocator);
 
-    // Escape title for JSON
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (task.title) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            else => try escaped_title.append(allocator, c),
-        }
+    for (task.comments) |comment| {
+        try comments_array.append(allocator, .{
+            .agent = comment.agent,
+            .content = comment.content,
+            .timestamp = comment.timestamp,
+        });
     }
 
-    try result_json.writer(allocator).print(
-        "{{\"task_id\": \"{s}\", \"task_title\": \"{s}\", \"comments\": [",
-        .{ &task_id, escaped_title.items },
-    );
+    const response = Response{
+        .task_id = &task_id,
+        .task_title = task.title,
+        .comments = comments_array.items,
+        .count = task.comments.len,
+    };
 
-    // Add each comment
-    for (task.comments, 0..) |comment, i| {
-        if (i > 0) try result_json.appendSlice(allocator, ", ");
-
-        // Escape comment content for JSON
-        var escaped_content = std.ArrayListUnmanaged(u8){};
-        defer escaped_content.deinit(allocator);
-        for (comment.content) |c| {
-            switch (c) {
-                '"' => try escaped_content.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_content.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_content.appendSlice(allocator, "\\n"),
-                '\r' => try escaped_content.appendSlice(allocator, "\\r"),
-                '\t' => try escaped_content.appendSlice(allocator, "\\t"),
-                else => try escaped_content.append(allocator, c),
-            }
-        }
-
-        try result_json.writer(allocator).print(
-            "{{\"agent\": \"{s}\", \"content\": \"{s}\", \"timestamp\": {d}}}",
-            .{ comment.agent, escaped_content.items, comment.timestamp },
-        );
-    }
-
-    try result_json.writer(allocator).print("], \"count\": {d}}}", .{task.comments.len});
-
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

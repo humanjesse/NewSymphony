@@ -9,6 +9,13 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response struct for JSON serialization
+const TodoItem = struct {
+    todo_id: []const u8,
+    status: []const u8,
+    content: []const u8,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -48,45 +55,25 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         return ToolResult.ok(allocator, msg, start_time, null);
     }
 
-    // Build JSON array: [{"todo_id": "todo_1", "status": "pending", "content": "..."}, ...]
-    var result = std.ArrayListUnmanaged(u8){};
-    errdefer result.deinit(allocator);
+    // Build todos array
+    var todos_array = std.ArrayListUnmanaged(TodoItem){};
+    defer todos_array.deinit(allocator);
 
-    try result.appendSlice(allocator, "[");
-    for (todos, 0..) |todo, i| {
-        if (i > 0) try result.appendSlice(allocator, ",");
-
+    for (todos) |todo| {
         const status_str = switch (todo.status) {
             .pending => "pending",
             .in_progress => "in_progress",
             .completed => "completed",
         };
 
-        // Escape content for JSON
-        var escaped_content = std.ArrayListUnmanaged(u8){};
-        defer escaped_content.deinit(allocator);
-        for (todo.content) |c| {
-            switch (c) {
-                '"' => try escaped_content.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_content.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_content.appendSlice(allocator, "\\n"),
-                '\r' => try escaped_content.appendSlice(allocator, "\\r"),
-                '\t' => try escaped_content.appendSlice(allocator, "\\t"),
-                else => try escaped_content.append(allocator, c),
-            }
-        }
-
-        const todo_json = try std.fmt.allocPrint(
-            allocator,
-            "{{\"todo_id\":\"{s}\",\"status\":\"{s}\",\"content\":\"{s}\"}}",
-            .{ todo.id, status_str, escaped_content.items },
-        );
-        defer allocator.free(todo_json);
-        try result.appendSlice(allocator, todo_json);
+        try todos_array.append(allocator, .{
+            .todo_id = todo.id,
+            .status = status_str,
+            .content = todo.content,
+        });
     }
-    try result.appendSlice(allocator, "]");
 
-    const result_str = try result.toOwnedSlice(allocator);
+    const result_str = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(todos_array.items, .{})});
     defer allocator.free(result_str);
     return ToolResult.ok(allocator, result_str, start_time, null);
 }

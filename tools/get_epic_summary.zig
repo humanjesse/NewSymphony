@@ -11,6 +11,25 @@ const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 const TaskStore = task_store.TaskStore;
 
+// Response structs for JSON serialization
+const ChildrenCounts = struct {
+    total: usize,
+    completed: usize,
+    in_progress: usize,
+    blocked: usize,
+    pending: usize,
+};
+
+const Response = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+    type: []const u8,
+    is_epic: bool,
+    children: ChildrenCounts,
+    completion_percent: u8,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -85,50 +104,23 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         return ToolResult.err(allocator, .not_found, "Task not found", start_time);
     };
 
-    // Escape title
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (summary.task.title) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            else => try escaped_title.append(allocator, c),
-        }
-    }
-
-    // Build JSON response
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
-
-    try json.writer(allocator).print(
-        "{{\"id\":\"{s}\",\"title\":\"{s}\",\"status\":\"{s}\",\"type\":\"{s}\",\"is_epic\":{s},",
-        .{
-            &summary.task.id,
-            escaped_title.items,
-            summary.task.status.toString(),
-            summary.task.task_type.toString(),
-            if (summary.task.task_type == .molecule) "true" else "false",
+    const response = Response{
+        .id = &summary.task.id,
+        .title = summary.task.title,
+        .status = summary.task.status.toString(),
+        .type = summary.task.task_type.toString(),
+        .is_epic = summary.task.task_type == .molecule,
+        .children = .{
+            .total = summary.total_children,
+            .completed = summary.completed_children,
+            .in_progress = summary.in_progress_children,
+            .blocked = summary.blocked_children,
+            .pending = summary.total_children - summary.completed_children - summary.in_progress_children - summary.blocked_children,
         },
-    );
+        .completion_percent = summary.completion_percent,
+    };
 
-    try json.writer(allocator).print(
-        "\"children\":{{\"total\":{d},\"completed\":{d},\"in_progress\":{d},\"blocked\":{d},\"pending\":{d}}},",
-        .{
-            summary.total_children,
-            summary.completed_children,
-            summary.in_progress_children,
-            summary.blocked_children,
-            summary.total_children - summary.completed_children - summary.in_progress_children - summary.blocked_children,
-        },
-    );
-
-    try json.writer(allocator).print(
-        "\"completion_percent\":{d}}}",
-        .{summary.completion_percent},
-    );
-
-    const result = try allocator.dupe(u8, json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

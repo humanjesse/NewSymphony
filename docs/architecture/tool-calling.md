@@ -37,12 +37,6 @@ Model Processes Results → Final Answer
 
 ### File System Tools
 
-#### `get_file_tree`
-- **Description:** Generate file tree of current directory (recursive)
-- **Permission:** Auto-approved (safe, read-only)
-- **Returns:** JSON array of file paths
-- **Use Case:** Understanding project structure
-
 #### `ls`
 - **Description:** List contents of a single directory with detailed metadata
 - **Permission:** Auto-approved (low risk, read-only)
@@ -257,7 +251,7 @@ pub const ToolErrorType = enum {
 When the AI requests a tool, the permission system evaluates:
 
 1. **Tool Risk Level:**
-   - `safe`: Auto-approved (get_file_tree, get_current_time, task tools)
+   - `safe`: Auto-approved (ls, get_current_time, task tools)
    - `medium`: Requires approval (read_file)
    - `high`: Requires approval with warning (write_file, replace_lines)
 
@@ -406,11 +400,11 @@ After a successful tool call:
 1. user: "What files are in this project?"
 
 2. assistant: ""
-   tool_calls: [{id: "call_1", function: {name: "get_file_tree", ...}}]
+   tool_calls: [{id: "call_1", function: {name: "ls", ...}}]
 
-3. system: "[Tool: get_file_tree]
+3. system: "[Tool: ls]
             Status: ✅ SUCCESS
-            Result: [file list...]
+            Result: [directory listing...]
             Execution Time: 5ms"
 
 4. tool: "{\"success\": true, \"data\": \"[...]\", ...}"
@@ -559,7 +553,7 @@ Tool calling works with:
 ```
 User: "Tell me about this project"
 
-AI: [Calls get_file_tree]
+AI: [Calls ls]
     I can see this is a Zig project with these main files:
     - main.zig - Entry point
     - ui.zig - Terminal UI
@@ -597,7 +591,7 @@ To encourage effective tool use:
 
 ## Legacy `/context` Command
 
-The old `/context` command is now superseded by the automatic `get_file_tree` tool but remains for backward compatibility.
+The old `/context` command is now superseded by the `ls` tool but remains for backward compatibility.
 
 ## Historical Notes
 

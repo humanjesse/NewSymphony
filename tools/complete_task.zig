@@ -12,6 +12,27 @@ const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 const TaskStore = task_store.TaskStore;
 
+// Response structs for JSON serialization
+const CompletedTask = struct {
+    id: []const u8,
+    title: []const u8,
+};
+
+const NextTask = struct {
+    id: []const u8,
+    title: []const u8,
+    priority: u8,
+};
+
+const Response = struct {
+    completed: bool,
+    task: CompletedTask,
+    unblocked: []const []const u8,
+    unblocked_count: usize,
+    summary: ?[]const u8 = null,
+    next_task: ?NextTask = null,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -109,27 +130,15 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         return ToolResult.err(allocator, .not_found, "Task not found", start_time);
     };
 
-    // Escape title for JSON
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (task.title) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            else => try escaped_title.append(allocator, c),
-        }
-    }
-
     // Complete the task
-    const result = store.completeTask(task_id) catch |err| {
+    const complete_result = store.completeTask(task_id) catch |err| {
         const msg = switch (err) {
             error.TaskNotFound => "Task not found",
             else => "Failed to complete task",
         };
         return ToolResult.err(allocator, .not_found, msg, start_time);
     };
-    defer allocator.free(result.unblocked);
+    defer allocator.free(complete_result.unblocked);
 
     // Persist to database if available
     if (context.task_db) |db| {
@@ -140,64 +149,40 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         }
     }
 
-    // Build JSON response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
-    try result_json.writer(allocator).print(
-        "{{\"completed\": true, \"task\": {{\"id\": \"{s}\", \"title\": \"{s}\"}}, \"unblocked\": [",
-        .{ &task_id, escaped_title.items },
-    );
-
-    for (result.unblocked, 0..) |unblocked_id, i| {
-        if (i > 0) try result_json.append(allocator, ',');
-        try result_json.writer(allocator).print("\"{s}\"", .{&unblocked_id});
+    // Build unblocked IDs array
+    var unblocked_ids = std.ArrayListUnmanaged([]const u8){};
+    defer unblocked_ids.deinit(allocator);
+    for (complete_result.unblocked) |unblocked_id| {
+        try unblocked_ids.append(allocator, &unblocked_id);
     }
 
-    try result_json.writer(allocator).print("], \"unblocked_count\": {d}", .{result.unblocked.len});
-
-    // Include summary if provided
-    if (summary) |s| {
-        var escaped_summary = std.ArrayListUnmanaged(u8){};
-        defer escaped_summary.deinit(allocator);
-        for (s) |c| {
-            switch (c) {
-                '"' => try escaped_summary.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_summary.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_summary.appendSlice(allocator, "\\n"),
-                else => try escaped_summary.append(allocator, c),
-            }
-        }
-        try result_json.writer(allocator).print(", \"summary\": \"{s}\"", .{escaped_summary.items});
-    }
-
-    // Auto-advance: show next ready task
+    // Auto-advance: get next ready task
     const ready_tasks = store.getReadyTasks() catch &[_]task_store.Task{};
     defer allocator.free(ready_tasks);
 
+    var next_task: ?NextTask = null;
     if (ready_tasks.len > 0) {
         const next = ready_tasks[0];
-        var escaped_next_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_next_title.deinit(allocator);
-        for (next.title) |c| {
-            switch (c) {
-                '"' => try escaped_next_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_next_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_next_title.appendSlice(allocator, "\\n"),
-                else => try escaped_next_title.append(allocator, c),
-            }
-        }
-        try result_json.writer(allocator).print(
-            ", \"next_task\": {{\"id\": \"{s}\", \"title\": \"{s}\", \"priority\": {d}}}",
-            .{ &next.id, escaped_next_title.items, next.priority.toInt() },
-        );
-    } else {
-        try result_json.appendSlice(allocator, ", \"next_task\": null");
+        next_task = .{
+            .id = &next.id,
+            .title = next.title,
+            .priority = next.priority.toInt(),
+        };
     }
 
-    try result_json.appendSlice(allocator, "}");
+    const response = Response{
+        .completed = true,
+        .task = .{
+            .id = &task_id,
+            .title = task.title,
+        },
+        .unblocked = unblocked_ids.items,
+        .unblocked_count = complete_result.unblocked.len,
+        .summary = summary,
+        .next_task = next_task,
+    };
 
-    const json_result = try allocator.dupe(u8, result_json.items);
+    const json_result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(json_result);
 
     return ToolResult.ok(allocator, json_result, start_time, null);

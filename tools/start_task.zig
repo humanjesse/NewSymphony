@@ -11,6 +11,19 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const TaskInfo = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+    priority: u8,
+};
+
+const Response = struct {
+    started: bool,
+    task: TaskInfo,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -85,33 +98,18 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         };
     }
 
-    // Build JSON response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
-    // Escape title
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (task.title) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            else => try escaped_title.append(allocator, c),
-        }
-    }
-
-    try result_json.writer(allocator).print(
-        "{{\"started\": true, \"task\": {{\"id\": \"{s}\", \"title\": \"{s}\", \"status\": \"{s}\", \"priority\": {d}}}}}",
-        .{
-            &task.id,
-            escaped_title.items,
-            task.status.toString(),
-            task.priority.toInt(),
+    // Build response
+    const response = Response{
+        .started = true,
+        .task = .{
+            .id = &task.id,
+            .title = task.title,
+            .status = task.status.toString(),
+            .priority = task.priority.toInt(),
         },
-    );
+    };
 
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

@@ -13,13 +13,47 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const Comment = struct {
+    agent: []const u8,
+    content: []const u8,
+    timestamp: i64,
+};
+
+const TaskInfo = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+    priority: []const u8,
+    type: []const u8,
+    description: ?[]const u8 = null,
+    blocked_by_count: usize,
+    comments: []const Comment,
+    started_at_commit: ?[]const u8 = null,
+};
+
+const ParentContext = struct {
+    id: []const u8,
+    title: []const u8,
+    type: []const u8,
+    description: ?[]const u8 = null,
+};
+
+const Response = struct {
+    current_task: ?TaskInfo = null,
+    parent_context: ?ParentContext = null,
+    ready_count: usize,
+    blocked_count: usize,
+    message: ?[]const u8 = null,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
             .type = "function",
             .function = .{
                 .name = try allocator.dupe(u8, "get_current_task"),
-                .description = try allocator.dupe(u8, "Get the task you're currently working on. Auto-assigns from ready queue if none set."),
+                .description = try allocator.dupe(u8, "Get the task you're currently working on. Auto-assigns from ready queue if none set. Includes parent_context when task is a subtask of a molecule."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
@@ -68,39 +102,19 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         }
     }
 
-    // Build JSON response
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
+    const counts = store.getTaskCounts();
 
     if (current_task) |task| {
-        // Escape title for JSON
-        var escaped_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_title.deinit(allocator);
-        for (task.title) |c| {
-            switch (c) {
-                '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                '\r' => try escaped_title.appendSlice(allocator, "\\r"),
-                '\t' => try escaped_title.appendSlice(allocator, "\\t"),
-                else => try escaped_title.append(allocator, c),
-            }
-        }
+        // Build comments array
+        var comments = std.ArrayListUnmanaged(Comment){};
+        defer comments.deinit(allocator);
 
-        // Escape description if present
-        var escaped_desc = std.ArrayListUnmanaged(u8){};
-        defer escaped_desc.deinit(allocator);
-        if (task.description) |desc| {
-            for (desc) |c| {
-                switch (c) {
-                    '"' => try escaped_desc.appendSlice(allocator, "\\\""),
-                    '\\' => try escaped_desc.appendSlice(allocator, "\\\\"),
-                    '\n' => try escaped_desc.appendSlice(allocator, "\\n"),
-                    '\r' => try escaped_desc.appendSlice(allocator, "\\r"),
-                    '\t' => try escaped_desc.appendSlice(allocator, "\\t"),
-                    else => try escaped_desc.append(allocator, c),
-                }
-            }
+        for (task.comments) |comment| {
+            try comments.append(allocator, .{
+                .agent = comment.agent,
+                .content = comment.content,
+                .timestamp = comment.timestamp,
+            });
         }
 
         const prio_str = switch (task.priority) {
@@ -111,75 +125,59 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
             .wishlist => "wishlist",
         };
 
-        try json.appendSlice(allocator, "{\"current_task\": {");
-        try json.writer(allocator).print(
-            "\"id\": \"{s}\", \"title\": \"{s}\", \"status\": \"{s}\", \"priority\": \"{s}\", \"type\": \"{s}\"",
-            .{
-                &task.id,
-                escaped_title.items,
-                task.status.toString(),
-                prio_str,
-                task.task_type.toString(),
-            },
-        );
+        const task_info = TaskInfo{
+            .id = &task.id,
+            .title = task.title,
+            .status = task.status.toString(),
+            .priority = prio_str,
+            .type = task.task_type.toString(),
+            .description = task.description,
+            .blocked_by_count = task.blocked_by_count,
+            .comments = comments.items,
+            .started_at_commit = task.started_at_commit,
+        };
 
-        if (task.description != null) {
-            try json.writer(allocator).print(", \"description\": \"{s}\"", .{escaped_desc.items});
-        }
-
-        // Add blocked_by count
-        try json.writer(allocator).print(", \"blocked_by_count\": {d}", .{task.blocked_by_count});
-
-        // Add comments (Beads audit trail)
-        try json.writer(allocator).print(", \"comments\": [", .{});
-        for (task.comments, 0..) |comment, i| {
-            if (i > 0) try json.writer(allocator).print(",", .{});
-
-            // Escape comment content for JSON
-            var escaped_content = std.ArrayListUnmanaged(u8){};
-            defer escaped_content.deinit(allocator);
-            for (comment.content) |c| {
-                switch (c) {
-                    '"' => try escaped_content.appendSlice(allocator, "\\\""),
-                    '\\' => try escaped_content.appendSlice(allocator, "\\\\"),
-                    '\n' => try escaped_content.appendSlice(allocator, "\\n"),
-                    '\r' => try escaped_content.appendSlice(allocator, "\\r"),
-                    '\t' => try escaped_content.appendSlice(allocator, "\\t"),
-                    else => try escaped_content.append(allocator, c),
-                }
+        // Build parent context if task has a parent
+        var parent_context: ?ParentContext = null;
+        if (task.parent_id) |parent_id| {
+            if (store.getTask(parent_id)) |parent| {
+                parent_context = .{
+                    .id = &parent_id,
+                    .title = parent.title,
+                    .type = parent.task_type.toString(),
+                    .description = parent.description,
+                };
             }
-
-            try json.writer(allocator).print(
-                "{{\"agent\": \"{s}\", \"content\": \"{s}\", \"timestamp\": {d}}}",
-                .{ comment.agent, escaped_content.items, comment.timestamp },
-            );
-        }
-        try json.writer(allocator).print("]", .{});
-
-        // Add started_at_commit for Judge workflow (Phase 2 commit tracking)
-        if (task.started_at_commit) |commit| {
-            try json.writer(allocator).print(", \"started_at_commit\": \"{s}\"", .{commit});
-        } else {
-            try json.writer(allocator).print(", \"started_at_commit\": null", .{});
         }
 
-        // Get ready count for context
-        const counts = store.getTaskCounts();
-        try json.writer(allocator).print("}}, \"ready_count\": {d}, \"blocked_count\": {d}}}", .{
-            counts.pending,
-            counts.blocked,
-        });
+        const response = Response{
+            .current_task = task_info,
+            .parent_context = parent_context,
+            .ready_count = counts.pending,
+            .blocked_count = counts.blocked,
+            .message = null,
+        };
+
+        const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
+        defer allocator.free(result);
+
+        return ToolResult.ok(allocator, result, start_time, null);
     } else {
         // No tasks ready
-        const counts = store.getTaskCounts();
-        try json.writer(allocator).print(
-            "{{\"current_task\": null, \"ready_count\": 0, \"blocked_count\": {d}, \"message\": \"No tasks ready. {d} tasks blocked - review dependencies.\"}}",
-            .{ counts.blocked, counts.blocked },
-        );
+        const message = try std.fmt.allocPrint(allocator, "No tasks ready. {d} tasks blocked - review dependencies.", .{counts.blocked});
+        defer allocator.free(message);
+
+        const response = Response{
+            .current_task = null,
+            .parent_context = null,
+            .ready_count = 0,
+            .blocked_count = counts.blocked,
+            .message = message,
+        };
+
+        const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
+        defer allocator.free(result);
+
+        return ToolResult.ok(allocator, result, start_time, null);
     }
-
-    const result = try allocator.dupe(u8, json.items);
-    defer allocator.free(result);
-
-    return ToolResult.ok(allocator, result, start_time, null);
 }

@@ -5,7 +5,6 @@ const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
 const task_store = @import("task_store");
-const html_utils = @import("html_utils");
 
 const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
@@ -126,67 +125,83 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     };
     defer allocator.free(tasks);
 
-    // Build JSON response
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
+    // Response structs for JSON serialization
+    const TaskInfo = struct {
+        id: []const u8,
+        title: []const u8,
+        status: []const u8,
+        priority: u8,
+        @"type": []const u8,
+        blocked_by: usize,
+        blocked_reason: ?[]const u8 = null,
+    };
 
-    try json.appendSlice(allocator, "{\"tasks\": [");
+    const Summary = struct {
+        pending: usize,
+        in_progress: usize,
+        completed: usize,
+        blocked: usize,
+    };
+
+    const Response = struct {
+        tasks: []const TaskInfo,
+        total: usize,
+        summary: Summary,
+    };
+
+    // Build task info array
+    var task_infos = std.ArrayListUnmanaged(TaskInfo){};
+    defer task_infos.deinit(allocator);
+
+    // We need to store the id copies
+    var id_bufs = try allocator.alloc([8]u8, tasks.len);
+    defer allocator.free(id_bufs);
 
     for (tasks, 0..) |task, i| {
-        if (i > 0) try json.append(allocator, ',');
+        @memcpy(&id_bufs[i], &task.id);
 
-        // Escape title for JSON
-        const escaped_title = try html_utils.escapeJSON(allocator, task.title);
-        defer allocator.free(escaped_title);
-
-        // Base task info
-        try json.writer(allocator).print(
-            "{{\"id\":\"{s}\",\"title\":\"{s}\",\"status\":\"{s}\",\"priority\":{d},\"type\":\"{s}\",\"blocked_by\":{d}",
-            .{
-                &task.id,
-                escaped_title,
-                task.status.toString(),
-                task.priority.toInt(),
-                task.task_type.toString(),
-                task.blocked_by_count,
-            },
-        );
-
-        // Add blocked_reason from comments if task is blocked (Beads philosophy)
+        // Find blocked_reason if task is blocked
+        var blocked_reason: ?[]const u8 = null;
         if (task.status == .blocked) {
-            // Find most recent BLOCKED: comment
             var j = task.comments.len;
             while (j > 0) {
                 j -= 1;
                 if (std.mem.startsWith(u8, task.comments[j].content, "BLOCKED:")) {
-                    var blocked_reason = task.comments[j].content[8..];
-                    // Trim leading whitespace
-                    while (blocked_reason.len > 0 and blocked_reason[0] == ' ') {
-                        blocked_reason = blocked_reason[1..];
+                    var reason = task.comments[j].content[8..];
+                    while (reason.len > 0 and reason[0] == ' ') {
+                        reason = reason[1..];
                     }
-                    const escaped_reason = try html_utils.escapeJSON(allocator, blocked_reason);
-                    defer allocator.free(escaped_reason);
-                    try json.writer(allocator).print(",\"blocked_reason\":\"{s}\"", .{escaped_reason});
+                    if (reason.len > 0) blocked_reason = reason;
                     break;
                 }
             }
         }
 
-        // Close the object
-        try json.append(allocator, '}');
+        try task_infos.append(allocator, .{
+            .id = &id_bufs[i],
+            .title = task.title,
+            .status = task.status.toString(),
+            .priority = task.priority.toInt(),
+            .@"type" = task.task_type.toString(),
+            .blocked_by = task.blocked_by_count,
+            .blocked_reason = blocked_reason,
+        });
     }
 
-    // Add summary
     const counts = store.getTaskCounts();
-    try json.writer(allocator).print("], \"total\": {d}, \"summary\": {{\"pending\": {d}, \"in_progress\": {d}, \"completed\": {d}, \"blocked\": {d}}}}}", .{
-        tasks.len,
-        counts.pending,
-        counts.in_progress,
-        counts.completed,
-        counts.blocked,
-    });
 
-    const result = try allocator.dupe(u8, json.items);
+    const response = Response{
+        .tasks = task_infos.items,
+        .total = tasks.len,
+        .summary = .{
+            .pending = counts.pending,
+            .in_progress = counts.in_progress,
+            .completed = counts.completed,
+            .blocked = counts.blocked,
+        },
+    };
+
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

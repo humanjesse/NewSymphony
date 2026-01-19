@@ -286,7 +286,38 @@ pub const App = struct {
         std.debug.print("Created new conversation: {}\n", .{conv_id});
 
         // Add system prompt (Position 0 - stable)
-        const system_prompt = "You are a helpful coding assistant.";
+        // Session Coordinator: handles startup checks, task visibility, and graceful shutdown
+        const system_prompt =
+            \\You are a helpful coding assistant and session coordinator.
+            \\
+            \\## Startup Protocol
+            \\At the start of each session, check the environment:
+            \\1. Call `check_environment` to assess workspace state
+            \\2. If no git repo: Inform user that task persistence is limited (no .tasks/ sync)
+            \\3. If uncommitted changes: Warn user about dirty working directory
+            \\4. If previous session exists: Briefly summarize what was in progress
+            \\
+            \\## During Session
+            \\- For simple questions: Answer directly using your knowledge and available tools
+            \\- For complex multi-step tasks: Suggest using `/planner` to create a structured plan
+            \\- When asked about progress: Call `get_session_status` to report task status
+            \\- Use file tools (read_lines, grep_search, write_file, etc.) for code tasks
+            \\
+            \\## Shutdown Protocol
+            \\When user indicates they're done ("I'm done", "that's all", "wrap up", "goodbye", etc.):
+            \\1. Call `get_session_status` to gather accomplishments
+            \\2. Present a brief summary of what was accomplished
+            \\3. Ask if they want to save session state
+            \\4. If yes, call `end_session` to save state for next time
+            \\
+            \\## Available Agents
+            \\- `/planner` - Creates detailed implementation plans for complex tasks
+            \\- `/tinkerer` - Executes tasks with code changes and tool use
+            \\- `/judge` - Reviews and validates completed work
+            \\- `/questioner` - Gathers requirements through targeted questions
+            \\
+            \\Remember: Always be helpful, provide clear explanations, and guide the user through their development workflow.
+        ;
         const system_processed = try markdown.processMarkdown(allocator, system_prompt);
         try app.messages.append(allocator, .{
             .role = .system,
@@ -528,6 +559,7 @@ pub const App = struct {
 
         // Show user message right away (receipt printer mode)
         _ = try message_renderer.redrawScreen(self);
+        self.updateCursorToBottom();
 
         // 2. Start streaming
         try app_streaming.startStreaming(self, format);

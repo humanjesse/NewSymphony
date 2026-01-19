@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("git_sync.zig"),
     });
     git_sync_module.addImport("task_store", task_store_module);
+    // Note: html_utils will be added after it's created
 
     // Git utilities module (commit tracking for Tinkerer/Judge workflow)
     const git_utils_module = b.createModule(.{
@@ -62,6 +63,9 @@ pub fn build(b: *std.Build) void {
     const html_utils_module = b.createModule(.{
         .root_source_file = b.path("tools/html_utils.zig"),
     });
+
+    // Now add html_utils to git_sync_module
+    git_sync_module.addImport("html_utils", html_utils_module);
 
     // Markdown module (depends on lexer)
     const markdown_module = b.createModule(.{

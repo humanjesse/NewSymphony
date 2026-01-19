@@ -208,7 +208,7 @@ Based on the architecture, here are agents you could easily add:
 
 ### documentation_writer
 - **Purpose**: Generate/update documentation
-- **Tools**: read_file, write_file, file_tree
+- **Tools**: read_file, write_file, ls, grep_search
 - **Output**: Markdown documentation
 
 ### refactorer

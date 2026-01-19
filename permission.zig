@@ -7,7 +7,7 @@ const ollama = @import("ollama");
 // ============================================================================
 
 pub const RiskLevel = enum {
-    safe,     // Auto-approve (get_file_tree)
+    safe,     // Auto-approve (ls, get_current_time)
     low,      // Ask once per session
     medium,   // Ask each time (read_lines)
     high,     // Ask + show preview

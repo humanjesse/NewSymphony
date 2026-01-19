@@ -11,6 +11,18 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const SubtaskInfo = struct {
+    id: []const u8,
+    title: []const u8,
+    parent_id: []const u8,
+};
+
+const Response = struct {
+    created: bool,
+    subtask: SubtaskInfo,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -116,30 +128,16 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     };
 
     // Build response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (title.?) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            else => try escaped_title.append(allocator, c),
-        }
-    }
-
-    try result_json.writer(allocator).print(
-        "{{\"created\": true, \"subtask\": {{\"id\": \"{s}\", \"title\": \"{s}\", \"parent_id\": \"{s}\"}}}}",
-        .{
-            &subtask_id,
-            escaped_title.items,
-            &parent_id,
+    const response = Response{
+        .created = true,
+        .subtask = .{
+            .id = &subtask_id,
+            .title = title.?,
+            .parent_id = &parent_id,
         },
-    );
+    };
 
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

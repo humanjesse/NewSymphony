@@ -8,6 +8,7 @@ const message_renderer = @import("message_renderer");
 const context_module = @import("context");
 pub const agents_module = @import("agents");
 const agent_executor = @import("agent_executor");
+const task_store_module = @import("task_store");
 
 // Forward declare App type to avoid circular dependency
 const App = @import("app.zig").App;
@@ -602,11 +603,6 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
     const agent_name_copy = try app.allocator.dupe(u8, session.agent_name);
     defer app.allocator.free(agent_name_copy);
 
-    // Capture executor flags BEFORE session cleanup (endAgentSession destroys the executor)
-    var tinkering_complete = false;
-    const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
-    tinkering_complete = executor.tinkering_complete;
-
     if (result.status == .complete or result.status == .failed) {
         // Agent finished - finalize the streamed message and end session
         // The message content was already populated via streaming
@@ -644,9 +640,15 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
             handleQuestionerComplete(app);
         }
 
-        // Tinkerer → Judge: trigger Judge on successful tinkerer completion
+        // Tinkerer → routing based on whether task was blocked
         if (result.success and mem.eql(u8, agent_name_copy, "tinkerer")) {
-            triggerJudge(app);
+            if (hasBlockedTasks(app)) {
+                // Tinkerer explicitly blocked - go to Planner for decomposition
+                triggerPlannerKickback(app);
+            } else {
+                // Either complete or max iterations - Judge reviews the work
+                triggerJudge(app);
+            }
         }
 
         // Judge completion: either move to next task or trigger revision retry
@@ -788,40 +790,48 @@ pub fn triggerTinkererRevision(app: *App, task_id: *const [8]u8, feedback: []con
     };
 }
 
-/// Handle Tinkerer completing without calling tinkering_done
-/// This happens when Tinkerer hits max_iterations or calls block_task
-pub fn handleTinkererIncomplete(app: *App) void {
-    const task_store = app.app_context.task_store orelse return;
-
-    // Check for tasks with BLOCKED: comments (need decomposition by Planner)
-    const blocked = task_store.getTasksWithCommentPrefix("BLOCKED:") catch return;
-    defer app.allocator.free(blocked);
-
-    if (blocked.len > 0) {
-        // Task was blocked - questioner will trigger planner for decomposition
-        triggerQuestioner(app);
+/// Handle questioner completion - either trigger tinkerer or planner for blocked tasks
+pub fn handleQuestionerComplete(app: *App) void {
+    // Check if there are blocked tasks - if so, trigger planner
+    if (hasBlockedTasks(app)) {
+        triggerPlannerKickback(app);
+    } else {
+        // No blocked tasks - trigger Tinkerer for next ready task
+        triggerTinkerer(app);
     }
-    // else: Tinkerer hit max iterations without blocking or completing
-    // Let the loop end - user can manually retry or check status
 }
 
-/// Handle questioner completion - queue planner event to decompose blocked tasks
-pub fn handleQuestionerComplete(app: *App) void {
+/// Check if there are any tasks with blocked status
+fn hasBlockedTasks(app: *App) bool {
+    const task_store = app.app_context.task_store orelse return false;
+    const counts = task_store.getTaskCounts();
+    return counts.blocked > 0;
+}
+
+/// Trigger planner to decompose blocked tasks
+fn triggerPlannerKickback(app: *App) void {
     const task_store = app.app_context.task_store orelse return;
     const registry = app.app_context.agent_registry orelse return;
 
-    // Check if planner agent exists
     if (registry.get("planner") == null) {
         return;
     }
 
-    // Get tasks with BLOCKED: comments (need decomposition)
-    const blocked_tasks = task_store.getTasksWithCommentPrefix("BLOCKED:") catch return;
-    defer app.allocator.free(blocked_tasks);
+    // Get tasks that are actually in blocked status
+    const tasks_with_blocked_comments = task_store.getTasksWithCommentPrefix("BLOCKED:") catch return;
+    defer app.allocator.free(tasks_with_blocked_comments);
 
-    if (blocked_tasks.len == 0) {
-        // No blocked tasks - trigger Tinkerer for next ready task
-        triggerTinkerer(app);
+    // Filter to only tasks that are actually blocked
+    var actually_blocked = std.ArrayListUnmanaged(task_store_module.Task){};
+    defer actually_blocked.deinit(app.allocator);
+    for (tasks_with_blocked_comments) |task| {
+        if (task.status == .blocked) {
+            actually_blocked.append(app.allocator, task) catch continue;
+        }
+    }
+
+    if (actually_blocked.items.len == 0) {
+        // No blocked tasks found - nothing to do
         return;
     }
 
@@ -829,9 +839,9 @@ pub fn handleQuestionerComplete(app: *App) void {
     var prompt = std.ArrayListUnmanaged(u8){};
     defer prompt.deinit(app.allocator);
 
-    prompt.appendSlice(app.allocator, "KICKBACK: The following tasks were blocked by the questioner and need decomposition:\n\n") catch return;
+    prompt.appendSlice(app.allocator, "KICKBACK: The following tasks were blocked and need decomposition:\n\n") catch return;
 
-    for (blocked_tasks) |task| {
+    for (actually_blocked.items) |task| {
         // Find most recent BLOCKED: comment to extract reason
         var blocked_reason: []const u8 = "No reason provided";
         var i = task.comments.len;
@@ -852,20 +862,18 @@ pub fn handleQuestionerComplete(app: *App) void {
             task.title,
             blocked_reason,
         }) catch return;
-
-        // Note: We don't need to clear comments - they're an append-only audit trail (Beads philosophy)
     }
 
-    prompt.appendSlice(app.allocator, "Please decompose these tasks into smaller, executable subtasks.") catch return;
+    prompt.appendSlice(app.allocator, "Please use update_task to convert these blocked tasks to molecules, then add subtasks to decompose them.") catch return;
 
-    // Create owned copies for the event (these will be freed by event.deinit)
+    // Create owned copies for the event
     const prompt_str = app.allocator.dupe(u8, prompt.items) catch return;
-    const display_text = std.fmt.allocPrint(app.allocator, "/planner [KICKBACK] Decomposing {d} blocked task(s)", .{blocked_tasks.len}) catch {
+    const display_text = std.fmt.allocPrint(app.allocator, "/planner [KICKBACK] Decomposing {d} blocked task(s)", .{actually_blocked.items.len}) catch {
         app.allocator.free(prompt_str);
         return;
     };
 
-    // Queue event for main loop dispatch (avoids recursive error set resolution)
+    // Queue event for main loop dispatch
     app.agent_command_events.append(app.allocator, .{
         .start_planner = .{ .prompt = prompt_str, .display_text = display_text },
     }) catch {

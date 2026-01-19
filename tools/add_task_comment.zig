@@ -11,6 +11,20 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const TaskInfo = struct {
+    id: []const u8,
+    title: []const u8,
+};
+
+const Response = struct {
+    success: bool,
+    task: TaskInfo,
+    agent: []const u8,
+    comment: []const u8,
+    total_comments: usize,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -116,46 +130,18 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     }
 
     // Build response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (task.title) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            else => try escaped_title.append(allocator, c),
-        }
-    }
-
-    // Escape comment for JSON
-    var escaped_comment = std.ArrayListUnmanaged(u8){};
-    defer escaped_comment.deinit(allocator);
-    for (comment.?) |c| {
-        switch (c) {
-            '"' => try escaped_comment.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_comment.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_comment.appendSlice(allocator, "\\n"),
-            '\r' => try escaped_comment.appendSlice(allocator, "\\r"),
-            '\t' => try escaped_comment.appendSlice(allocator, "\\t"),
-            else => try escaped_comment.append(allocator, c),
-        }
-    }
-
-    try result_json.writer(allocator).print(
-        "{{\"success\": true, \"task\": {{\"id\": \"{s}\", \"title\": \"{s}\"}}, \"agent\": \"{s}\", \"comment\": \"{s}\", \"total_comments\": {d}}}",
-        .{
-            &task_id,
-            escaped_title.items,
-            agent_name,
-            escaped_comment.items,
-            updated_task.comments.len,
+    const response = Response{
+        .success = true,
+        .task = .{
+            .id = &task_id,
+            .title = task.title,
         },
-    );
+        .agent = agent_name,
+        .comment = comment.?,
+        .total_comments = updated_task.comments.len,
+    };
 
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

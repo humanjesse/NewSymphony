@@ -1702,6 +1702,19 @@ pub fn calculateContentHeight(self: *App) !usize {
         absolute_y += 1;
     }
 
+    // Include pending user messages in height calculation
+    for (self.pending_user_messages.items) |pending_text| {
+        // Estimate height for pending message (content + borders + spacing)
+        const pending_lines = blk: {
+            var count: usize = 1;
+            for (pending_text) |c| {
+                if (c == '\n') count += 1;
+            }
+            break :blk count;
+        };
+        absolute_y += pending_lines + 2 + 1; // content + borders + spacing
+    }
+
     return absolute_y;
 }
 
@@ -1741,6 +1754,30 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
 
         // Draw message
         try drawMessage(self, writer, message, i, &absolute_y, input_field_height);
+    }
+
+    // Render pending user messages (queued while streaming/agent active)
+    // These appear as regular messages so users can see what they've submitted
+    for (self.pending_user_messages.items) |pending_text| {
+        // Create a temporary message for rendering
+        var pending_processed = try markdown.processMarkdown(self.allocator, pending_text);
+        defer {
+            for (pending_processed.items) |*item| {
+                item.deinit(self.allocator);
+            }
+            pending_processed.deinit(self.allocator);
+        }
+
+        var pending_msg = types.Message{
+            .role = .user,
+            .content = pending_text,
+            .processed_content = pending_processed,
+            .thinking_expanded = false,
+            .timestamp = std.time.milliTimestamp(),
+        };
+
+        // Draw the pending message (use messages.len as a fake index - won't be clicked)
+        try drawMessage(self, writer, &pending_msg, self.messages.items.len, &absolute_y, input_field_height);
     }
 
     // Auto-scroll to keep bottom visible (simple calculation)

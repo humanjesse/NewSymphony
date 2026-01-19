@@ -11,6 +11,21 @@ const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 const TaskStore = task_store.TaskStore;
 
+// Response structs for JSON serialization
+const Sibling = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+    priority: u8,
+};
+
+const Response = struct {
+    task_id: []const u8,
+    parent_id: ?[]const u8,
+    siblings: []const Sibling,
+    count: usize,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -92,54 +107,33 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     };
     defer allocator.free(siblings);
 
-    // Build JSON response
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
+    // Build siblings array
+    var siblings_array = std.ArrayListUnmanaged(Sibling){};
+    defer siblings_array.deinit(allocator);
 
-    try json.appendSlice(allocator, "{\"task_id\":\"");
-    try json.appendSlice(allocator, &task_id);
-    try json.appendSlice(allocator, "\",");
+    for (siblings) |sibling| {
+        try siblings_array.append(allocator, .{
+            .id = &sibling.id,
+            .title = sibling.title,
+            .status = sibling.status.toString(),
+            .priority = sibling.priority.toInt(),
+        });
+    }
 
-    // Include parent info if present
+    // Store parent_id slice if present
+    var parent_id_slice: ?[]const u8 = null;
     if (task.parent_id) |pid| {
-        try json.appendSlice(allocator, "\"parent_id\":\"");
-        try json.appendSlice(allocator, &pid);
-        try json.appendSlice(allocator, "\",");
-    } else {
-        try json.appendSlice(allocator, "\"parent_id\":null,");
+        parent_id_slice = &pid;
     }
 
-    try json.appendSlice(allocator, "\"siblings\":[");
+    const response = Response{
+        .task_id = &task_id,
+        .parent_id = parent_id_slice,
+        .siblings = siblings_array.items,
+        .count = siblings.len,
+    };
 
-    for (siblings, 0..) |sibling, i| {
-        if (i > 0) try json.append(allocator, ',');
-
-        // Escape title
-        var escaped_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_title.deinit(allocator);
-        for (sibling.title) |c| {
-            switch (c) {
-                '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                else => try escaped_title.append(allocator, c),
-            }
-        }
-
-        try json.writer(allocator).print(
-            "{{\"id\":\"{s}\",\"title\":\"{s}\",\"status\":\"{s}\",\"priority\":{d}}}",
-            .{
-                &sibling.id,
-                escaped_title.items,
-                sibling.status.toString(),
-                sibling.priority.toInt(),
-            },
-        );
-    }
-
-    try json.writer(allocator).print("],\"count\":{d}}}", .{siblings.len});
-
-    const result = try allocator.dupe(u8, json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

@@ -11,6 +11,21 @@ const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 const TaskStore = task_store.TaskStore;
 
+// Response structs for JSON serialization
+const ChildTask = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+    priority: u8,
+    type: []const u8,
+};
+
+const Response = struct {
+    parent_id: []const u8,
+    children: []const ChildTask,
+    count: usize,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -84,44 +99,27 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     };
     defer allocator.free(children);
 
-    // Build JSON response
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
+    // Build children array
+    var children_array = std.ArrayListUnmanaged(ChildTask){};
+    defer children_array.deinit(allocator);
 
-    try json.appendSlice(allocator, "{\"parent_id\":\"");
-    try json.appendSlice(allocator, &task_id);
-    try json.appendSlice(allocator, "\",\"children\":[");
-
-    for (children, 0..) |child, i| {
-        if (i > 0) try json.append(allocator, ',');
-
-        // Escape title
-        var escaped_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_title.deinit(allocator);
-        for (child.title) |c| {
-            switch (c) {
-                '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                else => try escaped_title.append(allocator, c),
-            }
-        }
-
-        try json.writer(allocator).print(
-            "{{\"id\":\"{s}\",\"title\":\"{s}\",\"status\":\"{s}\",\"priority\":{d},\"type\":\"{s}\"}}",
-            .{
-                &child.id,
-                escaped_title.items,
-                child.status.toString(),
-                child.priority.toInt(),
-                child.task_type.toString(),
-            },
-        );
+    for (children) |child| {
+        try children_array.append(allocator, .{
+            .id = &child.id,
+            .title = child.title,
+            .status = child.status.toString(),
+            .priority = child.priority.toInt(),
+            .type = child.task_type.toString(),
+        });
     }
 
-    try json.writer(allocator).print("],\"count\":{d}}}", .{children.len});
+    const response = Response{
+        .parent_id = &task_id,
+        .children = children_array.items,
+        .count = children.len,
+    };
 
-    const result = try allocator.dupe(u8, json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

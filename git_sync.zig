@@ -11,6 +11,7 @@ const TaskId = task_store_module.TaskId;
 const TaskStatus = task_store_module.TaskStatus;
 const Dependency = task_store_module.Dependency;
 const Comment = task_store_module.Comment;
+const html_utils = @import("html_utils");
 
 /// Session state summary for cold start
 pub const SessionState = struct {
@@ -141,15 +142,15 @@ pub const GitSync = struct {
         try writer.print("\"id\":\"{s}\"", .{&task.id});
 
         // title (escaped)
-        try writer.writeAll(",\"title\":\"");
-        try self.writeEscaped(buf, task.title);
-        try writer.writeByte('"');
+        const escaped_title = try html_utils.escapeJSON(self.allocator, task.title);
+        defer self.allocator.free(escaped_title);
+        try writer.print(",\"title\":\"{s}\"", .{escaped_title});
 
         // description (optional)
         if (task.description) |desc| {
-            try writer.writeAll(",\"description\":\"");
-            try self.writeEscaped(buf, desc);
-            try writer.writeByte('"');
+            const escaped_desc = try html_utils.escapeJSON(self.allocator, desc);
+            defer self.allocator.free(escaped_desc);
+            try writer.print(",\"description\":\"{s}\"", .{escaped_desc});
         }
 
         // status
@@ -165,9 +166,9 @@ pub const GitSync = struct {
         try writer.writeAll(",\"labels\":[");
         for (task.labels, 0..) |label, i| {
             if (i > 0) try writer.writeByte(',');
-            try writer.writeByte('"');
-            try self.writeEscaped(buf, label);
-            try writer.writeByte('"');
+            const escaped_label = try html_utils.escapeJSON(self.allocator, label);
+            defer self.allocator.free(escaped_label);
+            try writer.print("\"{s}\"", .{escaped_label});
         }
         try writer.writeByte(']');
 
@@ -187,35 +188,19 @@ pub const GitSync = struct {
         try writer.writeAll(",\"comments\":[");
         for (task.comments, 0..) |comment, i| {
             if (i > 0) try writer.writeByte(',');
-            try writer.writeAll("{\"agent\":\"");
-            try self.writeEscaped(buf, comment.agent);
-            try writer.writeAll("\",\"content\":\"");
-            try self.writeEscaped(buf, comment.content);
-            try writer.print("\",\"timestamp\":{d}}}", .{comment.timestamp});
+            const escaped_agent = try html_utils.escapeJSON(self.allocator, comment.agent);
+            defer self.allocator.free(escaped_agent);
+            const escaped_content = try html_utils.escapeJSON(self.allocator, comment.content);
+            defer self.allocator.free(escaped_content);
+            try writer.print("{{\"agent\":\"{s}\",\"content\":\"{s}\",\"timestamp\":{d}}}", .{
+                escaped_agent,
+                escaped_content,
+                comment.timestamp,
+            });
         }
         try writer.writeByte(']');
 
         try writer.writeByte('}');
-    }
-
-    /// Write JSON-escaped string to buffer
-    fn writeEscaped(self: *Self, buf: *std.ArrayListUnmanaged(u8), str: []const u8) !void {
-        for (str) |c| {
-            switch (c) {
-                '"' => try buf.appendSlice(self.allocator, "\\\""),
-                '\\' => try buf.appendSlice(self.allocator, "\\\\"),
-                '\n' => try buf.appendSlice(self.allocator, "\\n"),
-                '\r' => try buf.appendSlice(self.allocator, "\\r"),
-                '\t' => try buf.appendSlice(self.allocator, "\\t"),
-                else => {
-                    if (c < 0x20) {
-                        try buf.writer(self.allocator).print("\\u{x:0>4}", .{c});
-                    } else {
-                        try buf.append(self.allocator, c);
-                    }
-                },
-            }
-        }
     }
 
     /// Import tasks from JSONL files

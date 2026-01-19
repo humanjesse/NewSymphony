@@ -15,6 +15,22 @@ const TaskStatus = task_store.TaskStatus;
 const TaskPriority = task_store.TaskPriority;
 const TaskType = task_store.TaskType;
 
+// Response structs for JSON serialization
+const TaskInfo = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+    priority: []const u8,
+    type: []const u8,
+};
+
+const Response = struct {
+    updated: bool,
+    task: TaskInfo,
+    changes: []const []const u8,
+    unblocked_count: ?usize = null,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -236,24 +252,6 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         return ToolResult.err(allocator, .internal_error, "Task disappeared after update", start_time);
     };
 
-    // Build JSON response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
-    // Escape title
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (updated_task.title) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            '\r' => try escaped_title.appendSlice(allocator, "\\r"),
-            '\t' => try escaped_title.appendSlice(allocator, "\\t"),
-            else => try escaped_title.append(allocator, c),
-        }
-    }
-
     const prio_str = switch (updated_task.priority) {
         .critical => "critical",
         .high => "high",
@@ -262,34 +260,20 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         .wishlist => "wishlist",
     };
 
-    try result_json.appendSlice(allocator, "{\"updated\": true, \"task\": {");
-    try result_json.writer(allocator).print(
-        "\"id\": \"{s}\", \"title\": \"{s}\", \"status\": \"{s}\", \"priority\": \"{s}\", \"type\": \"{s}\"",
-        .{
-            &updated_task.id,
-            escaped_title.items,
-            updated_task.status.toString(),
-            prio_str,
-            updated_task.task_type.toString(),
+    const response = Response{
+        .updated = true,
+        .task = .{
+            .id = &updated_task.id,
+            .title = updated_task.title,
+            .status = updated_task.status.toString(),
+            .priority = prio_str,
+            .type = updated_task.task_type.toString(),
         },
-    );
-    try result_json.appendSlice(allocator, "}, \"changes\": [");
+        .changes = changes.items,
+        .unblocked_count = if (unblocked_count > 0) unblocked_count else null,
+    };
 
-    for (changes.items, 0..) |change, i| {
-        if (i > 0) try result_json.append(allocator, ',');
-        try result_json.writer(allocator).print("\"{s}\"", .{change});
-    }
-
-    try result_json.appendSlice(allocator, "]");
-
-    // Include unblocked count if status was changed to completed
-    if (unblocked_count > 0) {
-        try result_json.writer(allocator).print(", \"unblocked_count\": {d}", .{unblocked_count});
-    }
-
-    try result_json.appendSlice(allocator, "}");
-
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

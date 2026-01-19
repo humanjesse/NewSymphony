@@ -102,19 +102,11 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     };
     defer allocator.free(content);
 
-    // Split content into lines
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
-    var lines = std.ArrayListUnmanaged([]const u8){};
-    defer lines.deinit(allocator);
+    // Handle empty file - check content directly since splitScalar returns 1 element for ""
+    if (content.len == 0) {
+        // Still mark file as read so agent can edit it
+        try context.state.markFileAsRead(parsed.value.path);
 
-    while (line_iter.next()) |line| {
-        try lines.append(allocator, line);
-    }
-
-    const total_lines = lines.items.len;
-
-    // Handle empty file
-    if (total_lines == 0) {
         const msg = try std.fmt.allocPrint(
             allocator,
             "File: {s}\nFile is empty (0 lines)",
@@ -124,16 +116,38 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         return ToolResult.ok(allocator, msg, start_time, null);
     }
 
-    // Validate line range is within file bounds
-    if (parsed.value.end_line > total_lines) {
+    // Split content into lines
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var lines = std.ArrayListUnmanaged([]const u8){};
+    defer lines.deinit(allocator);
+
+    while (line_iter.next()) |line| {
+        try lines.append(allocator, line);
+    }
+
+    // Handle trailing newline - splitScalar creates empty element after final '\n'
+    // Most text files end with '\n', so "hello\n" should be 1 line, not 2
+    if (content.len > 0 and content[content.len - 1] == '\n') {
+        if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
+            _ = lines.pop();
+        }
+    }
+
+    const total_lines = lines.items.len;
+
+    // Validate start_line is within bounds
+    if (parsed.value.start_line > total_lines) {
         const msg = try std.fmt.allocPrint(
             allocator,
-            "Line {d} out of range (file has {d} line{s})",
-            .{ parsed.value.end_line, total_lines, if (total_lines == 1) "" else "s" },
+            "start_line {d} out of range (file has {d} line{s})",
+            .{ parsed.value.start_line, total_lines, if (total_lines == 1) "" else "s" },
         );
         defer allocator.free(msg);
         return ToolResult.err(allocator, .validation_failed, msg, start_time);
     }
+
+    // Clamp end_line to file bounds (be lenient if agent requests beyond file)
+    const actual_end_line = @min(parsed.value.end_line, total_lines);
 
     // Format output with line numbers
     var formatted_output = std.ArrayListUnmanaged(u8){};
@@ -143,14 +157,14 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     // Wrap in code fence for proper formatting
     try writer.writeAll("```\n");
 
-    // Write header
+    // Write header (show actual range returned, which may be clamped)
     try writer.print("File: {s}\n", .{parsed.value.path});
-    try writer.print("Lines: {d}-{d} of {d} total\n\n", .{ parsed.value.start_line, parsed.value.end_line, total_lines });
+    try writer.print("Lines: {d}-{d} of {d} total\n\n", .{ parsed.value.start_line, actual_end_line, total_lines });
 
     // Write numbered lines for requested range
     // Lines are 1-indexed, so convert to 0-indexed for array access
     const start_idx = parsed.value.start_line - 1;
-    const end_idx = parsed.value.end_line - 1;
+    const end_idx = actual_end_line - 1;
 
     for (lines.items[start_idx .. end_idx + 1], start_idx..) |line, idx| {
         try writer.print("{d}: {s}\n", .{ idx + 1, line });
@@ -158,7 +172,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
 
     // Write footer with remaining lines info
     const lines_before = parsed.value.start_line - 1;
-    const lines_after = total_lines - parsed.value.end_line;
+    const lines_after = total_lines - actual_end_line;
 
     if (lines_before > 0 or lines_after > 0) {
         try writer.writeAll("\n");
@@ -167,13 +181,13 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
                 lines_before,
                 parsed.value.start_line - 1,
                 lines_after,
-                parsed.value.end_line + 1,
+                actual_end_line + 1,
                 total_lines,
             });
         } else if (lines_before > 0) {
             try writer.print("--- {d} lines before (1-{d}) ---\n", .{ lines_before, parsed.value.start_line - 1 });
         } else {
-            try writer.print("--- {d} lines remaining ({d}-{d}) ---\n", .{ lines_after, parsed.value.end_line + 1, total_lines });
+            try writer.print("--- {d} lines remaining ({d}-{d}) ---\n", .{ lines_after, actual_end_line + 1, total_lines });
         }
     }
 

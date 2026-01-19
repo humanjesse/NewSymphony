@@ -12,6 +12,42 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const CurrentTask = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+    priority: u8,
+};
+
+const ReadyTask = struct {
+    id: []const u8,
+    title: []const u8,
+    priority: u8,
+};
+
+const CompletedTask = struct {
+    id: []const u8,
+    title: []const u8,
+    completed_at: i64,
+};
+
+const Counts = struct {
+    pending: usize,
+    in_progress: usize,
+    completed: usize,
+    blocked: usize,
+};
+
+const Response = struct {
+    session_id: ?[]const u8 = null,
+    current_task: ?CurrentTask = null,
+    ready_tasks: []const ReadyTask,
+    recently_completed: []const CompletedTask,
+    counts: Counts,
+    notes: ?[]const u8 = null,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -64,136 +100,95 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         }
     }
 
-    // Build comprehensive context
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
-    try result_json.appendSlice(allocator, "{");
-
-    // Session info
-    if (store.session_id) |sid| {
-        try result_json.writer(allocator).print("\"session_id\": \"{s}\", ", .{sid});
-    }
-
-    // Current task
-    try result_json.appendSlice(allocator, "\"current_task\": ");
+    // Build current task info
+    var current_task: ?CurrentTask = null;
     if (store.getCurrentTaskId()) |cid| {
         if (store.tasks.get(cid)) |task| {
-            var escaped_title = std.ArrayListUnmanaged(u8){};
-            defer escaped_title.deinit(allocator);
-            for (task.title) |c| {
-                switch (c) {
-                    '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                    '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                    '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                    else => try escaped_title.append(allocator, c),
-                }
-            }
-            try result_json.writer(allocator).print(
-                "{{\"id\": \"{s}\", \"title\": \"{s}\", \"status\": \"{s}\", \"priority\": {d}}}",
-                .{ &task.id, escaped_title.items, task.status.toString(), task.priority.toInt() },
-            );
-        } else {
-            try result_json.appendSlice(allocator, "null");
+            current_task = .{
+                .id = &task.id,
+                .title = task.title,
+                .status = task.status.toString(),
+                .priority = task.priority.toInt(),
+            };
         }
-    } else {
-        try result_json.appendSlice(allocator, "null");
     }
 
-    // Ready queue
-    try result_json.appendSlice(allocator, ", \"ready_tasks\": [");
+    // Build ready tasks array
     const ready = store.getReadyTasks() catch &[_]task_store.Task{};
     defer allocator.free(ready);
 
-    for (ready, 0..) |task, i| {
-        if (i > 0) try result_json.append(allocator, ',');
-        var escaped_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_title.deinit(allocator);
-        for (task.title) |c| {
-            switch (c) {
-                '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                else => try escaped_title.append(allocator, c),
-            }
-        }
-        try result_json.writer(allocator).print(
-            "{{\"id\": \"{s}\", \"title\": \"{s}\", \"priority\": {d}}}",
-            .{ &task.id, escaped_title.items, task.priority.toInt() },
-        );
-    }
-    try result_json.appendSlice(allocator, "]");
+    var ready_tasks = std.ArrayListUnmanaged(ReadyTask){};
+    defer ready_tasks.deinit(allocator);
 
-    // Recently completed
-    try result_json.appendSlice(allocator, ", \"recently_completed\": [");
-    var completed_tasks = std.ArrayListUnmanaged(task_store.Task){};
-    defer completed_tasks.deinit(allocator);
+    for (ready) |task| {
+        try ready_tasks.append(allocator, .{
+            .id = &task.id,
+            .title = task.title,
+            .priority = task.priority.toInt(),
+        });
+    }
+
+    // Build recently completed array
+    var completed_tasks_raw = std.ArrayListUnmanaged(task_store.Task){};
+    defer completed_tasks_raw.deinit(allocator);
 
     var iter = store.tasks.valueIterator();
     while (iter.next()) |task| {
         if (task.status == .completed and task.completed_at != null) {
-            try completed_tasks.append(allocator, task.*);
+            try completed_tasks_raw.append(allocator, task.*);
         }
     }
 
     // Sort by completion time (most recent first)
-    std.mem.sort(task_store.Task, completed_tasks.items, {}, struct {
+    std.mem.sort(task_store.Task, completed_tasks_raw.items, {}, struct {
         fn cmp(_: void, a: task_store.Task, b: task_store.Task) bool {
             return (a.completed_at orelse 0) > (b.completed_at orelse 0);
         }
     }.cmp);
 
-    const show_count = @min(depth, completed_tasks.items.len);
-    for (completed_tasks.items[0..show_count], 0..) |task, i| {
-        if (i > 0) try result_json.append(allocator, ',');
-        var escaped_title = std.ArrayListUnmanaged(u8){};
-        defer escaped_title.deinit(allocator);
-        for (task.title) |c| {
-            switch (c) {
-                '"' => try escaped_title.appendSlice(allocator, "\\\""),
-                '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-                else => try escaped_title.append(allocator, c),
-            }
-        }
-        try result_json.writer(allocator).print(
-            "{{\"id\": \"{s}\", \"title\": \"{s}\", \"completed_at\": {d}}}",
-            .{ &task.id, escaped_title.items, task.completed_at orelse 0 },
-        );
+    var recently_completed = std.ArrayListUnmanaged(CompletedTask){};
+    defer recently_completed.deinit(allocator);
+
+    const show_count = @min(depth, completed_tasks_raw.items.len);
+    for (completed_tasks_raw.items[0..show_count]) |task| {
+        try recently_completed.append(allocator, .{
+            .id = &task.id,
+            .title = task.title,
+            .completed_at = task.completed_at orelse 0,
+        });
     }
-    try result_json.appendSlice(allocator, "]");
 
     // Counts
     const counts = store.getTaskCounts();
-    try result_json.writer(allocator).print(
-        ", \"counts\": {{\"pending\": {d}, \"in_progress\": {d}, \"completed\": {d}, \"blocked\": {d}}}",
-        .{ counts.pending, counts.in_progress, counts.completed, counts.blocked },
-    );
 
     // Session notes from git_sync if available
+    var session_notes: ?[]const u8 = null;
     if (context.git_sync) |gs| {
         if (try gs.parseSessionState()) |parsed_state| {
             var mutable_state = parsed_state;
             defer mutable_state.deinit(allocator);
             if (mutable_state.notes) |notes| {
-                var escaped_notes = std.ArrayListUnmanaged(u8){};
-                defer escaped_notes.deinit(allocator);
-                for (notes) |c| {
-                    switch (c) {
-                        '"' => try escaped_notes.appendSlice(allocator, "\\\""),
-                        '\\' => try escaped_notes.appendSlice(allocator, "\\\\"),
-                        '\n' => try escaped_notes.appendSlice(allocator, "\\n"),
-                        else => try escaped_notes.append(allocator, c),
-                    }
-                }
-                try result_json.writer(allocator).print(", \"notes\": \"{s}\"", .{escaped_notes.items});
+                session_notes = try allocator.dupe(u8, notes);
             }
         }
     }
+    defer if (session_notes) |n| allocator.free(n);
 
-    try result_json.appendSlice(allocator, "}");
+    const response = Response{
+        .session_id = store.session_id,
+        .current_task = current_task,
+        .ready_tasks = ready_tasks.items,
+        .recently_completed = recently_completed.items,
+        .counts = .{
+            .pending = counts.pending,
+            .in_progress = counts.in_progress,
+            .completed = counts.completed,
+            .blocked = counts.blocked,
+        },
+        .notes = session_notes,
+    };
 
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

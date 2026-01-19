@@ -3,10 +3,8 @@ const std = @import("std");
 const ollama = @import("ollama");
 const permission = @import("permission");
 const context_module = @import("context");
-const html_utils = @import("html_utils");
 
 // Import all tool modules
-const file_tree = @import("tools/file_tree.zig");
 const ls = @import("tools/ls.zig");
 const read_lines = @import("tools/read_lines.zig");
 const write_file = @import("tools/write_file.zig");
@@ -35,6 +33,11 @@ const list_task_comments = @import("tools/list_task_comments.zig");
 const add_subtask = @import("tools/add_subtask.zig");
 const get_session_context = @import("tools/get_session_context.zig");
 const land_the_plane = @import("tools/land_the_plane.zig");
+// Session coordinator tools (main agent startup/shutdown)
+const check_environment = @import("tools/check_environment.zig");
+const init_environment = @import("tools/init_environment.zig");
+const get_session_status = @import("tools/get_session_status.zig");
+const end_session = @import("tools/end_session.zig");
 // Task hierarchy and graph tools (zvdb-integrated)
 const get_children = @import("tools/get_children.zig");
 const get_siblings = @import("tools/get_siblings.zig");
@@ -124,34 +127,32 @@ pub const ToolResult = struct {
 
     // Serialize to JSON for model
     pub fn toJSON(self: *const ToolResult, allocator: std.mem.Allocator) ![]const u8 {
-        var json = std.ArrayListUnmanaged(u8){};
-        defer json.deinit(allocator);
-        const writer = json.writer(allocator);
+        // Struct for JSON serialization
+        const JsonOutput = struct {
+            success: bool,
+            data: ?[]const u8,
+            error_message: ?[]const u8,
+            error_type: []const u8,
+            metadata: struct {
+                execution_time_ms: i64,
+                data_size_bytes: usize,
+                timestamp: i64,
+            },
+        };
 
-        try writer.writeAll("{");
-        try writer.print("\"success\":{s},", .{if (self.success) "true" else "false"});
+        const output = JsonOutput{
+            .success = self.success,
+            .data = self.data,
+            .error_message = self.error_message,
+            .error_type = @tagName(self.error_type),
+            .metadata = .{
+                .execution_time_ms = self.metadata.execution_time_ms,
+                .data_size_bytes = self.metadata.data_size_bytes,
+                .timestamp = self.metadata.timestamp,
+            },
+        };
 
-        if (self.data) |d| {
-            const escaped_data = try html_utils.escapeJSON(allocator, d);
-            defer allocator.free(escaped_data);
-            try writer.print("\"data\":\"{s}\",", .{escaped_data});
-        } else {
-            try writer.writeAll("\"data\":null,");
-        }
-
-        if (self.error_message) |e| {
-            const escaped_err = try html_utils.escapeJSON(allocator, e);
-            defer allocator.free(escaped_err);
-            try writer.print("\"error_message\":\"{s}\",", .{escaped_err});
-        } else {
-            try writer.writeAll("\"error_message\":null,");
-        }
-
-        try writer.print("\"error_type\":\"{s}\",", .{@tagName(self.error_type)});
-        try writer.print("\"metadata\":{{\"execution_time_ms\":{d},\"data_size_bytes\":{d},\"timestamp\":{d}}}", .{ self.metadata.execution_time_ms, self.metadata.data_size_bytes, self.metadata.timestamp });
-        try writer.writeAll("}");
-
-        return try json.toOwnedSlice(allocator);
+        return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(output, .{})});
     }
 
     // Format for user display (full transparency)
@@ -218,7 +219,6 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     errdefer tools.deinit(allocator);
 
     // File system tools
-    try tools.append(allocator, try file_tree.getDefinition(allocator));
     try tools.append(allocator, try ls.getDefinition(allocator));
     try tools.append(allocator, try read_lines.getDefinition(allocator));
     try tools.append(allocator, try write_file.getDefinition(allocator));
@@ -266,6 +266,12 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try add_subtask.getDefinition(allocator));
     try tools.append(allocator, try get_session_context.getDefinition(allocator));
     try tools.append(allocator, try land_the_plane.getDefinition(allocator));
+
+    // Session coordinator tools (main agent startup/shutdown)
+    try tools.append(allocator, try check_environment.getDefinition(allocator));
+    try tools.append(allocator, try init_environment.getDefinition(allocator));
+    try tools.append(allocator, try get_session_status.getDefinition(allocator));
+    try tools.append(allocator, try end_session.getDefinition(allocator));
 
     // Task hierarchy and graph tools (zvdb-integrated)
     try tools.append(allocator, try get_children.getDefinition(allocator));

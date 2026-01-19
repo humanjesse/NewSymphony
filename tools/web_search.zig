@@ -142,39 +142,8 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         allocator.free(results);
     }
 
-    // Format results as JSON
-    var output = std.ArrayListUnmanaged(u8){};
-    defer output.deinit(allocator);
-    const writer = output.writer(allocator);
-
-    // Reusable buffer for escaping to avoid allocations in loop
-    var escaped_buffer = std.ArrayListUnmanaged(u8){};
-    defer escaped_buffer.deinit(allocator);
-
-    try writer.writeAll("[\n");
-    for (results, 0..) |result, i| {
-        // Escape title into buffer
-        escaped_buffer.clearRetainingCapacity();
-        try escapeJSONIntoBuffer(&escaped_buffer, allocator, result.title);
-        const escaped_title = escaped_buffer.items;
-
-        // Escape URL into buffer (save title first)
-        const title_copy = try allocator.dupe(u8, escaped_title);
-        defer allocator.free(title_copy);
-        escaped_buffer.clearRetainingCapacity();
-        try escapeJSONIntoBuffer(&escaped_buffer, allocator, result.url);
-        const escaped_url = escaped_buffer.items;
-
-        try writer.print("  {{\n    \"title\": \"{s}\",\n    \"url\": \"{s}\"\n  }}", .{
-            title_copy,
-            escaped_url,
-        });
-        if (i < results.len - 1) try writer.writeAll(",");
-        try writer.writeAll("\n");
-    }
-    try writer.writeAll("]");
-
-    const result_str = try output.toOwnedSlice(allocator);
+    // Format results as JSON using std.json.fmt for proper escaping
+    const result_str = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(results, .{})});
     defer allocator.free(result_str);
 
     if (std.posix.getenv("DEBUG_WEB_TOOLS")) |_| {
@@ -398,15 +367,3 @@ fn parseGoogleAPIResponse(allocator: std.mem.Allocator, json_body: []const u8) !
     return results;
 }
 
-fn escapeJSONIntoBuffer(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text) |c| {
-        switch (c) {
-            '"' => try buffer.appendSlice(allocator, "\\\""),
-            '\\' => try buffer.appendSlice(allocator, "\\\\"),
-            '\n' => try buffer.appendSlice(allocator, "\\n"),
-            '\r' => try buffer.appendSlice(allocator, "\\r"),
-            '\t' => try buffer.appendSlice(allocator, "\\t"),
-            else => try buffer.append(allocator, c),
-        }
-    }
-}

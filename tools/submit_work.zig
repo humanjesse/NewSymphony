@@ -7,7 +7,6 @@ const ollama = @import("ollama");
 const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
-const html_utils = @import("html_utils");
 const task_store_module = @import("task_store");
 const git_utils = @import("git_utils");
 
@@ -222,42 +221,32 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         ptr.* = true;
     }
 
-    // Build success response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
+    // Response struct for JSON serialization
+    const Response = struct {
+        success: bool,
+        message: []const u8,
+        commit_hash: ?[]const u8 = null,
+        files_committed: usize,
+        summary: []const u8,
+        commit_output: ?[]const u8 = null,
+    };
 
-    try result_json.appendSlice(allocator, "{\"success\": true, \"message\": \"Work submitted for review.\"");
+    // Truncate commit output if needed
+    const commit_output: ?[]const u8 = if (commit_result.stdout.len > 0)
+        commit_result.stdout[0..@min(commit_result.stdout.len, 500)]
+    else
+        null;
 
-    // Include commit hash
-    if (commit_hash) |hash| {
-        try result_json.appendSlice(allocator, ", \"commit_hash\": \"");
-        try result_json.appendSlice(allocator, hash);
-        try result_json.appendSlice(allocator, "\"");
-    }
+    const response = Response{
+        .success = true,
+        .message = "Work submitted for review.",
+        .commit_hash = commit_hash,
+        .files_committed = staged_files.items.len,
+        .summary = summary,
+        .commit_output = commit_output,
+    };
 
-    // Include file count
-    try result_json.writer(allocator).print(", \"files_committed\": {d}", .{staged_files.items.len});
-
-    // Include summary
-    const escaped_summary = try html_utils.escapeJSON(allocator, summary);
-    defer allocator.free(escaped_summary);
-    try result_json.appendSlice(allocator, ", \"summary\": \"");
-    try result_json.appendSlice(allocator, escaped_summary);
-    try result_json.appendSlice(allocator, "\"");
-
-    // Include commit output snippet
-    if (commit_result.stdout.len > 0) {
-        const preview_len = @min(commit_result.stdout.len, 500);
-        const escaped_output = try html_utils.escapeJSON(allocator, commit_result.stdout[0..preview_len]);
-        defer allocator.free(escaped_output);
-        try result_json.appendSlice(allocator, ", \"commit_output\": \"");
-        try result_json.appendSlice(allocator, escaped_output);
-        try result_json.appendSlice(allocator, "\"");
-    }
-
-    try result_json.appendSlice(allocator, "}");
-
-    const json_result = try allocator.dupe(u8, result_json.items);
+    const json_result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(json_result);
 
     return ToolResult.ok(allocator, json_result, start_time, null);

@@ -12,6 +12,18 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response struct for JSON serialization
+const Response = struct {
+    landed: bool,
+    summary: ?[]const u8 = null,
+    tasks_saved: usize,
+    completed: usize,
+    pending: usize,
+    blocked: usize,
+    warning: ?[]const u8 = null,
+    git_warning: ?[]const u8 = null,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -127,68 +139,20 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     };
 
     // Build response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
     const counts = store.getTaskCounts();
 
-    try result_json.appendSlice(allocator, "{\"landed\": true");
+    const response = Response{
+        .landed = true,
+        .summary = summary,
+        .tasks_saved = store.tasks.count(),
+        .completed = counts.completed,
+        .pending = counts.pending,
+        .blocked = counts.blocked,
+        .warning = code_warning,
+        .git_warning = git_warning,
+    };
 
-    if (summary) |s| {
-        var escaped = std.ArrayListUnmanaged(u8){};
-        defer escaped.deinit(allocator);
-        for (s) |c| {
-            switch (c) {
-                '"' => try escaped.appendSlice(allocator, "\\\""),
-                '\\' => try escaped.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped.appendSlice(allocator, "\\n"),
-                else => try escaped.append(allocator, c),
-            }
-        }
-        try result_json.writer(allocator).print(", \"summary\": \"{s}\"", .{escaped.items});
-    }
-
-    try result_json.writer(allocator).print(
-        ", \"tasks_saved\": {d}, \"completed\": {d}, \"pending\": {d}, \"blocked\": {d}",
-        .{
-            store.tasks.count(),
-            counts.completed,
-            counts.pending,
-            counts.blocked,
-        },
-    );
-
-    if (code_warning) |warning| {
-        var escaped = std.ArrayListUnmanaged(u8){};
-        defer escaped.deinit(allocator);
-        for (warning) |c| {
-            switch (c) {
-                '"' => try escaped.appendSlice(allocator, "\\\""),
-                '\\' => try escaped.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped.appendSlice(allocator, "\\n"),
-                else => try escaped.append(allocator, c),
-            }
-        }
-        try result_json.writer(allocator).print(", \"warning\": \"{s}\"", .{escaped.items});
-    }
-
-    if (git_warning) |warning| {
-        var escaped = std.ArrayListUnmanaged(u8){};
-        defer escaped.deinit(allocator);
-        for (warning) |c| {
-            switch (c) {
-                '"' => try escaped.appendSlice(allocator, "\\\""),
-                '\\' => try escaped.appendSlice(allocator, "\\\\"),
-                '\n' => try escaped.appendSlice(allocator, "\\n"),
-                else => try escaped.append(allocator, c),
-            }
-        }
-        try result_json.writer(allocator).print(", \"git_warning\": \"{s}\"", .{escaped.items});
-    }
-
-    try result_json.appendSlice(allocator, "}");
-
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);

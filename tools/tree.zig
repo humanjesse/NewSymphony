@@ -325,41 +325,6 @@ pub fn generateTree(allocator: std.mem.Allocator, path: []const u8) ![]const u8 
 
     try collectFiles(allocator, &files, cwd, "", &gitignore, 0);
 
-    // Build JSON array
-    var output = try std.ArrayList(u8).initCapacity(allocator, 0);
-    errdefer output.deinit(allocator);
-
-    try output.append(allocator, '[');
-    for (files.items, 0..) |file, i| {
-        try output.append(allocator, '"');
-        // Properly escape all special characters for JSON
-        for (file) |c| {
-            switch (c) {
-                '"' => try output.appendSlice(allocator, "\\\""),
-                '\\' => try output.appendSlice(allocator, "\\\\"),
-                '\n' => try output.appendSlice(allocator, "\\n"),
-                '\r' => try output.appendSlice(allocator, "\\r"),
-                '\t' => try output.appendSlice(allocator, "\\t"),
-                0x08 => try output.appendSlice(allocator, "\\b"), // backspace
-                0x0C => try output.appendSlice(allocator, "\\f"), // form feed
-                else => {
-                    // Escape other control characters as \uXXXX
-                    if (c < 0x20) {
-                        var buf: [6]u8 = undefined;
-                        const escaped = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c});
-                        try output.appendSlice(allocator, escaped);
-                    } else {
-                        try output.append(allocator, c);
-                    }
-                },
-            }
-        }
-        try output.append(allocator, '"');
-        if (i < files.items.len - 1) {
-            try output.append(allocator, ',');
-        }
-    }
-    try output.append(allocator, ']');
-
-    return try output.toOwnedSlice(allocator);
+    // Build JSON array using std.json.fmt for proper escaping
+    return try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(files.items, .{})});
 }

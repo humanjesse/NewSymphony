@@ -91,8 +91,8 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
 
     const args = parsed.value;
 
-    // Apply defaults
-    const path = args.path orelse ".";
+    // Apply defaults - treat empty string as current directory
+    const path = if (args.path) |p| (if (p.len == 0) "." else p) else ".";
     const show_hidden = args.show_hidden orelse false;
     const sort_by = args.sort_by orelse "name";
     const reverse = args.reverse orelse false;

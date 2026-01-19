@@ -106,8 +106,7 @@ code here
 **Available tools:**
 
 #### File System
-- **get_file_tree**: List all files in project (recursive)
-- **ls**: List single directory with metadata (size, modified time, type) - supports sorting and filtering
+- **ls**: List directory with metadata (size, modified time, type) - supports sorting and filtering
 - **read_file**: Smart file reading with conversation-aware curator agent (small files: instant full content, larger files: intelligent curation with caching for 50-100x speedup on repeated reads)
 - **read_lines**: Read specific line ranges (fast, no indexing - use for quick checks)
 - **write_file**: Create or overwrite files with content
@@ -131,11 +130,9 @@ code here
 **Example conversations:**
 ```
 You: "What files are in this project?"
-AI: [Automatically calls get_file_tree]
-    This project contains:
-    - main.zig
-    - ui.zig
-    - ollama.zig
+AI: [Automatically calls ls]
+    Directory: .
+    Total: 15 entries (12 files, 3 directories)
     ...
 
 You: "What's in the tools directory?"
@@ -180,7 +177,7 @@ See [Tool Calling Documentation](../architecture/tool-calling.md) for details.
 You: "How does markdown rendering work?"
 
 [Iteration 1]
-AI: [Calls get_file_tree]
+AI: [Calls ls]
 
 [Iteration 2]
 AI: [Calls read_file("markdown.zig")]
@@ -242,7 +239,7 @@ AI: I'll break this down into tasks:
 **What it does:** Fine-grained control over AI's access to tools.
 
 **Risk levels:**
-- **Safe**: Auto-approved (get_file_tree, get_current_time, task tools)
+- **Safe**: Auto-approved (ls, get_current_time, task tools)
 - **Medium**: Requires approval (read_file)
 - **High**: Requires approval with warning (future: write_file, execute)
 
@@ -316,7 +313,7 @@ Risk: MEDIUM
 
 💭 Thinking...
 The user wants to know about file structure.
-I should use get_file_tree tool to list files,
+I should use ls tool to list files,
 then provide a categorized overview.
 [Expanded - shows reasoning]
 ```

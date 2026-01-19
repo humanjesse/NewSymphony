@@ -335,7 +335,7 @@ fn createAgentReadmeIfNeeded(allocator: std.mem.Allocator, agent_dir: []const u8
                 \\- `read_lines` - Read file contents (specific line ranges)
                 \\- `write_file` - Create or modify files
                 \\- `grep_search` - Search for patterns in files
-                \\- `file_tree` - Get directory structure
+                \\- `ls` - List directory contents
                 \\- `replace_lines` - Replace specific lines in a file
                 \\- `bash_command` - Execute shell commands (use with caution)
                 \\

@@ -11,6 +11,19 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Response structs for JSON serialization
+const BlockedTask = struct {
+    id: []const u8,
+    title: []const u8,
+};
+
+const Response = struct {
+    blocked: bool,
+    task: BlockedTask,
+    reason: []const u8,
+    current_task_cleared: bool,
+};
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
@@ -139,42 +152,17 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     }
 
     // Build response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
-
-    var escaped_title = std.ArrayListUnmanaged(u8){};
-    defer escaped_title.deinit(allocator);
-    for (task.title) |c| {
-        switch (c) {
-            '"' => try escaped_title.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_title.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_title.appendSlice(allocator, "\\n"),
-            else => try escaped_title.append(allocator, c),
-        }
-    }
-
-    var escaped_reason = std.ArrayListUnmanaged(u8){};
-    defer escaped_reason.deinit(allocator);
-    for (reason.?) |c| {
-        switch (c) {
-            '"' => try escaped_reason.appendSlice(allocator, "\\\""),
-            '\\' => try escaped_reason.appendSlice(allocator, "\\\\"),
-            '\n' => try escaped_reason.appendSlice(allocator, "\\n"),
-            else => try escaped_reason.append(allocator, c),
-        }
-    }
-
-    try result_json.writer(allocator).print(
-        "{{\"blocked\": true, \"task\": {{\"id\": \"{s}\", \"title\": \"{s}\"}}, \"reason\": \"{s}\", \"current_task_cleared\": {s}}}",
-        .{
-            &task_id,
-            escaped_title.items,
-            escaped_reason.items,
-            if (is_current_task) "true" else "false",
+    const response = Response{
+        .blocked = true,
+        .task = .{
+            .id = &task_id,
+            .title = task.title,
         },
-    );
+        .reason = reason.?,
+        .current_task_cleared = is_current_task,
+    };
 
-    const result = try allocator.dupe(u8, result_json.items);
+    const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(result);
 
     return ToolResult.ok(allocator, result, start_time, null);
