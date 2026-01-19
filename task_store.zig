@@ -141,6 +141,9 @@ pub const Task = struct {
     parent_id: ?TaskId, // For molecules (epics)
     blocked_by_count: usize, // Cached count of blocking dependencies
     comments: []Comment = &.{}, // Append-only audit trail (Beads philosophy)
+    // Commit tracking for Tinkerer/Judge workflow
+    started_at_commit: ?[]const u8 = null, // Captured when task is picked up (owned)
+    completed_at_commit: ?[]const u8 = null, // Captured when submit_work is called (owned)
 
     /// Free all owned memory
     pub fn deinit(self: *Task, allocator: Allocator) void {
@@ -160,6 +163,9 @@ pub const Task = struct {
         if (self.comments.len > 0) {
             allocator.free(self.comments);
         }
+        // Free commit tracking fields
+        if (self.started_at_commit) |c| allocator.free(c);
+        if (self.completed_at_commit) |c| allocator.free(c);
     }
 };
 
@@ -303,6 +309,32 @@ pub const TaskStore = struct {
                 task.updated_at = std.time.timestamp();
             }
         }
+    }
+
+    /// Set the started_at_commit for a task (commit tracking for Tinkerer workflow)
+    pub fn setTaskStartedCommit(self: *Self, task_id: TaskId, commit_hash: []const u8) !void {
+        const task = self.tasks.getPtr(task_id) orelse return error.TaskNotFound;
+
+        // Free old value if any
+        if (task.started_at_commit) |old| {
+            self.allocator.free(old);
+        }
+
+        task.started_at_commit = try self.allocator.dupe(u8, commit_hash);
+        task.updated_at = std.time.timestamp();
+    }
+
+    /// Set the completed_at_commit for a task (commit tracking for submit_work)
+    pub fn setTaskCompletedCommit(self: *Self, task_id: TaskId, commit_hash: []const u8) !void {
+        const task = self.tasks.getPtr(task_id) orelse return error.TaskNotFound;
+
+        // Free old value if any
+        if (task.completed_at_commit) |old| {
+            self.allocator.free(old);
+        }
+
+        task.completed_at_commit = try self.allocator.dupe(u8, commit_hash);
+        task.updated_at = std.time.timestamp();
     }
 
     /// Get the current task, auto-assigning from ready queue if none set

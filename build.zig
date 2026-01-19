@@ -43,6 +43,11 @@ pub fn build(b: *std.Build) void {
     });
     git_sync_module.addImport("task_store", task_store_module);
 
+    // Git utilities module (commit tracking for Tinkerer/Judge workflow)
+    const git_utils_module = b.createModule(.{
+        .root_source_file = b.path("git_utils.zig"),
+    });
+
     // Core lexer module (no dependencies)
     const lexer_module = b.createModule(.{
         .root_source_file = b.path("lexer.zig"),
@@ -168,6 +173,7 @@ pub fn build(b: *std.Build) void {
     tools_module.addImport("task_store", task_store_module);
     tools_module.addImport("task_db", task_db_module);
     tools_module.addImport("git_sync", git_sync_module);
+    tools_module.addImport("git_utils", git_utils_module);
     // Will add file_curator and types after they're created
 
     // Now that tools_module is created, add it to agents_module

@@ -14,7 +14,7 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
             .type = "function",
             .function = .{
                 .name = try allocator.dupe(u8, "git_diff"),
-                .description = try allocator.dupe(u8, "Shows changes in files. Can show unstaged changes (default) or staged changes. Optionally filter to a specific file path."),
+                .description = try allocator.dupe(u8, "Shows changes in files. Can show unstaged changes (default), staged changes, or changes between commits. Use from_commit/to_commit for reviewing task-specific changes."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
@@ -25,7 +25,15 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
                     \\    },
                     \\    "staged": {
                     \\      "type": "boolean",
-                    \\      "description": "If true, shows staged changes (git diff --cached). If false or omitted, shows unstaged changes."
+                    \\      "description": "If true, shows staged changes (git diff --cached). Ignored if from_commit is specified."
+                    \\    },
+                    \\    "from_commit": {
+                    \\      "type": "string",
+                    \\      "description": "Start commit for range diff (e.g., started_at_commit from task). Shows changes FROM this commit."
+                    \\    },
+                    \\    "to_commit": {
+                    \\      "type": "string",
+                    \\      "description": "End commit for range diff. Defaults to HEAD if from_commit is specified but to_commit is not."
                     \\    }
                     \\  },
                     \\  "required": []
@@ -52,6 +60,8 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     const Args = struct {
         file_path: ?[]const u8 = null,
         staged: ?bool = null,
+        from_commit: ?[]const u8 = null,
+        to_commit: ?[]const u8 = null,
     };
 
     const parsed = std.json.parseFromSlice(Args, allocator, arguments, .{
@@ -66,14 +76,24 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     const args = parsed.value;
 
     // Build git diff command
-    var argv = try std.ArrayList([]const u8).initCapacity(allocator, 5);
+    var argv = try std.ArrayList([]const u8).initCapacity(allocator, 7);
     defer argv.deinit(allocator);
+
+    // Track allocated range string for cleanup
+    var range_str: ?[]const u8 = null;
+    defer if (range_str) |r| allocator.free(r);
 
     try argv.append(allocator, "git");
     try argv.append(allocator, "diff");
 
-    // Add --cached flag if showing staged changes
-    if (args.staged orelse false) {
+    // Commit range diff takes priority over staged diff
+    if (args.from_commit) |from| {
+        // Build commit range: from..to (or from..HEAD if to not specified)
+        const to = args.to_commit orelse "HEAD";
+        range_str = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ from, to });
+        try argv.append(allocator, range_str.?);
+    } else if (args.staged orelse false) {
+        // Show staged changes only if not doing commit range diff
         try argv.append(allocator, "--cached");
     }
 

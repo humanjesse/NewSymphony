@@ -1,11 +1,13 @@
 // Get Current Task Tool - Returns the task you're currently working on
 // Auto-assigns from ready queue if no current task is set
+// Captures started_at_commit for commit tracking (Phase 2)
 const std = @import("std");
 const ollama = @import("ollama");
 const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
 const task_store = @import("task_store");
+const git_utils = @import("git_utils");
 
 const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
@@ -48,6 +50,23 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
     const current_task = store.getCurrentTask() catch {
         return ToolResult.err(allocator, .internal_error, "Failed to get current task", start_time);
     };
+
+    // Capture started_at_commit if task exists and doesn't have one yet (Phase 2 commit tracking)
+    if (current_task) |task| {
+        if (task.started_at_commit == null) {
+            // Get current HEAD commit hash
+            const head = git_utils.getCurrentHead(allocator, null) catch |err| blk: {
+                std.log.warn("Failed to get HEAD commit for task tracking: {}", .{err});
+                break :blk null;
+            };
+            if (head) |h| {
+                store.setTaskStartedCommit(task.id, h) catch |err| {
+                    std.log.warn("Failed to set started_at_commit: {}", .{err});
+                };
+                allocator.free(h);
+            }
+        }
+    }
 
     // Build JSON response
     var json = std.ArrayListUnmanaged(u8){};
@@ -136,6 +155,13 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
             );
         }
         try json.writer(allocator).print("]", .{});
+
+        // Add started_at_commit for Judge workflow (Phase 2 commit tracking)
+        if (task.started_at_commit) |commit| {
+            try json.writer(allocator).print(", \"started_at_commit\": \"{s}\"", .{commit});
+        } else {
+            try json.writer(allocator).print(", \"started_at_commit\": null", .{});
+        }
 
         // Get ready count for context
         const counts = store.getTaskCounts();

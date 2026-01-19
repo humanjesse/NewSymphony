@@ -587,6 +587,8 @@ pub const App = struct {
         // Clean up any pending agent tool events
         for (self.agent_tool_events.items) |event| {
             self.allocator.free(event.tool_name);
+            if (event.arguments) |a| self.allocator.free(a);
+            if (event.result) |r| self.allocator.free(r);
         }
         self.agent_tool_events.deinit(self.allocator);
 

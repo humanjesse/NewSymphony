@@ -44,6 +44,7 @@ const run_agent = @import("tools/run_agent.zig");
 const list_agents = @import("tools/list_agents.zig");
 const planning_done = @import("tools/planning_done.zig");
 const tinkering_done = @import("tools/tinkering_done.zig");
+const submit_work = @import("tools/submit_work.zig");
 const request_revision = @import("tools/request_revision.zig");
 const git_status = @import("tools/git_status.zig");
 const git_diff = @import("tools/git_diff.zig");
@@ -277,6 +278,7 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try list_agents.getDefinition(allocator));
     try tools.append(allocator, try planning_done.getDefinition(allocator));
     try tools.append(allocator, try tinkering_done.getDefinition(allocator));
+    try tools.append(allocator, try submit_work.getDefinition(allocator));
     try tools.append(allocator, try request_revision.getDefinition(allocator));
 
     // Web tools

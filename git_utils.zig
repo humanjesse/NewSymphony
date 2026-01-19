@@ -4,10 +4,11 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
-/// Get the current HEAD commit hash (full 40-char SHA)
+/// Get the current HEAD commit hash (short 7-char format)
+/// Using short hash prevents LLM from truncating long hashes with "..."
 /// Returns owned string that caller must free
 pub fn getCurrentHead(allocator: Allocator, repo_path: ?[]const u8) ![]const u8 {
-    var argv_buf: [5][]const u8 = undefined;
+    var argv_buf: [6][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "git";
@@ -21,6 +22,8 @@ pub fn getCurrentHead(allocator: Allocator, repo_path: ?[]const u8) ![]const u8 
     }
 
     argv_buf[argc] = "rev-parse";
+    argc += 1;
+    argv_buf[argc] = "--short";
     argc += 1;
     argv_buf[argc] = "HEAD";
     argc += 1;
@@ -39,9 +42,9 @@ pub fn getCurrentHead(allocator: Allocator, repo_path: ?[]const u8) ![]const u8 
         else => return error.GitCommandFailed,
     }
 
-    // Trim whitespace and validate length (40 hex chars for full SHA)
+    // Trim whitespace and validate length (7 hex chars for short SHA)
     const trimmed = mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len < 7) return error.InvalidCommitHash; // At least short hash
+    if (trimmed.len < 7) return error.InvalidCommitHash;
 
     return allocator.dupe(u8, trimmed);
 }
