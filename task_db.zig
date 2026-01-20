@@ -48,8 +48,14 @@ pub const TaskDB = struct {
         sqlite.close(self.db);
     }
 
-    /// Create database schema
+    /// Create database schema (calls base tables + migrations)
     fn createSchema(self: *Self) !void {
+        try self.createBaseTables();
+        try self.runMigrations();
+    }
+
+    /// Create base tables and indexes (safe to run always with IF NOT EXISTS)
+    fn createBaseTables(self: *Self) !void {
         // Tasks table
         try sqlite.exec(self.db,
             \\CREATE TABLE IF NOT EXISTS tasks (
@@ -124,15 +130,35 @@ pub const TaskDB = struct {
             \\    value TEXT NOT NULL
             \\)
         );
+    }
 
-        // Migration: Add blocked_reason column if it doesn't exist
-        // SQLite doesn't have IF NOT EXISTS for ALTER TABLE, so we catch the error
-        sqlite.exec(self.db, "ALTER TABLE tasks ADD COLUMN blocked_reason TEXT") catch {
-            // Column already exists, ignore error
-        };
+    /// Run version-gated migrations
+    fn runMigrations(self: *Self) !void {
+        // Get current schema version (default to 0 for new databases)
+        const version_str = try self.getMetadata("schema_version");
+        defer if (version_str) |v| self.allocator.free(v);
 
-        // Set schema version
-        try self.setMetadata("schema_version", "2");
+        const current_version: u32 = if (version_str) |v|
+            std.fmt.parseInt(u32, v, 10) catch 0
+        else
+            0;
+
+        // Migration v0 -> v1: Initial schema (handled by createBaseTables)
+        if (current_version < 1) {
+            try self.setMetadata("schema_version", "1");
+        }
+
+        // Migration v1 -> v2: Add blocked_reason column
+        if (current_version < 2) {
+            try sqlite.exec(self.db, "ALTER TABLE tasks ADD COLUMN blocked_reason TEXT");
+            try self.setMetadata("schema_version", "2");
+        }
+
+        // Future migrations go here:
+        // if (current_version < 3) {
+        //     try sqlite.exec(self.db, "ALTER TABLE ...");
+        //     try self.setMetadata("schema_version", "3");
+        // }
     }
 
     /// Save a task to the database (insert or update)
@@ -616,6 +642,26 @@ pub const TaskDB = struct {
         try sqlite.bindText(stmt, 2, value_z);
 
         _ = try sqlite.step(stmt);
+    }
+
+    /// Get a metadata value by key
+    fn getMetadata(self: *Self, key: []const u8) !?[]const u8 {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT value FROM task_db_metadata WHERE key = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        try sqlite.bindText(stmt, 1, key_z);
+
+        const rc = try sqlite.step(stmt);
+        if (rc == sqlite.SQLITE_ROW) {
+            if (sqlite.columnText(stmt, 0)) |text| {
+                return try self.allocator.dupe(u8, text);
+            }
+        }
+        return null;
     }
 
     /// Begin a transaction

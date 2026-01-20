@@ -1732,6 +1732,19 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
 
     const input_field_height = try calculateInputFieldHeight(self);
 
+    // Pre-calculate scroll_y BEFORE drawing to ensure new messages are visible immediately
+    const viewport_height = if (self.terminal_size.height > input_field_height + 1)
+        self.terminal_size.height - input_field_height - 1
+    else
+        1;
+
+    const total_content_height = try calculateContentHeight(self);
+    if (total_content_height > viewport_height) {
+        self.scroll_y = total_content_height - viewport_height;
+    } else {
+        self.scroll_y = 0;
+    }
+
     // Clear screen only on resize or first render
     if (clear_screen) {
         try writer.writeAll("\x1b[2J\x1b[H");
@@ -1780,17 +1793,7 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
         try drawMessage(self, writer, &pending_msg, self.messages.items.len, &absolute_y, input_field_height);
     }
 
-    // Auto-scroll to keep bottom visible (simple calculation)
-    const viewport_height = if (self.terminal_size.height > input_field_height + 1)
-        self.terminal_size.height - input_field_height - 1
-    else
-        1;
-
-    if (absolute_y > viewport_height) {
-        self.scroll_y = absolute_y - viewport_height;
-    } else {
-        self.scroll_y = 0;
-    }
+    // scroll_y was pre-calculated before drawing - no need to recalculate here
 
     // Ensure cursor_y is at a valid position
     if (self.valid_cursor_positions.items.len > 0) {

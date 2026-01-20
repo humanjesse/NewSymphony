@@ -154,7 +154,31 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         try staged_files.append(allocator, file_path);
     }
 
-    // Step 3: Create the commit
+    // Step 3: Check if anything was actually staged before committing
+    {
+        const diff_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "git", "diff", "--cached", "--name-only" },
+        }) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to check staged files: {}", .{err});
+            defer allocator.free(msg);
+            return ToolResult.err(allocator, .io_error, msg, start_time);
+        };
+        defer allocator.free(diff_result.stdout);
+        defer allocator.free(diff_result.stderr);
+
+        if (diff_result.stdout.len == 0) {
+            // Nothing staged - provide helpful error message
+            const msg = try allocator.dupe(u8,
+                "No changes to commit. The specified files either don't exist or have no modifications. " ++
+                "You must use write_file to CREATE or MODIFY files before calling submit_work. " ++
+                "If files already exist unchanged, modify them first.");
+            defer allocator.free(msg);
+            return ToolResult.err(allocator, .validation_failed, msg, start_time);
+        }
+    }
+
+    // Step 4: Create the commit
     const commit_result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "git", "commit", "-m", commit_message },
@@ -172,7 +196,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
                 const msg = if (commit_result.stderr.len > 0)
                     try std.fmt.allocPrint(allocator, "git commit failed: {s}", .{commit_result.stderr})
                 else
-                    try allocator.dupe(u8, "git commit failed (nothing staged or other issue)");
+                    try allocator.dupe(u8, "git commit failed unexpectedly");
                 defer allocator.free(msg);
                 return ToolResult.err(allocator, .io_error, msg, start_time);
             }
@@ -184,7 +208,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         },
     }
 
-    // Step 4: Get the new HEAD commit hash
+    // Step 5: Get the new HEAD commit hash
     var commit_hash: ?[]const u8 = null;
     {
         const head = git_utils.getCurrentHead(allocator, null) catch |err| blk: {
@@ -195,7 +219,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     }
     defer if (commit_hash) |h| allocator.free(h);
 
-    // Step 5: Update task with completed_at_commit and add SUMMARY comment
+    // Step 6: Update task with completed_at_commit and add SUMMARY comment
     if (context.task_store) |store| {
         if (store.getCurrentTaskId()) |task_id| {
             // Set completed_at_commit
@@ -216,7 +240,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         }
     }
 
-    // Step 6: Signal tinkering complete (triggers Judge)
+    // Step 7: Signal tinkering complete (triggers Judge)
     if (context.tinkering_complete_ptr) |ptr| {
         ptr.* = true;
     }

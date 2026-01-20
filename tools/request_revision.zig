@@ -6,7 +6,6 @@ const ollama = @import("ollama");
 const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
-const html_utils = @import("html_utils");
 const task_store_module = @import("task_store");
 
 const AppContext = context_module.AppContext;
@@ -107,16 +106,22 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     // Get rejection count from comments
     const rejection_count = task_store.countCommentsWithPrefix(task_id, agent_name, "REJECTED:");
 
-    // Build JSON response
-    var result_json = std.ArrayListUnmanaged(u8){};
-    defer result_json.deinit(allocator);
+    // Response struct for JSON serialization
+    const Response = struct {
+        revision_requested: bool,
+        task_id: []const u8,
+        rejection_count: usize,
+        message: []const u8,
+    };
 
-    try result_json.writer(allocator).print(
-        "{{\"revision_requested\": true, \"task_id\": \"{s}\", \"rejection_count\": {d}, \"message\": \"Revision requested. Tinkerer will receive your feedback.\"}}",
-        .{ task_id_str, rejection_count },
-    );
+    const response = Response{
+        .revision_requested = true,
+        .task_id = task_id_str,
+        .rejection_count = rejection_count,
+        .message = "Revision requested. Tinkerer will receive your feedback.",
+    };
 
-    const json_result = try allocator.dupe(u8, result_json.items);
+    const json_result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
     defer allocator.free(json_result);
 
     return ToolResult.ok(allocator, json_result, start_time, null);

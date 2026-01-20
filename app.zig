@@ -331,78 +331,78 @@ pub const App = struct {
         try app.persistMessage(app.messages.items.len - 1);
 
         // Initialize task memory system (Beads-style per-project)
-        // First, try to find git root for per-project storage
-        if (try findGitRoot(allocator)) |git_root| {
-            app.git_root = git_root;
+        // Use git root if in a repo, otherwise use current working directory
+        // This ensures .tasks/ is always created for task persistence
+        const project_root = if (try findGitRoot(allocator)) |git_root|
+            git_root
+        else blk: {
+            // Not in a git repo - use current working directory
+            var path_buf: [fs.max_path_bytes]u8 = undefined;
+            const cwd_path = try fs.cwd().realpath(".", &path_buf);
+            break :blk try allocator.dupe(u8, cwd_path);
+        };
+        app.git_root = project_root;
 
-            // Create task store
-            const task_store_ptr = try allocator.create(task_store_module.TaskStore);
-            task_store_ptr.* = task_store_module.TaskStore.init(allocator);
-            app.task_store = task_store_ptr;
+        // Create task store
+        const task_store_ptr = try allocator.create(task_store_module.TaskStore);
+        task_store_ptr.* = task_store_module.TaskStore.init(allocator);
+        app.task_store = task_store_ptr;
 
-            // Start a new session
-            try task_store_ptr.startSession();
+        // Start a new session
+        try task_store_ptr.startSession();
 
-            // Initialize GitSync for this project
-            const git_sync_ptr = try allocator.create(git_sync_module.GitSync);
-            git_sync_ptr.* = try git_sync_module.GitSync.init(allocator, git_root);
-            app.git_sync = git_sync_ptr;
+        // Initialize GitSync for this project
+        const git_sync_ptr = try allocator.create(git_sync_module.GitSync);
+        git_sync_ptr.* = try git_sync_module.GitSync.init(allocator, project_root);
+        app.git_sync = git_sync_ptr;
 
-            // Create per-project SQLite cache
-            const task_db_path = try std.fmt.allocPrint(allocator, "{s}/.tasks/tasks.db", .{git_root});
-            defer allocator.free(task_db_path);
+        // Create per-project SQLite cache
+        const task_db_path = try std.fmt.allocPrint(allocator, "{s}/.tasks/tasks.db", .{project_root});
+        defer allocator.free(task_db_path);
 
-            // Ensure .tasks directory exists
-            try git_sync_ptr.ensureTasksDir();
+        // Ensure .tasks directory exists
+        try git_sync_ptr.ensureTasksDir();
 
-            // Create task database
-            const task_db_ptr = try allocator.create(task_db_module.TaskDB);
-            task_db_ptr.* = try task_db_module.TaskDB.init(allocator, task_db_path);
-            app.task_db = task_db_ptr;
+        // Create task database
+        const task_db_ptr = try allocator.create(task_db_module.TaskDB);
+        task_db_ptr.* = try task_db_module.TaskDB.init(allocator, task_db_path);
+        app.task_db = task_db_ptr;
 
-            // Cold-start recovery: SQLite first (crash recovery), JSONL fallback (fresh clone)
-            var loaded_from_db = false;
-            if (task_db_ptr.loadIntoStore(task_store_ptr)) |count| {
+        // Cold-start recovery: SQLite first (crash recovery), JSONL fallback (fresh clone)
+        var loaded_from_db = false;
+        if (task_db_ptr.loadIntoStore(task_store_ptr)) |count| {
+            if (count > 0) {
+                loaded_from_db = true;
+                std.log.info("Recovered {d} tasks from local cache", .{count});
+            }
+        } else |_| {}
+
+        // Fall back to JSONL (fresh clone or empty SQLite)
+        if (!loaded_from_db) {
+            if (git_sync_ptr.importTasks(task_store_ptr)) |count| {
                 if (count > 0) {
-                    loaded_from_db = true;
-                    std.log.info("Recovered {d} tasks from local cache", .{count});
+                    std.log.info("Loaded {d} tasks from JSONL", .{count});
+                    // Populate SQLite for future crash recovery
+                    task_db_ptr.saveFromStore(task_store_ptr) catch |err| {
+                        std.log.warn("Failed to populate SQLite cache: {}", .{err});
+                    };
                 }
             } else |_| {}
+        }
 
-            // Fall back to JSONL (fresh clone or empty SQLite)
-            if (!loaded_from_db) {
-                if (git_sync_ptr.importTasks(task_store_ptr)) |count| {
-                    if (count > 0) {
-                        std.log.info("Loaded {d} tasks from JSONL", .{count});
-                        // Populate SQLite for future crash recovery
-                        task_db_ptr.saveFromStore(task_store_ptr) catch |err| {
-                            std.log.warn("Failed to populate SQLite cache: {}", .{err});
-                        };
-                    }
-                } else |_| {}
+        // Try to restore session state (current_task_id)
+        if (try git_sync_ptr.parseSessionState()) |state| {
+            defer {
+                var s = state;
+                s.deinit(allocator);
             }
 
-            // Try to restore session state (current_task_id)
-            if (try git_sync_ptr.parseSessionState()) |state| {
-                defer {
-                    var s = state;
-                    s.deinit(allocator);
-                }
-
-                // Restore current task if it exists in store
-                if (state.current_task_id) |cid| {
-                    if (task_store_ptr.tasks.contains(cid)) {
-                        task_store_ptr.current_task_id = cid;
-                    }
+            // Restore current task if it exists in store
+            if (state.current_task_id) |cid| {
+                if (task_store_ptr.tasks.contains(cid)) {
+                    task_store_ptr.current_task_id = cid;
                 }
             }
-        } else {
-            // Not in a git repo - task system unavailable
-            // Create minimal task store for in-memory use only
-            const task_store_ptr = try allocator.create(task_store_module.TaskStore);
-            task_store_ptr.* = task_store_module.TaskStore.init(allocator);
-            app.task_store = task_store_ptr;
-            // Note: git_sync and task_db remain null - Beads features disabled
         }
 
         return app;

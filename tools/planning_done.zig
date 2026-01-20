@@ -55,12 +55,14 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
             if (p.value == .object) {
                 if (p.value.object.get("summary")) |v| {
                     if (v == .string) {
-                        summary = v.string;
+                        // Dupe the string before parsed JSON is freed
+                        summary = try allocator.dupe(u8, v.string);
                     }
                 }
             }
         }
     }
+    defer if (summary) |s| allocator.free(s);
 
     // Set the flag to signal completion (directly on executor via pointer)
     if (context.planning_complete_ptr) |ptr| {

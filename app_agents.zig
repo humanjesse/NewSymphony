@@ -792,13 +792,14 @@ pub fn triggerTinkererRevision(app: *App, task_id: *const [8]u8, feedback: []con
 
 /// Handle questioner completion - either trigger tinkerer or planner for blocked tasks
 pub fn handleQuestionerComplete(app: *App) void {
-    // Check if there are blocked tasks - if so, trigger planner
-    if (hasBlockedTasks(app)) {
-        triggerPlannerKickback(app);
-    } else {
-        // No blocked tasks - trigger Tinkerer for next ready task
+    // Check for ready tasks FIRST - prioritize work over decomposition
+    if (hasReadyTasks(app)) {
         triggerTinkerer(app);
+    } else if (hasBlockedTasks(app)) {
+        // Only kick back to planner if there's NO ready work
+        triggerPlannerKickback(app);
     }
+    // else: no work to do, execution loop ends
 }
 
 /// Check if there are any tasks with blocked status
@@ -806,6 +807,14 @@ fn hasBlockedTasks(app: *App) bool {
     const task_store = app.app_context.task_store orelse return false;
     const counts = task_store.getTaskCounts();
     return counts.blocked > 0;
+}
+
+/// Check if there are any ready tasks (pending, no blockers, not molecules)
+fn hasReadyTasks(app: *App) bool {
+    const task_store = app.app_context.task_store orelse return false;
+    const ready = task_store.getReadyTasks() catch return false;
+    defer app.allocator.free(ready);
+    return ready.len > 0;
 }
 
 /// Trigger planner to decompose blocked tasks

@@ -803,10 +803,15 @@ pub const TaskStore = struct {
             }
         }
 
-        // Sort by priority (lower = higher priority)
+        // Sort by priority (lower = higher priority), then by creation time (FIFO)
         mem.sort(Task, result.items, {}, struct {
             fn lessThan(_: void, a: Task, b: Task) bool {
-                return a.priority.toInt() < b.priority.toInt();
+                // Primary: priority (lower number = higher priority)
+                if (a.priority.toInt() != b.priority.toInt()) {
+                    return a.priority.toInt() < b.priority.toInt();
+                }
+                // Secondary: creation time (earlier = first, FIFO within same priority)
+                return a.created_at < b.created_at;
             }
         }.lessThan);
 
