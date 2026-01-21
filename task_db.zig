@@ -16,6 +16,8 @@ const Comment = task_store.Comment;
 pub const TaskDB = struct {
     db: *sqlite.Db,
     allocator: Allocator,
+    transaction_depth: u32 = 0, // Track nested transaction depth for savepoint management
+    transaction_mutex: std.Thread.Mutex = .{}, // Protects transaction_depth and transaction operations
 
     const Self = @This();
 
@@ -154,11 +156,30 @@ pub const TaskDB = struct {
             try self.setMetadata("schema_version", "2");
         }
 
-        // Future migrations go here:
-        // if (current_version < 3) {
-        //     try sqlite.exec(self.db, "ALTER TABLE ...");
-        //     try self.setMetadata("schema_version", "3");
-        // }
+        // Migration v2 -> v3: Session state table and commit tracking
+        if (current_version < 3) {
+            // Add session_state table for cold-start recovery
+            try sqlite.exec(self.db,
+                \\CREATE TABLE IF NOT EXISTS session_state (
+                \\    id INTEGER PRIMARY KEY CHECK (id = 1),
+                \\    session_id TEXT NOT NULL,
+                \\    current_task_id TEXT,
+                \\    started_at INTEGER NOT NULL
+                \\)
+            );
+
+            // Add commit tracking columns (ignore error if already exist)
+            sqlite.exec(self.db, "ALTER TABLE tasks ADD COLUMN started_at_commit TEXT") catch {};
+            sqlite.exec(self.db, "ALTER TABLE tasks ADD COLUMN completed_at_commit TEXT") catch {};
+
+            // Optimize ready queue query
+            try sqlite.exec(self.db,
+                \\CREATE INDEX IF NOT EXISTS idx_tasks_ready
+                \\ON tasks(status, task_type, priority, created_at)
+            );
+
+            try self.setMetadata("schema_version", "3");
+        }
     }
 
     /// Save a task to the database (insert or update)
@@ -178,9 +199,6 @@ pub const TaskDB = struct {
         }
         try labels_json.append(self.allocator, ']');
 
-        const labels_str = try self.allocator.dupeZ(u8, labels_json.items);
-        defer self.allocator.free(labels_str);
-
         const stmt = try sqlite.prepare(self.db,
             \\INSERT OR REPLACE INTO tasks (
             \\    id, title, description, status, priority, task_type,
@@ -190,39 +208,29 @@ pub const TaskDB = struct {
         defer sqlite.finalize(stmt);
 
         // Bind task ID
-        const id_str = try self.allocator.dupeZ(u8, &task.id);
-        defer self.allocator.free(id_str);
-        try sqlite.bindText(stmt, 1, id_str);
+        try sqlite.bindText(stmt, 1, &task.id);
 
         // Bind title
-        const title_z = try self.allocator.dupeZ(u8, task.title);
-        defer self.allocator.free(title_z);
-        try sqlite.bindText(stmt, 2, title_z);
+        try sqlite.bindText(stmt, 2, task.title);
 
         // Bind description
         if (task.description) |desc| {
-            const desc_z = try self.allocator.dupeZ(u8, desc);
-            defer self.allocator.free(desc_z);
-            try sqlite.bindText(stmt, 3, desc_z);
+            try sqlite.bindText(stmt, 3, desc);
         } else {
             try sqlite.bindNull(stmt, 3);
         }
 
         // Bind status
-        const status_str = try self.allocator.dupeZ(u8, task.status.toString());
-        defer self.allocator.free(status_str);
-        try sqlite.bindText(stmt, 4, status_str);
+        try sqlite.bindText(stmt, 4, task.status.toString());
 
         // Bind priority
         try sqlite.bindInt64(stmt, 5, task.priority.toInt());
 
         // Bind task_type
-        const type_str = try self.allocator.dupeZ(u8, task.task_type.toString());
-        defer self.allocator.free(type_str);
-        try sqlite.bindText(stmt, 6, type_str);
+        try sqlite.bindText(stmt, 6, task.task_type.toString());
 
         // Bind labels JSON
-        try sqlite.bindText(stmt, 7, labels_str);
+        try sqlite.bindText(stmt, 7, labels_json.items);
 
         // Bind timestamps
         try sqlite.bindInt64(stmt, 8, task.created_at);
@@ -236,9 +244,7 @@ pub const TaskDB = struct {
 
         // Bind parent_id
         if (task.parent_id) |pid| {
-            const pid_str = try self.allocator.dupeZ(u8, &pid);
-            defer self.allocator.free(pid_str);
-            try sqlite.bindText(stmt, 11, pid_str);
+            try sqlite.bindText(stmt, 11, &pid);
         } else {
             try sqlite.bindNull(stmt, 11);
         }
@@ -249,32 +255,37 @@ pub const TaskDB = struct {
         try self.saveComments(&task.id, task.comments);
     }
 
-    /// Load a task from the database by ID
+    /// Load a task from the database by ID (uses self.allocator)
     pub fn loadTask(self: *Self, task_id: TaskId) !?Task {
+        return self.loadTaskWithAllocator(task_id, self.allocator);
+    }
+
+    /// Load a task from the database by ID with specified allocator
+    pub fn loadTaskWithAllocator(self: *Self, task_id: TaskId, alloc: Allocator) !?Task {
         const stmt = try sqlite.prepare(self.db,
             \\SELECT id, title, description, status, priority, task_type,
-            \\       labels, created_at, updated_at, completed_at, parent_id
+            \\       labels, created_at, updated_at, completed_at, parent_id,
+            \\       started_at_commit, completed_at_commit
             \\FROM tasks WHERE id = ?
         );
         defer sqlite.finalize(stmt);
 
-        const id_str = try self.allocator.dupeZ(u8, &task_id);
-        defer self.allocator.free(id_str);
-        try sqlite.bindText(stmt, 1, id_str);
+        try sqlite.bindText(stmt, 1, &task_id);
 
         const rc = try sqlite.step(stmt);
         if (rc != sqlite.SQLITE_ROW) {
             return null;
         }
 
-        return try self.taskFromRow(stmt);
+        return try self.taskFromRowWithAllocator(stmt, alloc);
     }
 
     /// Load all tasks from the database
     pub fn loadAllTasks(self: *Self) ![]Task {
         const stmt = try sqlite.prepare(self.db,
             \\SELECT id, title, description, status, priority, task_type,
-            \\       labels, created_at, updated_at, completed_at, parent_id, blocked_reason
+            \\       labels, created_at, updated_at, completed_at, parent_id,
+            \\       started_at_commit, completed_at_commit
             \\FROM tasks
         );
         defer sqlite.finalize(stmt);
@@ -296,8 +307,13 @@ pub const TaskDB = struct {
         return tasks.toOwnedSlice(self.allocator);
     }
 
-    /// Parse a task from a SQLite row
+    /// Parse a task from a SQLite row (uses self.allocator)
     fn taskFromRow(self: *Self, stmt: *sqlite.Stmt) !Task {
+        return self.taskFromRowWithAllocator(stmt, self.allocator);
+    }
+
+    /// Parse a task from a SQLite row with specified allocator
+    fn taskFromRowWithAllocator(self: *Self, stmt: *sqlite.Stmt, alloc: Allocator) !Task {
         // ID (column 0)
         var id: TaskId = undefined;
         if (sqlite.columnText(stmt, 0)) |id_text| {
@@ -312,14 +328,14 @@ pub const TaskDB = struct {
 
         // Title (column 1)
         const title = if (sqlite.columnText(stmt, 1)) |t|
-            try self.allocator.dupe(u8, t)
+            try alloc.dupe(u8, t)
         else
             return error.InvalidTaskData;
 
         // Description (column 2)
         const description = if (sqlite.columnType(stmt, 2) != sqlite.SQLITE_NULL)
             if (sqlite.columnText(stmt, 2)) |d|
-                try self.allocator.dupe(u8, d)
+                try alloc.dupe(u8, d)
             else
                 null
         else
@@ -353,8 +369,8 @@ pub const TaskDB = struct {
                         start = i + 1;
                     } else if (c == '"' and in_string) {
                         if (start) |s| {
-                            const label = try self.allocator.dupe(u8, labels_json[s..i]);
-                            try labels.append(self.allocator, label);
+                            const label = try alloc.dupe(u8, labels_json[s..i]);
+                            try labels.append(alloc, label);
                         }
                         in_string = false;
                         start = null;
@@ -383,8 +399,27 @@ pub const TaskDB = struct {
             }
         }
 
+        // Commit tracking (columns 11, 12) - Tinkerer/Judge workflow
+        const started_at_commit = if (sqlite.columnType(stmt, 11) != sqlite.SQLITE_NULL)
+            if (sqlite.columnText(stmt, 11)) |c|
+                try alloc.dupe(u8, c)
+            else
+                null
+        else
+            null;
+        errdefer if (started_at_commit) |c| alloc.free(c);
+
+        const completed_at_commit = if (sqlite.columnType(stmt, 12) != sqlite.SQLITE_NULL)
+            if (sqlite.columnText(stmt, 12)) |c|
+                try alloc.dupe(u8, c)
+            else
+                null
+        else
+            null;
+        errdefer if (completed_at_commit) |c| alloc.free(c);
+
         // Load comments from separate table (Beads audit trail)
-        const comments = try self.loadComments(&id);
+        const comments = try self.loadCommentsWithAllocator(&id, alloc);
 
         return Task{
             .id = id,
@@ -393,13 +428,15 @@ pub const TaskDB = struct {
             .status = status,
             .priority = priority,
             .task_type = task_type,
-            .labels = try labels.toOwnedSlice(self.allocator),
+            .labels = try labels.toOwnedSlice(alloc),
             .created_at = created_at,
             .updated_at = updated_at,
             .completed_at = completed_at,
             .parent_id = parent_id,
             .blocked_by_count = 0, // Will be recalculated when loading dependencies
             .comments = comments,
+            .started_at_commit = started_at_commit,
+            .completed_at_commit = completed_at_commit,
         };
     }
 
@@ -408,9 +445,7 @@ pub const TaskDB = struct {
         const stmt = try sqlite.prepare(self.db, "DELETE FROM tasks WHERE id = ?");
         defer sqlite.finalize(stmt);
 
-        const id_str = try self.allocator.dupeZ(u8, &task_id);
-        defer self.allocator.free(id_str);
-        try sqlite.bindText(stmt, 1, id_str);
+        try sqlite.bindText(stmt, 1, &task_id);
 
         _ = try sqlite.step(stmt);
     }
@@ -425,24 +460,14 @@ pub const TaskDB = struct {
         );
         defer sqlite.finalize(stmt);
 
-        const src_str = try self.allocator.dupeZ(u8, &dep.src_id);
-        defer self.allocator.free(src_str);
-        try sqlite.bindText(stmt, 1, src_str);
-
-        const dst_str = try self.allocator.dupeZ(u8, &dep.dst_id);
-        defer self.allocator.free(dst_str);
-        try sqlite.bindText(stmt, 2, dst_str);
-
-        const type_str = try self.allocator.dupeZ(u8, dep.dep_type.toString());
-        defer self.allocator.free(type_str);
-        try sqlite.bindText(stmt, 3, type_str);
+        try sqlite.bindText(stmt, 1, &dep.src_id);
+        try sqlite.bindText(stmt, 2, &dep.dst_id);
+        try sqlite.bindText(stmt, 3, dep.dep_type.toString());
 
         // Bind weight as text since we need to handle floats
         var weight_buf: [32]u8 = undefined;
         const weight_str = try std.fmt.bufPrint(&weight_buf, "{d:.2}", .{dep.weight});
-        const weight_z = try self.allocator.dupeZ(u8, weight_str);
-        defer self.allocator.free(weight_z);
-        try sqlite.bindText(stmt, 4, weight_z);
+        try sqlite.bindText(stmt, 4, weight_str);
 
         try sqlite.bindInt64(stmt, 5, now);
 
@@ -498,25 +523,24 @@ pub const TaskDB = struct {
     }
 
     /// Delete a dependency
+    /// Returns error.DependencyNotFound if the dependency doesn't exist
     pub fn deleteDependency(self: *Self, src_id: TaskId, dst_id: TaskId, dep_type: DependencyType) !void {
         const stmt = try sqlite.prepare(self.db,
             \\DELETE FROM task_dependencies WHERE src_id = ? AND dst_id = ? AND dep_type = ?
         );
         defer sqlite.finalize(stmt);
 
-        const src_str = try self.allocator.dupeZ(u8, &src_id);
-        defer self.allocator.free(src_str);
-        try sqlite.bindText(stmt, 1, src_str);
-
-        const dst_str = try self.allocator.dupeZ(u8, &dst_id);
-        defer self.allocator.free(dst_str);
-        try sqlite.bindText(stmt, 2, dst_str);
-
-        const type_str = try self.allocator.dupeZ(u8, dep_type.toString());
-        defer self.allocator.free(type_str);
-        try sqlite.bindText(stmt, 3, type_str);
+        try sqlite.bindText(stmt, 1, &src_id);
+        try sqlite.bindText(stmt, 2, &dst_id);
+        try sqlite.bindText(stmt, 3, dep_type.toString());
 
         _ = try sqlite.step(stmt);
+
+        // Check if any rows were affected
+        const affected = sqlite.changes(self.db);
+        if (affected == 0) {
+            return error.DependencyNotFound;
+        }
     }
 
     /// Save comments for a task (replaces existing comments)
@@ -525,9 +549,7 @@ pub const TaskDB = struct {
         const delete_stmt = try sqlite.prepare(self.db, "DELETE FROM task_comments WHERE task_id = ?");
         defer sqlite.finalize(delete_stmt);
 
-        const id_str = try self.allocator.dupeZ(u8, task_id);
-        defer self.allocator.free(id_str);
-        try sqlite.bindText(delete_stmt, 1, id_str);
+        try sqlite.bindText(delete_stmt, 1, task_id);
         _ = try sqlite.step(delete_stmt);
 
         // Insert new comments
@@ -538,15 +560,9 @@ pub const TaskDB = struct {
             );
             defer sqlite.finalize(insert_stmt);
 
-            try sqlite.bindText(insert_stmt, 1, id_str);
-
-            const agent_z = try self.allocator.dupeZ(u8, comment.agent);
-            defer self.allocator.free(agent_z);
-            try sqlite.bindText(insert_stmt, 2, agent_z);
-
-            const content_z = try self.allocator.dupeZ(u8, comment.content);
-            defer self.allocator.free(content_z);
-            try sqlite.bindText(insert_stmt, 3, content_z);
+            try sqlite.bindText(insert_stmt, 1, task_id);
+            try sqlite.bindText(insert_stmt, 2, comment.agent);
+            try sqlite.bindText(insert_stmt, 3, comment.content);
 
             try sqlite.bindInt64(insert_stmt, 4, comment.timestamp);
 
@@ -562,42 +578,37 @@ pub const TaskDB = struct {
         );
         defer sqlite.finalize(stmt);
 
-        const id_str = try self.allocator.dupeZ(u8, task_id);
-        defer self.allocator.free(id_str);
-        try sqlite.bindText(stmt, 1, id_str);
-
-        const agent_z = try self.allocator.dupeZ(u8, comment.agent);
-        defer self.allocator.free(agent_z);
-        try sqlite.bindText(stmt, 2, agent_z);
-
-        const content_z = try self.allocator.dupeZ(u8, comment.content);
-        defer self.allocator.free(content_z);
-        try sqlite.bindText(stmt, 3, content_z);
+        try sqlite.bindText(stmt, 1, task_id);
+        try sqlite.bindText(stmt, 2, comment.agent);
+        try sqlite.bindText(stmt, 3, comment.content);
 
         try sqlite.bindInt64(stmt, 4, comment.timestamp);
 
         _ = try sqlite.step(stmt);
     }
 
-    /// Load comments for a task
+    /// Load comments for a task (uses self.allocator)
     fn loadComments(self: *Self, task_id: *const TaskId) ![]Comment {
+        return self.loadCommentsWithAllocator(task_id, self.allocator);
+    }
+
+    /// Load comments for a task with specified allocator
+    fn loadCommentsWithAllocator(self: *Self, task_id: *const TaskId, alloc: Allocator) ![]Comment {
         const stmt = try sqlite.prepare(self.db,
             \\SELECT agent, content, timestamp FROM task_comments
             \\WHERE task_id = ? ORDER BY timestamp ASC
         );
         defer sqlite.finalize(stmt);
 
-        const id_str = try self.allocator.dupeZ(u8, task_id);
-        defer self.allocator.free(id_str);
-        try sqlite.bindText(stmt, 1, id_str);
+        try sqlite.bindText(stmt, 1, task_id);
 
         var comments = std.ArrayListUnmanaged(Comment){};
         errdefer {
             for (comments.items) |*c| {
-                self.allocator.free(c.agent);
-                self.allocator.free(c.content);
+                alloc.free(c.agent);
+                alloc.free(c.content);
             }
-            comments.deinit(self.allocator);
+            comments.deinit(alloc);
         }
 
         while (true) {
@@ -605,25 +616,25 @@ pub const TaskDB = struct {
             if (rc != sqlite.SQLITE_ROW) break;
 
             const agent = if (sqlite.columnText(stmt, 0)) |a|
-                try self.allocator.dupe(u8, a)
+                try alloc.dupe(u8, a)
             else
-                try self.allocator.dupe(u8, "unknown");
+                try alloc.dupe(u8, "unknown");
 
             const content = if (sqlite.columnText(stmt, 1)) |c|
-                try self.allocator.dupe(u8, c)
+                try alloc.dupe(u8, c)
             else
-                try self.allocator.dupe(u8, "");
+                try alloc.dupe(u8, "");
 
             const timestamp = sqlite.columnInt64(stmt, 2);
 
-            try comments.append(self.allocator, .{
+            try comments.append(alloc, .{
                 .agent = agent,
                 .content = content,
                 .timestamp = timestamp,
             });
         }
 
-        return comments.toOwnedSlice(self.allocator);
+        return comments.toOwnedSlice(alloc);
     }
 
     /// Set a metadata key-value pair
@@ -633,13 +644,8 @@ pub const TaskDB = struct {
         );
         defer sqlite.finalize(stmt);
 
-        const key_z = try self.allocator.dupeZ(u8, key);
-        defer self.allocator.free(key_z);
-        try sqlite.bindText(stmt, 1, key_z);
-
-        const value_z = try self.allocator.dupeZ(u8, value);
-        defer self.allocator.free(value_z);
-        try sqlite.bindText(stmt, 2, value_z);
+        try sqlite.bindText(stmt, 1, key);
+        try sqlite.bindText(stmt, 2, value);
 
         _ = try sqlite.step(stmt);
     }
@@ -651,9 +657,7 @@ pub const TaskDB = struct {
         );
         defer sqlite.finalize(stmt);
 
-        const key_z = try self.allocator.dupeZ(u8, key);
-        defer self.allocator.free(key_z);
-        try sqlite.bindText(stmt, 1, key_z);
+        try sqlite.bindText(stmt, 1, key);
 
         const rc = try sqlite.step(stmt);
         if (rc == sqlite.SQLITE_ROW) {
@@ -664,19 +668,69 @@ pub const TaskDB = struct {
         return null;
     }
 
-    /// Begin a transaction
+    /// Begin a transaction (uses SAVEPOINTs for nesting)
+    /// SQLite ignores nested BEGIN, so we use SAVEPOINTs to provide true nesting
+    /// Uses IMMEDIATE mode to acquire write lock immediately, preventing lost updates
+    /// when multiple threads may modify the same data concurrently
+    /// Thread-safe: protected by transaction_mutex
     pub fn beginTransaction(self: *Self) !void {
-        try sqlite.exec(self.db, "BEGIN TRANSACTION");
+        self.transaction_mutex.lock();
+        defer self.transaction_mutex.unlock();
+
+        if (self.transaction_depth == 0) {
+            try sqlite.exec(self.db, "BEGIN IMMEDIATE");
+        } else {
+            // Use savepoint for nested transaction
+            var buf: [32]u8 = undefined;
+            const savepoint_sql = std.fmt.bufPrint(&buf, "SAVEPOINT sp_{d}", .{self.transaction_depth}) catch unreachable;
+            try sqlite.exec(self.db, savepoint_sql);
+        }
+        self.transaction_depth += 1;
     }
 
-    /// Commit a transaction
+    /// Commit a transaction (releases SAVEPOINT if nested)
+    /// Thread-safe: protected by transaction_mutex
     pub fn commitTransaction(self: *Self) !void {
-        try sqlite.exec(self.db, "COMMIT");
+        self.transaction_mutex.lock();
+        defer self.transaction_mutex.unlock();
+
+        if (self.transaction_depth == 0) {
+            return error.NoActiveTransaction;
+        }
+        self.transaction_depth -= 1;
+        if (self.transaction_depth == 0) {
+            try sqlite.exec(self.db, "COMMIT");
+        } else {
+            // Release savepoint for nested transaction
+            var buf: [32]u8 = undefined;
+            const release_sql = std.fmt.bufPrint(&buf, "RELEASE sp_{d}", .{self.transaction_depth}) catch unreachable;
+            try sqlite.exec(self.db, release_sql);
+        }
     }
 
-    /// Rollback a transaction
+    /// Rollback a transaction (rolls back to SAVEPOINT if nested)
+    /// Thread-safe: protected by transaction_mutex
     pub fn rollbackTransaction(self: *Self) !void {
-        try sqlite.exec(self.db, "ROLLBACK");
+        self.transaction_mutex.lock();
+        defer self.transaction_mutex.unlock();
+
+        if (self.transaction_depth == 0) {
+            return error.NoActiveTransaction;
+        }
+        self.transaction_depth -= 1;
+        if (self.transaction_depth == 0) {
+            try sqlite.exec(self.db, "ROLLBACK");
+        } else {
+            // Rollback to savepoint for nested transaction
+            var buf: [48]u8 = undefined;
+            const rollback_sql = std.fmt.bufPrint(&buf, "ROLLBACK TO sp_{d}", .{self.transaction_depth}) catch unreachable;
+            try sqlite.exec(self.db, rollback_sql);
+        }
+    }
+
+    /// Check if currently in a transaction
+    pub fn inTransaction(self: *Self) bool {
+        return self.transaction_depth > 0;
     }
 
     /// Export all tasks to JSONL format
@@ -721,70 +775,793 @@ pub const TaskDB = struct {
         return 0;
     }
 
-    /// Load all tasks and dependencies from SQLite directly into a TaskStore
-    /// Returns the number of tasks loaded
-    pub fn loadIntoStore(self: *Self, store: *task_store.TaskStore) !usize {
-        var count: usize = 0;
+    // ============================================================
+    // Phase 1: Query methods for SQLite as single source of truth
+    // ============================================================
 
-        // Load all tasks
-        const tasks = try self.loadAllTasks();
-        defer self.allocator.free(tasks);
+    /// Check if a task exists
+    pub fn taskExists(self: *Self, task_id: TaskId) !bool {
+        const stmt = try sqlite.prepare(self.db, "SELECT 1 FROM tasks WHERE id = ? LIMIT 1");
+        defer sqlite.finalize(stmt);
 
-        for (tasks) |task| {
-            // Skip if task already exists (collision check)
-            if (store.tasks.contains(task.id)) {
-                // Free the task's owned memory since we're not using it
-                var t = task;
-                t.deinit(self.allocator);
-                continue;
+        try sqlite.bindText(stmt, 1, &task_id);
+
+        const rc = try sqlite.step(stmt);
+        return rc == sqlite.SQLITE_ROW;
+    }
+
+    /// Get ready task IDs (pending, not blocked, not molecules)
+    /// Returns IDs sorted by priority then created_at
+    pub fn getReadyTaskIds(self: *Self) ![]TaskId {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT t.id FROM tasks t
+            \\WHERE t.status = 'pending'
+            \\  AND t.task_type != 'molecule'
+            \\  AND NOT EXISTS (
+            \\    SELECT 1 FROM task_dependencies d
+            \\    JOIN tasks blocker ON d.src_id = blocker.id
+            \\    WHERE d.dst_id = t.id
+            \\      AND d.dep_type = 'blocks'
+            \\      AND blocker.status != 'completed'
+            \\  )
+            \\ORDER BY t.priority ASC, t.created_at ASC
+        );
+        defer sqlite.finalize(stmt);
+
+        var ids = std.ArrayListUnmanaged(TaskId){};
+        errdefer ids.deinit(self.allocator);
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            if (sqlite.columnText(stmt, 0)) |id_text| {
+                if (id_text.len >= 8) {
+                    var id: TaskId = undefined;
+                    @memcpy(&id, id_text[0..8]);
+                    try ids.append(self.allocator, id);
+                }
             }
-
-            // Transfer ownership to store
-            try store.tasks.put(task.id, task);
-            count += 1;
         }
 
-        // Load all dependencies
-        const deps = try self.loadAllDependencies();
-        defer self.allocator.free(deps);
+        return ids.toOwnedSlice(self.allocator);
+    }
 
-        for (deps) |dep| {
-            // Only add if both tasks exist in store
-            if (store.tasks.contains(dep.src_id) and store.tasks.contains(dep.dst_id)) {
-                try store.dependencies.append(store.allocator, dep);
+    /// Get ready tasks with computed blocked_by_count (uses self.allocator)
+    pub fn getReadyTasks(self: *Self) ![]Task {
+        return self.getReadyTasksWithAllocator(self.allocator);
+    }
 
-                // Update blocked_by_count for blocking dependencies
-                if (dep.dep_type.isBlocking()) {
-                    if (store.tasks.getPtr(dep.dst_id)) |dst_task| {
-                        dst_task.blocked_by_count += 1;
+    /// Get ready tasks with specified allocator
+    pub fn getReadyTasksWithAllocator(self: *Self, alloc: Allocator) ![]Task {
+        const ids = try self.getReadyTaskIds();
+        defer self.allocator.free(ids);
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(alloc);
+            tasks.deinit(alloc);
+        }
+
+        for (ids) |id| {
+            if (try self.loadTaskWithAllocator(id, alloc)) |task| {
+                try tasks.append(alloc, task);
+            }
+        }
+
+        return tasks.toOwnedSlice(alloc);
+    }
+
+    /// Get tasks by IDs (uses self.allocator)
+    pub fn getTasksByIds(self: *Self, ids: []const TaskId) ![]Task {
+        return self.getTasksByIdsWithAllocator(ids, self.allocator);
+    }
+
+    /// Get tasks by IDs with specified allocator
+    pub fn getTasksByIdsWithAllocator(self: *Self, ids: []const TaskId, alloc: Allocator) ![]Task {
+        if (ids.len == 0) return alloc.alloc(Task, 0);
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(alloc);
+            tasks.deinit(alloc);
+        }
+
+        // For now, query each task individually
+        // TODO: Build IN clause for better performance with large batches
+        for (ids) |id| {
+            if (try self.loadTaskWithAllocator(id, alloc)) |task| {
+                try tasks.append(alloc, task);
+            }
+        }
+
+        return tasks.toOwnedSlice(alloc);
+    }
+
+    /// List tasks with optional filters (uses self.allocator)
+    pub fn listTasks(self: *Self, filter: task_store.TaskFilter) ![]Task {
+        return self.listTasksWithAllocator(filter, self.allocator);
+    }
+
+    /// List tasks with optional filters and specified allocator
+    pub fn listTasksWithAllocator(self: *Self, filter: task_store.TaskFilter, alloc: Allocator) ![]Task {
+        // Build dynamic WHERE clause (use self.allocator for temp query building)
+        var conditions = std.ArrayListUnmanaged([]const u8){};
+        defer conditions.deinit(self.allocator);
+
+        if (filter.status) |_| {
+            try conditions.append(self.allocator, "status = ?");
+        }
+        if (filter.priority) |_| {
+            try conditions.append(self.allocator, "priority = ?");
+        }
+        if (filter.task_type) |_| {
+            try conditions.append(self.allocator, "task_type = ?");
+        }
+        if (filter.parent_id) |_| {
+            try conditions.append(self.allocator, "parent_id = ?");
+        }
+
+        // Build query
+        var query = std.ArrayListUnmanaged(u8){};
+        defer query.deinit(self.allocator);
+
+        try query.appendSlice(self.allocator,
+            \\SELECT id, title, description, status, priority, task_type,
+            \\       labels, created_at, updated_at, completed_at, parent_id,
+            \\       started_at_commit, completed_at_commit
+            \\FROM tasks
+        );
+
+        if (conditions.items.len > 0) {
+            try query.appendSlice(self.allocator, " WHERE ");
+            for (conditions.items, 0..) |cond, i| {
+                if (i > 0) try query.appendSlice(self.allocator, " AND ");
+                try query.appendSlice(self.allocator, cond);
+            }
+        }
+
+        const stmt = try sqlite.prepare(self.db, query.items);
+        defer sqlite.finalize(stmt);
+
+        // Bind parameters
+        var bind_idx: usize = 1;
+        if (filter.status) |s| {
+            try sqlite.bindText(stmt, @intCast(bind_idx), s.toString());
+            bind_idx += 1;
+        }
+        if (filter.priority) |p| {
+            try sqlite.bindInt64(stmt, @intCast(bind_idx), p.toInt());
+            bind_idx += 1;
+        }
+        if (filter.task_type) |t| {
+            try sqlite.bindText(stmt, @intCast(bind_idx), t.toString());
+            bind_idx += 1;
+        }
+        if (filter.parent_id) |pid| {
+            try sqlite.bindText(stmt, @intCast(bind_idx), &pid);
+            bind_idx += 1;
+        }
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(alloc);
+            tasks.deinit(alloc);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var task = try self.taskFromRowWithAllocator(stmt, alloc);
+
+            // Post-filter for ready_only (requires checking dependencies)
+            if (filter.ready_only) {
+                const blocked_count = try self.getBlockedByCount(task.id);
+                if (blocked_count > 0 or task.status == .blocked or task.status != .pending) {
+                    task.deinit(alloc);
+                    continue;
+                }
+            }
+
+            // Post-filter for label
+            if (filter.label) |lbl| {
+                var found = false;
+                for (task.labels) |task_lbl| {
+                    if (std.mem.eql(u8, task_lbl, lbl)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    task.deinit(alloc);
+                    continue;
+                }
+            }
+
+            // Compute blocked_by_count
+            task.blocked_by_count = try self.getBlockedByCount(task.id);
+            try tasks.append(alloc, task);
+        }
+
+        return tasks.toOwnedSlice(alloc);
+    }
+
+    /// Get task counts by status
+    pub fn getTaskCounts(self: *Self) !task_store.TaskStore.TaskCounts {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT status, COUNT(*) FROM tasks GROUP BY status
+        );
+        defer sqlite.finalize(stmt);
+
+        var counts = task_store.TaskStore.TaskCounts{};
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            if (sqlite.columnText(stmt, 0)) |status_str| {
+                const count: usize = @intCast(sqlite.columnInt64(stmt, 1));
+                if (TaskStatus.fromString(status_str)) |status| {
+                    switch (status) {
+                        .pending => counts.pending = count,
+                        .in_progress => counts.in_progress = count,
+                        .completed => counts.completed = count,
+                        .blocked => counts.blocked = count,
+                        .cancelled => {},
                     }
                 }
             }
         }
 
-        // Invalidate ready cache since we loaded tasks
-        store.ready_cache_valid = false;
-
-        return count;
+        return counts;
     }
 
-    /// Save all tasks and dependencies from a TaskStore to SQLite
-    pub fn saveFromStore(self: *Self, store: *task_store.TaskStore) !void {
-        // Use a transaction for atomicity
-        try self.beginTransaction();
-        errdefer self.rollbackTransaction() catch {};
+    /// Get tasks by status (uses self.allocator)
+    pub fn getTasksByStatus(self: *Self, status: TaskStatus) ![]Task {
+        return self.getTasksByStatusWithAllocator(status, self.allocator);
+    }
 
-        // Save all tasks
-        var task_iter = store.tasks.valueIterator();
-        while (task_iter.next()) |task| {
-            try self.saveTask(task);
+    /// Get tasks by status with specified allocator
+    pub fn getTasksByStatusWithAllocator(self: *Self, status: TaskStatus, alloc: Allocator) ![]Task {
+        return self.listTasksWithAllocator(.{ .status = status }, alloc);
+    }
+
+    /// Get children of a parent task (uses self.allocator)
+    pub fn getChildren(self: *Self, parent_id: TaskId) ![]Task {
+        return self.getChildrenWithAllocator(parent_id, self.allocator);
+    }
+
+    /// Get children of a parent task with specified allocator
+    pub fn getChildrenWithAllocator(self: *Self, parent_id: TaskId, alloc: Allocator) ![]Task {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT id, title, description, status, priority, task_type,
+            \\       labels, created_at, updated_at, completed_at, parent_id,
+            \\       started_at_commit, completed_at_commit
+            \\FROM tasks WHERE parent_id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &parent_id);
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(alloc);
+            tasks.deinit(alloc);
         }
 
-        // Save all dependencies
-        for (store.dependencies.items) |dep| {
-            try self.saveDependency(&dep);
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var task = try self.taskFromRowWithAllocator(stmt, alloc);
+            task.blocked_by_count = try self.getBlockedByCount(task.id);
+            try tasks.append(alloc, task);
         }
 
-        try self.commitTransaction();
+        return tasks.toOwnedSlice(alloc);
+    }
+
+    /// Get siblings of a task (uses self.allocator)
+    pub fn getSiblings(self: *Self, task_id: TaskId) ![]Task {
+        return self.getSiblingsWithAllocator(task_id, self.allocator);
+    }
+
+    /// Get siblings of a task with specified allocator
+    pub fn getSiblingsWithAllocator(self: *Self, task_id: TaskId, alloc: Allocator) ![]Task {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT id, title, description, status, priority, task_type,
+            \\       labels, created_at, updated_at, completed_at, parent_id,
+            \\       started_at_commit, completed_at_commit
+            \\FROM tasks
+            \\WHERE parent_id = (SELECT parent_id FROM tasks WHERE id = ?)
+            \\  AND id != ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+        try sqlite.bindText(stmt, 2, &task_id);
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(alloc);
+            tasks.deinit(alloc);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var task = try self.taskFromRowWithAllocator(stmt, alloc);
+            task.blocked_by_count = try self.getBlockedByCount(task.id);
+            try tasks.append(alloc, task);
+        }
+
+        return tasks.toOwnedSlice(alloc);
+    }
+
+    /// Epic summary for molecules
+    pub const EpicSummary = struct {
+        total_children: usize,
+        completed_children: usize,
+        blocked_children: usize,
+        in_progress_children: usize,
+        completion_percent: u8,
+    };
+
+    pub fn getEpicSummary(self: *Self, epic_id: TaskId) !EpicSummary {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT status, COUNT(*) FROM tasks
+            \\WHERE parent_id = ?
+            \\GROUP BY status
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &epic_id);
+
+        var total: usize = 0;
+        var completed: usize = 0;
+        var blocked: usize = 0;
+        var in_progress: usize = 0;
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            if (sqlite.columnText(stmt, 0)) |status_str| {
+                const count: usize = @intCast(sqlite.columnInt64(stmt, 1));
+                total += count;
+                if (TaskStatus.fromString(status_str)) |status| {
+                    switch (status) {
+                        .completed => completed = count,
+                        .blocked => blocked = count,
+                        .in_progress => in_progress = count,
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        const pct: u8 = if (total > 0) @intCast((completed * 100) / total) else 0;
+
+        return EpicSummary{
+            .total_children = total,
+            .completed_children = completed,
+            .blocked_children = blocked,
+            .in_progress_children = in_progress,
+            .completion_percent = pct,
+        };
+    }
+
+    /// Count of incomplete tasks blocking this one
+    pub fn getBlockedByCount(self: *Self, task_id: TaskId) !usize {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT COUNT(*) FROM task_dependencies d
+            \\JOIN tasks blocker ON d.src_id = blocker.id
+            \\WHERE d.dst_id = ?
+            \\  AND d.dep_type = 'blocks'
+            \\  AND blocker.status != 'completed'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+
+        const rc = try sqlite.step(stmt);
+        if (rc == sqlite.SQLITE_ROW) {
+            return @intCast(sqlite.columnInt64(stmt, 0));
+        }
+        return 0;
+    }
+
+    /// Get tasks that block this one (incomplete only)
+    pub fn getBlockedBy(self: *Self, task_id: TaskId) ![]Task {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT t.id, t.title, t.description, t.status, t.priority, t.task_type,
+            \\       t.labels, t.created_at, t.updated_at, t.completed_at, t.parent_id,
+            \\       t.started_at_commit, t.completed_at_commit
+            \\FROM tasks t
+            \\JOIN task_dependencies d ON d.src_id = t.id
+            \\WHERE d.dst_id = ?
+            \\  AND d.dep_type = 'blocks'
+            \\  AND t.status != 'completed'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(self.allocator);
+            tasks.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var task = try self.taskFromRow(stmt);
+            task.blocked_by_count = try self.getBlockedByCount(task.id);
+            try tasks.append(self.allocator, task);
+        }
+
+        return tasks.toOwnedSlice(self.allocator);
+    }
+
+    /// Get tasks blocked by this one
+    pub fn getBlocking(self: *Self, task_id: TaskId) ![]Task {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT t.id, t.title, t.description, t.status, t.priority, t.task_type,
+            \\       t.labels, t.created_at, t.updated_at, t.completed_at, t.parent_id,
+            \\       t.started_at_commit, t.completed_at_commit
+            \\FROM tasks t
+            \\JOIN task_dependencies d ON d.dst_id = t.id
+            \\WHERE d.src_id = ?
+            \\  AND d.dep_type = 'blocks'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(self.allocator);
+            tasks.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var task = try self.taskFromRow(stmt);
+            task.blocked_by_count = try self.getBlockedByCount(task.id);
+            try tasks.append(self.allocator, task);
+        }
+
+        return tasks.toOwnedSlice(self.allocator);
+    }
+
+    /// Get IDs of tasks blocked by this one (efficient - no full Task load)
+    /// Used for cycle detection in dependency graphs
+    pub fn getBlockingTaskIds(self: *Self, task_id: TaskId) ![]TaskId {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT dst_id FROM task_dependencies
+            \\WHERE src_id = ? AND dep_type = 'blocks'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+
+        var ids = std.ArrayListUnmanaged(TaskId){};
+        errdefer ids.deinit(self.allocator);
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            if (sqlite.columnText(stmt, 0)) |id_text| {
+                if (id_text.len >= 8) {
+                    var id: TaskId = undefined;
+                    @memcpy(&id, id_text[0..8]);
+                    try ids.append(self.allocator, id);
+                }
+            }
+        }
+
+        return ids.toOwnedSlice(self.allocator);
+    }
+
+    /// Get tasks that become unblocked when completed_id is completed
+    /// Returns task IDs where completed_id was the last blocker
+    pub fn getNewlyUnblockedTasks(self: *Self, completed_id: TaskId) ![]TaskId {
+        // Find tasks where:
+        // 1. completed_id blocks them
+        // 2. They have no other incomplete blockers
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT DISTINCT d.dst_id FROM task_dependencies d
+            \\WHERE d.src_id = ?
+            \\  AND d.dep_type = 'blocks'
+            \\  AND NOT EXISTS (
+            \\    SELECT 1 FROM task_dependencies d2
+            \\    JOIN tasks blocker ON d2.src_id = blocker.id
+            \\    WHERE d2.dst_id = d.dst_id
+            \\      AND d2.dep_type = 'blocks'
+            \\      AND d2.src_id != ?
+            \\      AND blocker.status != 'completed'
+            \\  )
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &completed_id);
+        try sqlite.bindText(stmt, 2, &completed_id);
+
+        var ids = std.ArrayListUnmanaged(TaskId){};
+        errdefer ids.deinit(self.allocator);
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            if (sqlite.columnText(stmt, 0)) |id_text| {
+                if (id_text.len >= 8) {
+                    var id: TaskId = undefined;
+                    @memcpy(&id, id_text[0..8]);
+                    try ids.append(self.allocator, id);
+                }
+            }
+        }
+
+        return ids.toOwnedSlice(self.allocator);
+    }
+
+    /// Get tasks with comments containing a prefix (uses self.allocator)
+    pub fn getTasksWithCommentPrefix(self: *Self, prefix: []const u8) ![]Task {
+        return self.getTasksWithCommentPrefixWithAllocator(prefix, self.allocator);
+    }
+
+    /// Get tasks with comments containing a prefix with specified allocator
+    pub fn getTasksWithCommentPrefixWithAllocator(self: *Self, prefix: []const u8, alloc: Allocator) ![]Task {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT DISTINCT t.id, t.title, t.description, t.status, t.priority, t.task_type,
+            \\       t.labels, t.created_at, t.updated_at, t.completed_at, t.parent_id,
+            \\       t.started_at_commit, t.completed_at_commit
+            \\FROM tasks t
+            \\JOIN task_comments c ON c.task_id = t.id
+            \\WHERE c.content LIKE ? || '%'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, prefix);
+
+        var tasks = std.ArrayListUnmanaged(Task){};
+        errdefer {
+            for (tasks.items) |*t| t.deinit(alloc);
+            tasks.deinit(alloc);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var task = try self.taskFromRowWithAllocator(stmt, alloc);
+            task.blocked_by_count = try self.getBlockedByCount(task.id);
+            try tasks.append(alloc, task);
+        }
+
+        return tasks.toOwnedSlice(alloc);
+    }
+
+    /// Get last comment from a specific agent
+    pub fn getLastCommentFrom(self: *Self, task_id: TaskId, agent: []const u8) !?Comment {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT agent, content, timestamp FROM task_comments
+            \\WHERE task_id = ? AND agent = ?
+            \\ORDER BY timestamp DESC LIMIT 1
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+        try sqlite.bindText(stmt, 2, agent);
+
+        const rc = try sqlite.step(stmt);
+        if (rc != sqlite.SQLITE_ROW) return null;
+
+        const agent_out = if (sqlite.columnText(stmt, 0)) |a|
+            try self.allocator.dupe(u8, a)
+        else
+            try self.allocator.dupe(u8, "unknown");
+
+        const content = if (sqlite.columnText(stmt, 1)) |c|
+            try self.allocator.dupe(u8, c)
+        else
+            try self.allocator.dupe(u8, "");
+
+        return Comment{
+            .agent = agent_out,
+            .content = content,
+            .timestamp = sqlite.columnInt64(stmt, 2),
+        };
+    }
+
+    /// Count comments from agent with prefix
+    pub fn countCommentsWithPrefix(self: *Self, task_id: TaskId, agent: []const u8, prefix: []const u8) !usize {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT COUNT(*) FROM task_comments
+            \\WHERE task_id = ? AND agent = ? AND content LIKE ? || '%'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+        try sqlite.bindText(stmt, 2, agent);
+        try sqlite.bindText(stmt, 3, prefix);
+
+        const rc = try sqlite.step(stmt);
+        if (rc == sqlite.SQLITE_ROW) {
+            return @intCast(sqlite.columnInt64(stmt, 0));
+        }
+        return 0;
+    }
+
+    // ============================================================
+    // Update methods
+    // ============================================================
+
+    /// Update task status
+    pub fn updateTaskStatus(self: *Self, task_id: TaskId, status: TaskStatus, completed_at: ?i64) !void {
+        const now = std.time.timestamp();
+        const stmt = try sqlite.prepare(self.db,
+            \\UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?
+            \\WHERE id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, status.toString());
+
+        try sqlite.bindInt64(stmt, 2, now);
+
+        if (completed_at) |ca| {
+            try sqlite.bindInt64(stmt, 3, ca);
+        } else {
+            try sqlite.bindNull(stmt, 3);
+        }
+
+        try sqlite.bindText(stmt, 4, &task_id);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    /// Update task priority
+    pub fn updateTaskPriority(self: *Self, task_id: TaskId, priority: TaskPriority) !void {
+        const now = std.time.timestamp();
+        const stmt = try sqlite.prepare(self.db,
+            \\UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, priority.toInt());
+        try sqlite.bindInt64(stmt, 2, now);
+
+        try sqlite.bindText(stmt, 3, &task_id);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    /// Update task title
+    pub fn updateTaskTitle(self: *Self, task_id: TaskId, title: []const u8) !void {
+        const now = std.time.timestamp();
+        const stmt = try sqlite.prepare(self.db,
+            \\UPDATE tasks SET title = ?, updated_at = ? WHERE id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, title);
+
+        try sqlite.bindInt64(stmt, 2, now);
+
+        try sqlite.bindText(stmt, 3, &task_id);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    /// Update task type
+    pub fn updateTaskType(self: *Self, task_id: TaskId, task_type: TaskType) !void {
+        const now = std.time.timestamp();
+        const stmt = try sqlite.prepare(self.db,
+            \\UPDATE tasks SET task_type = ?, updated_at = ? WHERE id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, task_type.toString());
+
+        try sqlite.bindInt64(stmt, 2, now);
+
+        try sqlite.bindText(stmt, 3, &task_id);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    /// Update commit tracking fields
+    pub fn updateCommitTracking(self: *Self, task_id: TaskId, started: ?[]const u8, completed: ?[]const u8) !void {
+        const now = std.time.timestamp();
+        const stmt = try sqlite.prepare(self.db,
+            \\UPDATE tasks SET started_at_commit = ?, completed_at_commit = ?, updated_at = ?
+            \\WHERE id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        if (started) |s| {
+            try sqlite.bindText(stmt, 1, s);
+        } else {
+            try sqlite.bindNull(stmt, 1);
+        }
+
+        if (completed) |c| {
+            try sqlite.bindText(stmt, 2, c);
+        } else {
+            try sqlite.bindNull(stmt, 2);
+        }
+
+        try sqlite.bindInt64(stmt, 3, now);
+
+        try sqlite.bindText(stmt, 4, &task_id);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    // ============================================================
+    // Session state
+    // ============================================================
+
+    /// Save session state for cold-start recovery
+    pub fn saveSessionState(self: *Self, session_id: []const u8, current_task_id: ?TaskId, started_at: i64) !void {
+        const stmt = try sqlite.prepare(self.db,
+            \\INSERT OR REPLACE INTO session_state (id, session_id, current_task_id, started_at)
+            \\VALUES (1, ?, ?, ?)
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, session_id);
+
+        if (current_task_id) |tid| {
+            try sqlite.bindText(stmt, 2, &tid);
+        } else {
+            try sqlite.bindNull(stmt, 2);
+        }
+
+        try sqlite.bindInt64(stmt, 3, started_at);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    /// Load session state
+    pub fn loadSessionState(self: *Self) !?task_store.SessionState {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT session_id, current_task_id, started_at FROM session_state WHERE id = 1
+        );
+        defer sqlite.finalize(stmt);
+
+        const rc = try sqlite.step(stmt);
+        if (rc != sqlite.SQLITE_ROW) return null;
+
+        const session_id = if (sqlite.columnText(stmt, 0)) |s|
+            try self.allocator.dupe(u8, s)
+        else
+            return null;
+
+        var current_task_id: ?TaskId = null;
+        if (sqlite.columnType(stmt, 1) != sqlite.SQLITE_NULL) {
+            if (sqlite.columnText(stmt, 1)) |tid_text| {
+                if (tid_text.len >= 8) {
+                    var tid: TaskId = undefined;
+                    @memcpy(&tid, tid_text[0..8]);
+                    current_task_id = tid;
+                }
+            }
+        }
+
+        return task_store.SessionState{
+            .session_id = session_id,
+            .current_task_id = current_task_id,
+            .started_at = sqlite.columnInt64(stmt, 2),
+        };
     }
 };

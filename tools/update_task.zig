@@ -108,35 +108,20 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     var task_id: task_store.TaskId = undefined;
     @memcpy(&task_id, task_id_str.?[0..8]);
 
-    // Verify task exists
-    const task = store.getTask(task_id) orelse {
-        return ToolResult.err(allocator, .not_found, "Task not found", start_time);
-    };
-
-    // Wisp guard - cannot update wisps
-    if (task.task_type == .wisp) {
-        return ToolResult.err(allocator, .invalid_arguments, "Cannot update wisp tasks - they are ephemeral", start_time);
-    }
-
-    // Track what changed
+    // Build UpdateTaskParams from provided fields
+    var update_params = TaskStore.UpdateTaskParams{};
     var changes = std.ArrayListUnmanaged([]const u8){};
     defer changes.deinit(allocator);
 
-    // Update title if provided
+    // Parse title if provided
     if (parsed.value.object.get("title")) |v| {
         if (v == .string and v.string.len > 0) {
-            store.updateTitle(task_id, v.string) catch |err| {
-                const msg = switch (err) {
-                    error.TaskNotFound => "Task not found during title update",
-                    else => "Failed to update title",
-                };
-                return ToolResult.err(allocator, .internal_error, msg, start_time);
-            };
+            update_params.title = v.string;
             try changes.append(allocator, "title");
         }
     }
 
-    // Update priority if provided
+    // Parse priority if provided
     if (parsed.value.object.get("priority")) |v| {
         if (v == .string) {
             const new_priority: ?TaskPriority = if (std.mem.eql(u8, v.string, "low"))
@@ -151,9 +136,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
                 null;
 
             if (new_priority) |prio| {
-                store.updatePriority(task_id, prio) catch {
-                    return ToolResult.err(allocator, .not_found, "Task not found during priority update", start_time);
-                };
+                update_params.priority = prio;
                 try changes.append(allocator, "priority");
             } else {
                 return ToolResult.err(allocator, .invalid_arguments, "Invalid priority value", start_time);
@@ -161,7 +144,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         }
     }
 
-    // Update task_type if provided
+    // Parse task_type if provided
     if (parsed.value.object.get("task_type")) |v| {
         if (v == .string) {
             const new_type: ?TaskType = if (std.mem.eql(u8, v.string, "task"))
@@ -175,17 +158,12 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
             else if (std.mem.eql(u8, v.string, "molecule"))
                 .molecule
             else if (std.mem.eql(u8, v.string, "wisp"))
-                .wisp // Will be rejected by updateTaskType
+                .wisp
             else
                 null;
 
             if (new_type) |tt| {
-                store.updateTaskType(task_id, tt) catch |err| {
-                    return switch (err) {
-                        error.TaskNotFound => ToolResult.err(allocator, .not_found, "Task not found during type update", start_time),
-                        error.CannotChangeWispType => ToolResult.err(allocator, .invalid_arguments, "Cannot change task type to or from wisp", start_time),
-                    };
-                };
+                update_params.task_type = tt;
                 try changes.append(allocator, "task_type");
             } else {
                 return ToolResult.err(allocator, .invalid_arguments, "Invalid task_type value", start_time);
@@ -193,8 +171,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         }
     }
 
-    // Update status if provided (special handling for completed)
-    var unblocked_count: usize = 0;
+    // Parse status if provided
     if (parsed.value.object.get("status")) |v| {
         if (v == .string) {
             const new_status: ?TaskStatus = if (std.mem.eql(u8, v.string, "pending"))
@@ -211,21 +188,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
                 null;
 
             if (new_status) |status| {
-                if (status == .completed) {
-                    // Use completeTask for cascade unblocking
-                    const result = store.completeTask(task_id) catch |err| {
-                        return switch (err) {
-                            error.TaskNotFound => ToolResult.err(allocator, .not_found, "Task not found during completion", start_time),
-                            error.OutOfMemory => ToolResult.err(allocator, .internal_error, "Out of memory during completion", start_time),
-                        };
-                    };
-                    unblocked_count = result.unblocked.len;
-                    allocator.free(result.unblocked);
-                } else {
-                    store.updateStatus(task_id, status) catch {
-                        return ToolResult.err(allocator, .not_found, "Task not found during status update", start_time);
-                    };
-                }
+                update_params.status = status;
                 try changes.append(allocator, "status");
             } else {
                 return ToolResult.err(allocator, .invalid_arguments, "Invalid status value", start_time);
@@ -233,24 +196,33 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         }
     }
 
-    // Check if any changes were made
+    // Check if any changes were requested
     if (changes.items.len == 0) {
         return ToolResult.err(allocator, .invalid_arguments, "No valid fields to update", start_time);
     }
 
-    // Persist to database if available
-    if (context.task_db) |db| {
-        if (store.getTask(task_id)) |updated_task| {
-            db.saveTask(updated_task) catch |err| {
-                std.log.warn("Failed to persist updated task to SQLite: {}", .{err});
-            };
-        }
-    }
+    // Execute batch update (all changes in single transaction)
+    const complete_result = store.updateTask(task_id, update_params) catch |err| {
+        return switch (err) {
+            error.TaskNotFound => ToolResult.err(allocator, .not_found, "Task not found", start_time),
+            error.CannotUpdateWisp => ToolResult.err(allocator, .invalid_arguments, "Cannot update wisp tasks - they are ephemeral", start_time),
+            error.CannotChangeWispType => ToolResult.err(allocator, .invalid_arguments, "Cannot change task type to or from wisp", start_time),
+            error.OutOfMemory => ToolResult.err(allocator, .internal_error, "Out of memory during update", start_time),
+            else => ToolResult.err(allocator, .internal_error, "Failed to update task", start_time),
+        };
+    };
+    defer if (complete_result) |cr| allocator.free(cr.unblocked);
+
+    const unblocked_count: usize = if (complete_result) |cr| cr.unblocked.len else 0;
 
     // Get updated task for response
-    const updated_task = store.getTask(task_id) orelse {
+    const updated_task = (try store.getTask(task_id)) orelse {
         return ToolResult.err(allocator, .internal_error, "Task disappeared after update", start_time);
     };
+    defer {
+        var ut = updated_task;
+        ut.deinit(allocator);
+    }
 
     const prio_str = switch (updated_task.priority) {
         .critical => "critical",

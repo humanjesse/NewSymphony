@@ -44,6 +44,11 @@ pub const AppContext = struct {
     conversation_db: ?*conversation_db_module.ConversationDB = null,
     session_id: ?i64 = null,
 
+    // Arena allocator for task queries during tool execution
+    // Set by tools.zig executeToolCall(), used by TaskStore/TaskDB for task allocations
+    // All tasks allocated from arena are freed when tool execution completes
+    task_arena: ?*std.heap.ArenaAllocator = null,
+
     // Recent conversation messages for context-aware tools
     // Populated before tool execution, null otherwise
     // Tools can use this to understand what the user is asking about

@@ -28,6 +28,7 @@ const update_task = @import("tools/update_task.zig");
 const get_current_task = @import("tools/get_current_task.zig");
 const start_task = @import("tools/start_task.zig");
 const block_task = @import("tools/block_task.zig");
+const approve_task = @import("tools/approve_task.zig");
 const add_task_comment = @import("tools/add_task_comment.zig");
 const list_task_comments = @import("tools/list_task_comments.zig");
 const add_subtask = @import("tools/add_subtask.zig");
@@ -261,6 +262,7 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try get_current_task.getDefinition(allocator));
     try tools.append(allocator, try start_task.getDefinition(allocator));
     try tools.append(allocator, try block_task.getDefinition(allocator));
+    try tools.append(allocator, try approve_task.getDefinition(allocator));
     try tools.append(allocator, try add_task_comment.getDefinition(allocator));
     try tools.append(allocator, try list_task_comments.getDefinition(allocator));
     try tools.append(allocator, try add_subtask.getDefinition(allocator));
@@ -333,8 +335,21 @@ pub fn getPermissionMetadata(allocator: std.mem.Allocator) ![]permission.ToolMet
 }
 
 /// Execute a tool by name (Phase 1: accepts AppContext for state access)
+/// Creates a per-tool arena allocator for task queries - all task allocations are
+/// automatically freed when tool execution completes.
 pub fn executeToolCall(allocator: std.mem.Allocator, tool_call: ollama.ToolCall, context: *AppContext) !ToolResult {
     const start_time = std.time.milliTimestamp();
+
+    // Create arena for task allocations during this tool execution
+    // Tasks loaded from SQLite use this arena, freed automatically on return
+    var task_arena = std.heap.ArenaAllocator.init(allocator);
+    defer task_arena.deinit();
+
+    // Set arena in context for TaskStore/TaskDB to use
+    const old_arena = context.task_arena;
+    context.task_arena = &task_arena;
+    defer context.task_arena = old_arena;
+
     const definitions = try getAllToolDefinitions(allocator);
     defer {
         // Free the tool definitions
@@ -349,6 +364,8 @@ pub fn executeToolCall(allocator: std.mem.Allocator, tool_call: ollama.ToolCall,
     // Find matching tool and execute
     for (definitions) |def| {
         if (std.mem.eql(u8, def.ollama_tool.function.name, tool_call.function.name)) {
+            // Tool uses 'allocator' for ToolResult (must outlive arena)
+            // Task queries inside tool use arena via context.task_arena
             return try def.execute(allocator, tool_call.function.arguments, context);
         }
     }

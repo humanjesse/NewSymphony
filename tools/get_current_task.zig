@@ -80,10 +80,12 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         return ToolResult.err(allocator, .internal_error, "Task store not initialized", start_time);
     };
 
-    // Get current task (with auto-assignment)
-    const current_task = store.getCurrentTask() catch {
+    // Get current task using arena allocator (auto-freed when tool returns)
+    const task_alloc = if (context.task_arena) |a| a.allocator() else allocator;
+    const current_task = store.getCurrentTaskWithAllocator(task_alloc) catch {
         return ToolResult.err(allocator, .internal_error, "Failed to get current task", start_time);
     };
+    // No defer needed - arena handles cleanup
 
     // Capture started_at_commit if task exists and doesn't have one yet (Phase 2 commit tracking)
     if (current_task) |task| {
@@ -102,7 +104,7 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         }
     }
 
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
 
     if (current_task) |task| {
         // Build comments array
@@ -137,10 +139,13 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
             .started_at_commit = task.started_at_commit,
         };
 
-        // Build parent context if task has a parent
+        // Build parent context if task has a parent (using arena - auto-freed when tool returns)
         var parent_context: ?ParentContext = null;
+        var parent_task_obj: ?task_store.Task = null;
+        // No defer needed - arena handles cleanup
         if (task.parent_id) |parent_id| {
-            if (store.getTask(parent_id)) |parent| {
+            if (try store.getTaskWithAllocator(parent_id, task_alloc)) |parent| {
+                parent_task_obj = parent;
                 parent_context = .{
                     .id = &parent_id,
                     .title = parent.title,

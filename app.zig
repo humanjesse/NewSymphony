@@ -44,6 +44,7 @@ const app_streaming = @import("app_streaming.zig");
 const app_agents = @import("app_agents.zig");
 const modal_dispatcher = @import("modal_dispatcher.zig");
 const app_tool_execution = @import("app_tool_execution.zig");
+const message_loader = @import("message_loader");
 
 // Re-export types for convenience
 pub const Message = types.Message;
@@ -72,18 +73,91 @@ pub const MessageRenderInfo = struct {
     content_hash: u64, // Hash of message content for change detection (includes expansion states)
 };
 
-/// Simplified render cache - just tracks terminal size for resize detection
+/// Render cache - tracks terminal size and message Y positions for virtualization
 pub const RenderCache = struct {
     last_terminal_width: u16 = 0,
     last_terminal_height: u16 = 0,
+    message_y_positions: std.ArrayListUnmanaged(usize) = .{}, // Y position where each message starts
+    total_content_height: usize = 0, // Total height of all messages
+    cache_valid: bool = false, // Whether position cache is valid
+    last_message_count: usize = 0, // Message count when cache was built
 
     pub fn init() RenderCache {
         return .{};
     }
 
     pub fn deinit(self: *RenderCache, allocator: mem.Allocator) void {
-        _ = self;
-        _ = allocator;
+        self.message_y_positions.deinit(allocator);
+    }
+
+    pub fn invalidate(self: *RenderCache) void {
+        self.cache_valid = false;
+    }
+};
+
+/// Virtualization state for memory-bounded message management
+/// Tracks which messages are loaded in memory vs stored only in DB
+pub const VirtualizationState = struct {
+    total_message_count: usize = 0, // Total messages in conversation (from DB)
+    loaded_start: usize = 0, // First message index currently loaded
+    loaded_end: usize = 0, // Last message index currently loaded (exclusive)
+    buffer_size: usize = 25, // Extra messages to keep around visible range
+    target_loaded: usize = 100, // Target number of messages to keep loaded
+    streaming_message_idx: ?usize = null, // Protected message during streaming
+    estimated_heights: std.AutoHashMapUnmanaged(usize, usize) = .{}, // Heights of unloaded messages
+    average_message_height: usize = 15, // Default for never-loaded messages
+    last_load_time: i64 = 0, // For debouncing rapid scroll
+
+    const Self = @This();
+
+    pub fn init() VirtualizationState {
+        return .{};
+    }
+
+    pub fn deinit(self: *Self, allocator: mem.Allocator) void {
+        self.estimated_heights.deinit(allocator);
+    }
+
+    /// Check if an absolute message index is currently loaded
+    pub fn isLoaded(self: *const Self, absolute_idx: usize) bool {
+        return absolute_idx >= self.loaded_start and absolute_idx < self.loaded_end;
+    }
+
+    /// Convert absolute index to local array index (or null if not loaded)
+    pub fn localIndex(self: *const Self, absolute_idx: usize) ?usize {
+        if (!self.isLoaded(absolute_idx)) return null;
+        return absolute_idx - self.loaded_start;
+    }
+
+    /// Convert local array index to absolute index
+    pub fn absoluteIndex(self: *const Self, local_idx: usize) usize {
+        return local_idx + self.loaded_start;
+    }
+
+    /// Get estimated height for an unloaded message (or average if unknown)
+    pub fn getEstimatedHeight(self: *const Self, absolute_idx: usize) usize {
+        return self.estimated_heights.get(absolute_idx) orelse self.average_message_height;
+    }
+
+    /// Store height estimate before unloading a message
+    pub fn storeHeightEstimate(self: *Self, allocator: mem.Allocator, absolute_idx: usize, height: usize) !void {
+        try self.estimated_heights.put(allocator, absolute_idx, height);
+
+        // Update running average
+        const count = self.estimated_heights.count();
+        if (count > 0) {
+            var total: usize = 0;
+            var iter = self.estimated_heights.valueIterator();
+            while (iter.next()) |h| {
+                total += h.*;
+            }
+            self.average_message_height = total / count;
+        }
+    }
+
+    /// Clear all height estimates (on terminal resize)
+    pub fn clearHeightEstimates(self: *Self) void {
+        self.estimated_heights.clearRetainingCapacity();
     }
 };
 
@@ -146,6 +220,7 @@ pub const App = struct {
     // Streaming state
     streaming_active: bool = false,
     streaming_message_idx: ?usize = null, // Specific message to update (for agents with tool calls)
+    user_scrolled_away: bool = false, // Track if user manually scrolled away from bottom
     // Agent responding state (for status indicator)
     agent_responding: bool = false,
     stream_mutex: std.Thread.Mutex = .{},
@@ -203,6 +278,9 @@ pub const App = struct {
 
     // Incremental rendering state
     render_cache: RenderCache = RenderCache.init(),
+
+    // Virtualization state for memory-bounded message management
+    virtualization: VirtualizationState = VirtualizationState.init(),
 
     pub fn init(allocator: mem.Allocator, config: Config) !App {
         const tools = try createTools(allocator);
@@ -326,9 +404,13 @@ pub const App = struct {
             .thinking_expanded = true,
             .timestamp = std.time.milliTimestamp(),
         });
+        message_loader.onMessageAdded(&app);
 
         // Persist system message immediately
         try app.persistMessage(app.messages.items.len - 1);
+
+        // Initialize virtualization state after system message is ready
+        try message_loader.initVirtualization(&app);
 
         // Initialize task memory system (Beads-style per-project)
         // Use git root if in a repo, otherwise use current working directory
@@ -343,66 +425,59 @@ pub const App = struct {
         };
         app.git_root = project_root;
 
-        // Create task store
-        const task_store_ptr = try allocator.create(task_store_module.TaskStore);
-        task_store_ptr.* = task_store_module.TaskStore.init(allocator);
-        app.task_store = task_store_ptr;
-
-        // Start a new session
-        try task_store_ptr.startSession();
-
         // Initialize GitSync for this project
         const git_sync_ptr = try allocator.create(git_sync_module.GitSync);
         git_sync_ptr.* = try git_sync_module.GitSync.init(allocator, project_root);
         app.git_sync = git_sync_ptr;
 
-        // Create per-project SQLite cache
-        const task_db_path = try std.fmt.allocPrint(allocator, "{s}/.tasks/tasks.db", .{project_root});
-        defer allocator.free(task_db_path);
-
         // Ensure .tasks directory exists
         try git_sync_ptr.ensureTasksDir();
 
-        // Create task database
+        // Create per-project SQLite database (single source of truth)
+        const task_db_path = try std.fmt.allocPrint(allocator, "{s}/.tasks/tasks.db", .{project_root});
+        defer allocator.free(task_db_path);
+
         const task_db_ptr = try allocator.create(task_db_module.TaskDB);
         task_db_ptr.* = try task_db_module.TaskDB.init(allocator, task_db_path);
         app.task_db = task_db_ptr;
 
-        // Cold-start recovery: SQLite first (crash recovery), JSONL fallback (fresh clone)
-        var loaded_from_db = false;
-        if (task_db_ptr.loadIntoStore(task_store_ptr)) |count| {
-            if (count > 0) {
-                loaded_from_db = true;
-                std.log.info("Recovered {d} tasks from local cache", .{count});
-            }
-        } else |_| {}
+        // Create task store with TaskDB reference (facade pattern)
+        const task_store_ptr = try allocator.create(task_store_module.TaskStore);
+        task_store_ptr.* = task_store_module.TaskStore.init(allocator, task_db_ptr);
+        app.task_store = task_store_ptr;
 
-        // Fall back to JSONL (fresh clone or empty SQLite)
-        if (!loaded_from_db) {
-            if (git_sync_ptr.importTasks(task_store_ptr)) |count| {
+        // Check if SQLite has existing tasks
+        const task_count = task_db_ptr.getTaskCount() catch 0;
+
+        // Fall back to JSONL import only if SQLite is empty (fresh clone scenario)
+        if (task_count == 0) {
+            if (git_sync_ptr.importTasks(task_db_ptr)) |count| {
                 if (count > 0) {
-                    std.log.info("Loaded {d} tasks from JSONL", .{count});
-                    // Populate SQLite for future crash recovery
-                    task_db_ptr.saveFromStore(task_store_ptr) catch |err| {
-                        std.log.warn("Failed to populate SQLite cache: {}", .{err});
-                    };
+                    std.log.info("Imported {d} tasks from JSONL to SQLite", .{count});
                 }
             } else |_| {}
+        } else {
+            std.log.info("Loaded {d} tasks from SQLite", .{task_count});
         }
 
-        // Try to restore session state (current_task_id)
-        if (try git_sync_ptr.parseSessionState()) |state| {
+        // Try to restore session state from SQLite
+        if (try task_db_ptr.loadSessionState()) |state| {
             defer {
                 var s = state;
                 s.deinit(allocator);
             }
 
-            // Restore current task if it exists in store
+            // Restore session to TaskStore
+            task_store_ptr.session_id = try allocator.dupe(u8, state.session_id);
+            task_store_ptr.session_started_at = state.started_at;
             if (state.current_task_id) |cid| {
-                if (task_store_ptr.tasks.contains(cid)) {
+                if (try task_db_ptr.taskExists(cid)) {
                     task_store_ptr.current_task_id = cid;
                 }
             }
+        } else {
+            // Start a new session
+            try task_store_ptr.startSession();
         }
 
         return app;
@@ -441,6 +516,92 @@ pub const App = struct {
         } else {
             return error.DatabaseNotInitialized;
         }
+    }
+
+    /// Invalidate height cache for a specific message (call when message content changes)
+    pub fn invalidateMessageCache(self: *App, message_index: usize) void {
+        if (message_index < self.messages.items.len) {
+            self.messages.items[message_index].cached_height = null;
+        }
+        self.render_cache.invalidate();
+    }
+
+    /// Invalidate all message caches (call on terminal resize)
+    pub fn invalidateAllMessageCaches(self: *App) void {
+        for (self.messages.items) |*message| {
+            message.cached_height = null;
+        }
+        self.render_cache.invalidate();
+        self.virtualization.clearHeightEstimates();
+    }
+
+    /// Convert a MessageRow from the database into a full Message
+    /// Regenerates processed_content from raw content using markdown parser
+    /// Note: tool_calls and permission_request are NOT persisted (ephemeral)
+    pub fn messageFromRow(self: *App, row: *const conversation_db_module.MessageRow) !Message {
+        const allocator = self.allocator;
+
+        // Parse role enum from string
+        const role: @TypeOf(@as(Message, undefined).role) = if (std.mem.eql(u8, row.role, "user"))
+            .user
+        else if (std.mem.eql(u8, row.role, "assistant"))
+            .assistant
+        else if (std.mem.eql(u8, row.role, "system"))
+            .system
+        else if (std.mem.eql(u8, row.role, "tool"))
+            .tool
+        else
+            .display_only_data;
+
+        // Duplicate content (take ownership)
+        const content = try allocator.dupe(u8, row.content);
+        errdefer allocator.free(content);
+
+        // Generate processed_content from markdown
+        var processed_content = try markdown.processMarkdown(allocator, content);
+        errdefer {
+            for (processed_content.items) |*item| item.deinit(allocator);
+            processed_content.deinit(allocator);
+        }
+
+        // Process thinking content if present
+        var thinking_content: ?[]const u8 = null;
+        var processed_thinking_content: ?std.ArrayListUnmanaged(markdown.RenderableItem) = null;
+        if (row.thinking_content) |tc| {
+            thinking_content = try allocator.dupe(u8, tc);
+            processed_thinking_content = try markdown.processMarkdown(allocator, thinking_content.?);
+        }
+
+        // Duplicate optional string fields
+        const tool_call_id = if (row.tool_call_id) |id| try allocator.dupe(u8, id) else null;
+        const tool_name = if (row.tool_name) |name| try allocator.dupe(u8, name) else null;
+        const agent_analysis_name = if (row.agent_analysis_name) |name| try allocator.dupe(u8, name) else null;
+        const agent_source = if (row.agent_source) |source| try allocator.dupe(u8, source) else null;
+
+        return Message{
+            .role = role,
+            .content = content,
+            .agent_source = agent_source,
+            .processed_content = processed_content,
+            .thinking_content = thinking_content,
+            .processed_thinking_content = processed_thinking_content,
+            .thinking_expanded = row.thinking_expanded,
+            .timestamp = row.timestamp,
+            .tool_calls = null, // Not persisted (complex nested structure)
+            .tool_call_id = tool_call_id,
+            .permission_request = null, // Not persisted (session-only ephemeral)
+            .tool_call_expanded = row.tool_call_expanded,
+            .tool_name = tool_name,
+            .tool_success = row.tool_success,
+            .tool_execution_time = row.tool_execution_time,
+            .agent_analysis_name = agent_analysis_name,
+            .agent_analysis_expanded = row.agent_analysis_expanded,
+            .agent_analysis_completed = row.agent_analysis_completed,
+            // Height cache starts empty (will be populated on first render)
+            .cached_height = null,
+            .cache_width = 0,
+            .cache_hash = 0,
+        };
     }
 
     // Check if viewport is currently at the bottom
@@ -553,6 +714,7 @@ pub const App = struct {
             .thinking_expanded = true,
             .timestamp = std.time.milliTimestamp(),
         });
+        message_loader.onMessageAdded(self);
 
         // Persist user message immediately
         try self.persistMessage(self.messages.items.len - 1);
@@ -560,6 +722,9 @@ pub const App = struct {
         // Show user message right away (receipt printer mode)
         _ = try message_renderer.redrawScreen(self);
         self.updateCursorToBottom();
+
+        // Reset scroll state so response auto-scrolls
+        self.user_scrolled_away = false;
 
         // 2. Start streaming
         try app_streaming.startStreaming(self, format);
@@ -805,6 +970,9 @@ pub const App = struct {
         // Clean up incremental rendering state
         self.render_cache.deinit(self.allocator);
 
+        // Clean up virtualization state
+        self.virtualization.deinit(self.allocator);
+
         // Clean up config (App owns it)
         self.config.deinit(self.allocator);
     }
@@ -896,8 +1064,8 @@ pub const App = struct {
                 self.valid_cursor_positions.clearRetainingCapacity();
 
                 var absolute_y: usize = 1;
-                for (self.messages.items, 0..) |_, i| {
-                    const message = &self.messages.items[i];
+                for (self.messages.items, 0..) |_, local_i| {
+                    const message = &self.messages.items[local_i];
 
                     // Skip tool JSON if hidden by config
                     if (message.role == .tool and !self.config.show_tool_json) continue;
@@ -906,7 +1074,7 @@ pub const App = struct {
                     if (message.role == .system and message.content.len == 0) continue;
 
                     // Draw message (handles both thinking and content)
-                    try message_renderer.drawMessage(self, writer, message, i, &absolute_y, input_field_height);
+                    try message_renderer.drawMessage(self, writer, message, &absolute_y, input_field_height);
                 }
 
                 // Position cursor after last message content to clear any leftover content

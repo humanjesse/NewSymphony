@@ -119,11 +119,12 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         }
     }
 
-    // Get tasks
-    const tasks = store.listTasks(filter) catch {
+    // Get tasks using arena allocator (auto-freed when tool returns)
+    const task_alloc = if (context.task_arena) |a| a.allocator() else allocator;
+    const tasks = store.listTasksWithAllocator(filter, task_alloc) catch {
         return ToolResult.err(allocator, .internal_error, "Failed to list tasks", start_time);
     };
-    defer allocator.free(tasks);
+    // No defer needed - arena handles cleanup
 
     // Response structs for JSON serialization
     const TaskInfo = struct {
@@ -188,7 +189,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         });
     }
 
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
 
     const response = Response{
         .tasks = task_infos.items,

@@ -139,12 +139,12 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     };
 
     // Build response
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
 
     const response = Response{
         .landed = true,
         .summary = summary,
-        .tasks_saved = store.tasks.count(),
+        .tasks_saved = try store.count(),
         .completed = counts.completed,
         .pending = counts.pending,
         .blocked = counts.blocked,

@@ -86,17 +86,12 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         return ToolResult.err(allocator, .internal_error, "Task not found", start_time);
     };
 
-    // Get the task for response
-    const task = store.getTask(task_id) orelse {
+    // Get the task for response (using arena - auto-freed when tool returns)
+    const task_alloc = if (context.task_arena) |a| a.allocator() else allocator;
+    const task = (try store.getTaskWithAllocator(task_id, task_alloc)) orelse {
         return ToolResult.err(allocator, .internal_error, "Task disappeared after setting as current", start_time);
     };
-
-    // Persist to database if available
-    if (context.task_db) |db| {
-        db.saveTask(task) catch |err| {
-            std.log.warn("Failed to persist started task to SQLite: {}", .{err});
-        };
-    }
+    // No defer needed - arena handles cleanup
 
     // Build response
     const response = Response{

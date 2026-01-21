@@ -109,7 +109,7 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     }
 
     // Verify parent exists
-    if (!store.tasks.contains(parent_id)) {
+    if (!(try store.db.taskExists(parent_id))) {
         return ToolResult.err(allocator, .internal_error, "Parent task not found", start_time);
     }
 

@@ -146,19 +146,20 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     var previous_session = PreviousSession{ .exists = false };
     const store = context.task_store;
     if (store) |s| {
-        const counts = s.getTaskCounts();
-        const total = counts.pending + counts.in_progress + counts.completed + counts.blocked;
+        if (s.getTaskCounts()) |counts| {
+            const total = counts.pending + counts.in_progress + counts.completed + counts.blocked;
 
-        if (total > 0) {
-            previous_session = .{
-                .exists = true,
-                .task_count = total,
-                .pending = counts.pending,
-                .in_progress = counts.in_progress,
-                .completed = counts.completed,
-                .blocked = counts.blocked,
-            };
-        }
+            if (total > 0) {
+                previous_session = .{
+                    .exists = true,
+                    .task_count = total,
+                    .pending = counts.pending,
+                    .in_progress = counts.in_progress,
+                    .completed = counts.completed,
+                    .blocked = counts.blocked,
+                };
+            }
+        } else |_| {}
     }
 
     // Get session notes if available

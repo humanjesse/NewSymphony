@@ -35,6 +35,11 @@ pub const Message = struct {
     agent_analysis_name: ?[]const u8 = null, // e.g., "File Curator"
     agent_analysis_expanded: bool = true, // Default expanded until user collapses
     agent_analysis_completed: bool = false, // Whether agent finished (enables collapse)
+
+    // Height cache for virtualization (Phase 1)
+    cached_height: ?usize = null, // Cached rendered height in lines
+    cache_width: u16 = 0, // Terminal width when height was cached
+    cache_hash: u64 = 0, // Content hash when height was cached
 };
 
 /// Clickable area for mouse interaction (thinking blocks)

@@ -1,4 +1,4 @@
-// Block Task Tool - Mark a task as blocked with a reason
+// Approve Task Tool - Mark a task as approved for execution
 const std = @import("std");
 const json = std.json;
 const ollama = @import("ollama");
@@ -12,16 +12,15 @@ const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
 // Response structs for JSON serialization
-const BlockedTask = struct {
+const ApprovedTask = struct {
     id: []const u8,
     title: []const u8,
 };
 
 const Response = struct {
-    blocked: bool,
-    task: BlockedTask,
+    approved: bool,
+    task: ApprovedTask,
     reason: []const u8,
-    current_task_cleared: bool,
 };
 
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
@@ -29,23 +28,19 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
         .ollama_tool = .{
             .type = "function",
             .function = .{
-                .name = try allocator.dupe(u8, "block_task"),
-                .description = try allocator.dupe(u8, "Mark a task as blocked. Optionally specify what's blocking it."),
+                .name = try allocator.dupe(u8, "approve_task"),
+                .description = try allocator.dupe(u8, "Approve a task as ready for execution. Use this when a task is clear, actionable, and appropriately sized."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
                     \\  "properties": {
                     \\    "task_id": {
                     \\      "type": "string",
-                    \\      "description": "Task to block. Defaults to current task if not specified."
+                    \\      "description": "Task to approve. Defaults to current task if not specified."
                     \\    },
                     \\    "reason": {
                     \\      "type": "string",
-                    \\      "description": "Why this task is blocked"
-                    \\    },
-                    \\    "blocked_by": {
-                    \\      "type": "string",
-                    \\      "description": "Task ID that is blocking this task"
+                    \\      "description": "Why this task is approved (e.g., 'Task is clear, bite-sized, and actionable')"
                     \\    }
                     \\  },
                     \\  "required": ["reason"]
@@ -54,8 +49,8 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
             },
         },
         .permission_metadata = .{
-            .name = "block_task",
-            .description = "Block a task",
+            .name = "approve_task",
+            .description = "Approve a task for execution",
             .risk_level = .safe,
             .required_scopes = &.{.todo_management},
             .validator = null,
@@ -88,7 +83,6 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
 
     // Get task_id - either from args or current task
     var task_id: task_store.TaskId = undefined;
-    var is_current_task = false;
 
     if (parsed.value.object.get("task_id")) |v| {
         if (v == .string and v.string.len == 8) {
@@ -100,7 +94,6 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         // Use current task
         if (store.getCurrentTaskId()) |cid| {
             task_id = cid;
-            is_current_task = true;
         } else {
             return ToolResult.err(allocator, .invalid_arguments, "No current task. Specify task_id explicitly.", start_time);
         }
@@ -113,54 +106,24 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     };
     // No defer needed - arena handles cleanup
 
-    // Molecules can't be blocked - they're containers
-    if (task.task_type == .molecule) {
-        return ToolResult.err(allocator, .invalid_arguments, "Cannot block a molecule - molecules are containers. Block individual subtasks instead.", start_time);
-    }
-
-    // Update status to blocked
-    store.updateStatus(task_id, .blocked) catch |err| {
-        return switch (err) {
-            error.CannotBlockMolecule => ToolResult.err(allocator, .invalid_arguments, "Cannot block a molecule - molecules are containers.", start_time),
-            else => ToolResult.err(allocator, .internal_error, "Failed to update task status", start_time),
-        };
-    };
-
-    // Add a comment with the block reason (Beads philosophy)
+    // Add a comment with the approval reason (Beads philosophy)
     const agent_name = context.current_agent_name orelse "unknown";
-    const block_comment = try std.fmt.allocPrint(allocator, "BLOCKED: {s}", .{reason.?});
-    defer allocator.free(block_comment);
-    store.addComment(task_id, agent_name, block_comment) catch {
-        return ToolResult.err(allocator, .internal_error, "Failed to add block comment", start_time);
+    const approve_comment = try std.fmt.allocPrint(allocator, "APPROVED: {s}", .{reason.?});
+    defer allocator.free(approve_comment);
+    store.addComment(task_id, agent_name, approve_comment) catch {
+        return ToolResult.err(allocator, .internal_error, "Failed to add approval comment", start_time);
     };
 
-    // If blocked_by is specified, add a dependency
-    if (parsed.value.object.get("blocked_by")) |v| {
-        if (v == .string and v.string.len == 8) {
-            var blocker_id: task_store.TaskId = undefined;
-            @memcpy(&blocker_id, v.string[0..8]);
-            store.addDependency(blocker_id, task_id, .blocks) catch {
-                // Dependency might already exist or task might not exist
-            };
-        }
-    }
-
-    // Clear current task if we blocked it
-    if (is_current_task) {
-        store.clearCurrentTask();
-    }
-
-    // Note: TaskStore now handles persistence via SQLite automatically
+    // Note: We don't change task status - it remains in_progress, ready for Tinkerer
 
     // Build response
     const response = Response{
-        .blocked = true,
+        .approved = true,
         .task = .{
             .id = &task_id,
             .title = task.title,
         },
         .reason = reason.?,
-        .current_task_cleared = is_current_task,
     };
 
     const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});

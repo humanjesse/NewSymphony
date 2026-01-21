@@ -98,30 +98,18 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     else
         DependencyType.blocks;
 
-    // Add the dependency
+    // Add the dependency (automatically persisted to SQLite)
     store.addDependency(src_id, dst_id, dep_type) catch |err| {
         const msg = switch (err) {
             error.SourceTaskNotFound => "Source task not found",
             error.DestTaskNotFound => "Destination task not found",
             error.SelfDependency => "Cannot create self-dependency",
-            error.CircularDependency => "Would create circular dependency",
             error.DependencyExists => "Dependency already exists",
+            error.CircularDependency => "Cannot add dependency: would create circular dependency",
             else => "Failed to add dependency",
         };
         return ToolResult.err(allocator, .invalid_arguments, msg, start_time);
     };
-
-    // Persist to database if available
-    if (context.task_db) |db| {
-        db.saveDependency(&.{
-            .src_id = src_id,
-            .dst_id = dst_id,
-            .dep_type = dep_type,
-            .weight = 1.0,
-        }) catch |err| {
-            std.log.warn("Failed to persist dependency to SQLite: {}", .{err});
-        };
-    }
 
     // Return JSON result
     const result_msg = try std.fmt.allocPrint(allocator, "{{\"src\": \"{s}\", \"dst\": \"{s}\", \"type\": \"{s}\", \"success\": true}}", .{

@@ -7,6 +7,37 @@ const markdown = @import("markdown");
 
 const Allocator = std.mem.Allocator;
 
+/// Row data loaded from the messages table
+/// Contains all fields needed to reconstruct a Message
+pub const MessageRow = struct {
+    id: i64,
+    message_index: i64,
+    role: []const u8,
+    content: []const u8,
+    thinking_content: ?[]const u8,
+    timestamp: i64,
+    tool_call_id: ?[]const u8,
+    thinking_expanded: bool,
+    tool_call_expanded: bool,
+    tool_name: ?[]const u8,
+    tool_success: ?bool,
+    tool_execution_time: ?i64,
+    agent_analysis_name: ?[]const u8,
+    agent_analysis_expanded: bool,
+    agent_analysis_completed: bool,
+    agent_source: ?[]const u8,
+
+    pub fn deinit(self: *MessageRow, allocator: Allocator) void {
+        allocator.free(self.role);
+        allocator.free(self.content);
+        if (self.thinking_content) |tc| allocator.free(tc);
+        if (self.tool_call_id) |tcid| allocator.free(tcid);
+        if (self.tool_name) |tn| allocator.free(tn);
+        if (self.agent_analysis_name) |aan| allocator.free(aan);
+        if (self.agent_source) |as| allocator.free(as);
+    }
+};
+
 pub const ConversationDB = struct {
     db: *sqlite.Db,
     allocator: Allocator,
@@ -743,6 +774,98 @@ pub const ConversationDB = struct {
                 .iterations_used = sqlite.columnInt64(stmt, 9),
             };
             try results.append(self.allocator, inv);
+        }
+
+        return results.toOwnedSlice(self.allocator);
+    }
+
+    // ========== Message Loading Methods (Phase 2: Virtualization) ==========
+
+    /// Get the total count of messages in a conversation
+    pub fn getMessageCount(self: *Self, conversation_id: i64) !usize {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT COUNT(*) FROM messages WHERE conversation_id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, conversation_id);
+
+        const rc = try sqlite.step(stmt);
+        if (rc == sqlite.SQLITE_ROW) {
+            return @intCast(sqlite.columnInt64(stmt, 0));
+        }
+
+        return 0;
+    }
+
+    /// Load messages from database within a range [start_idx, end_idx] (inclusive)
+    /// Returns an owned slice of MessageRow that must be freed by the caller
+    pub fn loadMessages(self: *Self, conversation_id: i64, start_idx: i64, end_idx: i64) ![]MessageRow {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT id, message_index, role, content, thinking_content, timestamp,
+            \\       tool_call_id, thinking_expanded, tool_call_expanded, tool_name,
+            \\       tool_success, tool_execution_time, agent_analysis_name,
+            \\       agent_analysis_expanded, agent_analysis_completed, agent_source
+            \\FROM messages
+            \\WHERE conversation_id = ? AND message_index >= ? AND message_index <= ?
+            \\ORDER BY message_index ASC
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, conversation_id);
+        try sqlite.bindInt64(stmt, 2, start_idx);
+        try sqlite.bindInt64(stmt, 3, end_idx);
+
+        var results = std.ArrayListUnmanaged(MessageRow){};
+        errdefer {
+            for (results.items) |*row| row.deinit(self.allocator);
+            results.deinit(self.allocator);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            const row = MessageRow{
+                .id = sqlite.columnInt64(stmt, 0),
+                .message_index = sqlite.columnInt64(stmt, 1),
+                .role = if (sqlite.columnText(stmt, 2)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .content = if (sqlite.columnText(stmt, 3)) |t| try self.allocator.dupe(u8, t) else try self.allocator.dupe(u8, ""),
+                .thinking_content = if (sqlite.columnType(stmt, 4) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 4)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .timestamp = sqlite.columnInt64(stmt, 5),
+                .tool_call_id = if (sqlite.columnType(stmt, 6) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 6)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .thinking_expanded = sqlite.columnInt64(stmt, 7) != 0,
+                .tool_call_expanded = sqlite.columnInt64(stmt, 8) != 0,
+                .tool_name = if (sqlite.columnType(stmt, 9) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 9)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .tool_success = if (sqlite.columnType(stmt, 10) != sqlite.SQLITE_NULL)
+                    sqlite.columnInt64(stmt, 10) != 0
+                else
+                    null,
+                .tool_execution_time = if (sqlite.columnType(stmt, 11) != sqlite.SQLITE_NULL)
+                    sqlite.columnInt64(stmt, 11)
+                else
+                    null,
+                .agent_analysis_name = if (sqlite.columnType(stmt, 12) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 12)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+                .agent_analysis_expanded = sqlite.columnInt64(stmt, 13) != 0,
+                .agent_analysis_completed = sqlite.columnInt64(stmt, 14) != 0,
+                .agent_source = if (sqlite.columnType(stmt, 15) != sqlite.SQLITE_NULL)
+                    if (sqlite.columnText(stmt, 15)) |t| try self.allocator.dupe(u8, t) else null
+                else
+                    null,
+            };
+            try results.append(self.allocator, row);
         }
 
         return results.toOwnedSlice(self.allocator);

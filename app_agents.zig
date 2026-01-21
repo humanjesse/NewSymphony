@@ -5,6 +5,7 @@ const ollama = @import("ollama");
 const markdown = @import("markdown");
 const tools_module = @import("tools");
 const message_renderer = @import("message_renderer");
+const message_loader = @import("message_loader");
 const context_module = @import("context");
 pub const agents_module = @import("agents");
 const agent_executor = @import("agent_executor");
@@ -399,6 +400,7 @@ pub fn handleAgentCommand(app: *App, agent_name: []const u8, task: ?[]const u8, 
             .thinking_expanded = false,
             .timestamp = std.time.milliTimestamp(),
         });
+        message_loader.onMessageAdded(app);
         _ = try message_renderer.redrawScreen(app);
         app.updateCursorToBottom();
     }
@@ -455,6 +457,7 @@ pub fn sendToAgent(app: *App, user_input: []const u8, display_text: ?[]const u8)
         .thinking_expanded = true,
         .timestamp = std.time.milliTimestamp(),
     });
+    message_loader.onMessageAdded(app);
     try app.persistMessage(app.messages.items.len - 1);
 
     // Set agent responding flag BEFORE redraw so taskbar shows status
@@ -472,14 +475,22 @@ pub fn sendToAgent(app: *App, user_input: []const u8, display_text: ?[]const u8)
         .thinking_expanded = true,
         .timestamp = std.time.milliTimestamp(),
     });
+    message_loader.onMessageAdded(app);
 
     // Enable streaming mode and track the specific message to update
     // (important: tool messages may be inserted, so we can't just use "last message")
     app.streaming_active = true;
-    app.streaming_message_idx = app.messages.items.len - 1;
+    // Store as absolute index and protect from virtualization unloading
+    const local_idx = app.messages.items.len - 1;
+    const abs_idx = app.virtualization.absoluteIndex(local_idx);
+    app.streaming_message_idx = abs_idx;
+    message_loader.setStreamingProtection(app, abs_idx);
 
     _ = try message_renderer.redrawScreen(app);
     app.updateCursorToBottom();
+
+    // Reset scroll state so response auto-scrolls
+    app.user_scrolled_away = false;
 
     // Get the executor through the type-safe interface
     const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
@@ -662,62 +673,50 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
     }
 }
 
-/// Trigger Questioner to evaluate the next ready task
-/// Used after Planner completes and after Judge approves a task
-pub fn triggerQuestioner(app: *App) void {
+/// Queue an agent command event with proper memory management
+fn queueAgentCommand(app: *App, agent_name: []const u8, task_desc: []const u8, display_prefix: []const u8) void {
     const registry = app.app_context.agent_registry orelse return;
-    if (registry.get("questioner") == null) return;
+    if (registry.get(agent_name) == null) return;
 
-    const task = app.allocator.dupe(u8, "Evaluate next task") catch return;
-    const display = app.allocator.dupe(u8, "/questioner Evaluate next task") catch {
+    const task = app.allocator.dupe(u8, task_desc) catch return;
+    const display = std.fmt.allocPrint(app.allocator, "{s} {s}", .{ display_prefix, task_desc }) catch {
         app.allocator.free(task);
         return;
     };
 
-    app.agent_command_events.append(app.allocator, .{
-        .start_questioner = .{ .task = task, .display_text = display },
-    }) catch {
+    const event: AgentCommandEvent = if (mem.eql(u8, agent_name, "questioner"))
+        .{ .start_questioner = .{ .task = task, .display_text = display } }
+    else if (mem.eql(u8, agent_name, "tinkerer"))
+        .{ .start_tinkerer = .{ .task = task, .display_text = display } }
+    else if (mem.eql(u8, agent_name, "judge"))
+        .{ .start_judge = .{ .task = task, .display_text = display } }
+    else if (mem.eql(u8, agent_name, "planner"))
+        .{ .start_planner = .{ .prompt = task, .display_text = display } }
+    else {
+        app.allocator.free(task);
+        app.allocator.free(display);
+        return;
+    };
+
+    app.agent_command_events.append(app.allocator, event) catch {
         app.allocator.free(task);
         app.allocator.free(display);
     };
+}
+
+/// Trigger Questioner to evaluate the next ready task
+pub fn triggerQuestioner(app: *App) void {
+    queueAgentCommand(app, "questioner", "Evaluate next task", "/questioner");
 }
 
 /// Trigger Tinkerer to work on next ready task
 pub fn triggerTinkerer(app: *App) void {
-    const registry = app.app_context.agent_registry orelse return;
-    if (registry.get("tinkerer") == null) return;
-
-    const task = app.allocator.dupe(u8, "Implement the next ready task") catch return;
-    const display = app.allocator.dupe(u8, "/tinkerer Implement next ready task") catch {
-        app.allocator.free(task);
-        return;
-    };
-
-    app.agent_command_events.append(app.allocator, .{
-        .start_tinkerer = .{ .task = task, .display_text = display },
-    }) catch {
-        app.allocator.free(task);
-        app.allocator.free(display);
-    };
+    queueAgentCommand(app, "tinkerer", "Implement the next ready task", "/tinkerer");
 }
 
 /// Trigger Judge to review Tinkerer's implementation
 pub fn triggerJudge(app: *App) void {
-    const registry = app.app_context.agent_registry orelse return;
-    if (registry.get("judge") == null) return;
-
-    const task = app.allocator.dupe(u8, "Review the staged implementation") catch return;
-    const display = app.allocator.dupe(u8, "/judge Review implementation") catch {
-        app.allocator.free(task);
-        return;
-    };
-
-    app.agent_command_events.append(app.allocator, .{
-        .start_judge = .{ .task = task, .display_text = display },
-    }) catch {
-        app.allocator.free(task);
-        app.allocator.free(display);
-    };
+    queueAgentCommand(app, "judge", "Review the staged implementation", "/judge");
 }
 
 /// Handle Judge completion - either move to next task or retry Tinkerer
@@ -727,7 +726,15 @@ pub fn handleJudgeComplete(app: *App) void {
     // Check if Judge rejected (look for REJECTED: comment from judge)
     // Note: complete_task changes status to completed, so if still in_progress
     // with recent rejection, it means Judge rejected
-    if (task_store.getCurrentInProgressTask()) |task| {
+    const maybe_task = task_store.getCurrentInProgressTask() catch |err| blk: {
+        std.log.warn("Failed to get current task in Judge complete: {}", .{err});
+        break :blk null;
+    };
+    if (maybe_task) |task| {
+        defer {
+            var t = task;
+            t.deinit(app.allocator);
+        }
         // Find most recent REJECTED: comment
         var i = task.comments.len;
         while (i > 0) {
@@ -740,7 +747,8 @@ pub fn handleJudgeComplete(app: *App) void {
                     feedback = feedback[1..];
                 }
                 // Judge rejected - trigger Tinkerer to retry
-                triggerTinkererRevision(app, &task.id, feedback);
+                var task_id = task.id;
+                triggerTinkererRevision(app, &task_id, feedback);
                 return;
             } else if (std.mem.startsWith(u8, comment.content, "SUMMARY:") or
                 std.mem.startsWith(u8, comment.content, "APPROVED:"))
@@ -752,8 +760,14 @@ pub fn handleJudgeComplete(app: *App) void {
     }
 
     // Judge approved (or no current task) - check for next ready task
-    const ready_tasks = task_store.getReadyTasks() catch return;
-    defer app.allocator.free(ready_tasks);
+    // Use local arena to properly manage task memory
+    var task_arena = std.heap.ArenaAllocator.init(app.allocator);
+    defer task_arena.deinit();
+    const ready_tasks = task_store.getReadyTasksWithAllocator(task_arena.allocator()) catch |err| {
+        std.log.warn("Failed to get ready tasks in Judge complete: {}", .{err});
+        return;
+    };
+    // No individual cleanup needed - arena handles everything
 
     if (ready_tasks.len > 0) {
         // More tasks to do - questioner evaluates before tinkerer implements
@@ -805,15 +819,17 @@ pub fn handleQuestionerComplete(app: *App) void {
 /// Check if there are any tasks with blocked status
 fn hasBlockedTasks(app: *App) bool {
     const task_store = app.app_context.task_store orelse return false;
-    const counts = task_store.getTaskCounts();
+    const counts = task_store.getTaskCounts() catch return false;
     return counts.blocked > 0;
 }
 
 /// Check if there are any ready tasks (pending, no blockers, not molecules)
 fn hasReadyTasks(app: *App) bool {
-    const task_store = app.app_context.task_store orelse return false;
-    const ready = task_store.getReadyTasks() catch return false;
-    defer app.allocator.free(ready);
+    const store = app.app_context.task_store orelse return false;
+    // Use arena for automatic cleanup - no manual task.deinit needed
+    var arena = std.heap.ArenaAllocator.init(app.allocator);
+    defer arena.deinit();
+    const ready = store.getReadyTasksWithAllocator(arena.allocator()) catch return false;
     return ready.len > 0;
 }
 
@@ -828,18 +844,23 @@ fn triggerPlannerKickback(app: *App) void {
 
     // Get tasks that are actually in blocked status
     const tasks_with_blocked_comments = task_store.getTasksWithCommentPrefix("BLOCKED:") catch return;
-    defer app.allocator.free(tasks_with_blocked_comments);
+    defer {
+        for (tasks_with_blocked_comments) |*t| {
+            var task = t.*;
+            task.deinit(app.allocator);
+        }
+        app.allocator.free(tasks_with_blocked_comments);
+    }
 
     // Filter to only tasks that are actually blocked
-    var actually_blocked = std.ArrayListUnmanaged(task_store_module.Task){};
-    defer actually_blocked.deinit(app.allocator);
+    var blocked_count: usize = 0;
     for (tasks_with_blocked_comments) |task| {
         if (task.status == .blocked) {
-            actually_blocked.append(app.allocator, task) catch continue;
+            blocked_count += 1;
         }
     }
 
-    if (actually_blocked.items.len == 0) {
+    if (blocked_count == 0) {
         // No blocked tasks found - nothing to do
         return;
     }
@@ -850,7 +871,9 @@ fn triggerPlannerKickback(app: *App) void {
 
     prompt.appendSlice(app.allocator, "KICKBACK: The following tasks were blocked and need decomposition:\n\n") catch return;
 
-    for (actually_blocked.items) |task| {
+    for (tasks_with_blocked_comments) |task| {
+        if (task.status != .blocked) continue;
+
         // Find most recent BLOCKED: comment to extract reason
         var blocked_reason: []const u8 = "No reason provided";
         var i = task.comments.len;
@@ -877,7 +900,7 @@ fn triggerPlannerKickback(app: *App) void {
 
     // Create owned copies for the event
     const prompt_str = app.allocator.dupe(u8, prompt.items) catch return;
-    const display_text = std.fmt.allocPrint(app.allocator, "/planner [KICKBACK] Decomposing {d} blocked task(s)", .{actually_blocked.items.len}) catch {
+    const display_text = std.fmt.allocPrint(app.allocator, "/planner [KICKBACK] Decomposing {d} blocked task(s)", .{blocked_count}) catch {
         app.allocator.free(prompt_str);
         return;
     };
@@ -963,6 +986,7 @@ pub fn endAgentSession(app: *App) !void {
     // Clean up streaming state (agent sets streaming_active when it starts)
     app.streaming_active = false;
     app.streaming_message_idx = null;
+    app.user_scrolled_away = false; // Reset scroll state for next message
 
     // Clear any pending stream chunks from the terminated agent
     {
@@ -1001,6 +1025,7 @@ pub fn endAgentSession(app: *App) !void {
         .thinking_expanded = false,
         .timestamp = std.time.milliTimestamp(),
     });
+    message_loader.onMessageAdded(app);
     _ = try message_renderer.redrawScreen(app);
     app.updateCursorToBottom();
 }
@@ -1045,6 +1070,7 @@ pub fn processAgentToolEvents(app: *App) !void {
                         .tool_success = null,
                         .tool_execution_time = null,
                     }) catch continue;
+                    message_loader.onMessageAdded(app);
                     current_tool_idx = app.messages.items.len - 1;
                 },
                 .complete => {

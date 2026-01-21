@@ -399,6 +399,166 @@ pub fn calculateMessageHash(message: *const Message) u64 {
     return hasher.final();
 }
 
+/// Get message height, using cache if valid or calculating fresh
+/// This is the single entry point for getting message height
+pub fn getMessageHeight(app: *App, message: *Message, idx: usize) !usize {
+    _ = idx; // May be used for logging/debugging
+
+    // Check if cache is valid
+    const current_hash = calculateMessageHash(message);
+    if (message.cached_height != null and
+        message.cache_width == app.terminal_size.width and
+        message.cache_hash == current_hash)
+    {
+        return message.cached_height.?;
+    }
+
+    // Calculate fresh using buildMessageLayout
+    var layout = try buildMessageLayout(app, message);
+    defer layout.deinit(app.allocator);
+
+    // Update cache
+    message.cached_height = layout.height;
+    message.cache_width = app.terminal_size.width;
+    message.cache_hash = current_hash;
+
+    return layout.height;
+}
+
+/// Visible range of messages (start and end indices)
+pub const VisibleRange = struct {
+    start: usize, // First visible message index (inclusive)
+    end: usize, // Last visible message index (inclusive)
+};
+
+/// Rebuild the position cache for all messages
+/// Call this when cache is invalid (resize, message added, etc.)
+/// Accounts for virtualization: uses estimated heights for unloaded messages
+pub fn rebuildPositionCache(app: *App) !void {
+    const allocator = app.allocator;
+    const cache = &app.render_cache;
+    const virt = &app.virtualization;
+
+    // Clear and rebuild
+    cache.message_y_positions.clearRetainingCapacity();
+
+    var absolute_y: usize = 1; // Start at 1
+
+    // Add estimated heights for messages BEFORE loaded range
+    for (0..virt.loaded_start) |abs_idx| {
+        absolute_y += virt.getEstimatedHeight(abs_idx);
+    }
+
+    // Process loaded messages
+    for (app.messages.items, 0..) |*message, local_idx| {
+        // Skip tool JSON if hidden by config
+        if (message.role == .tool and !app.config.show_tool_json) continue;
+
+        // Skip empty system messages
+        if (message.role == .system and message.content.len == 0) continue;
+
+        // Record start position
+        try cache.message_y_positions.append(allocator, absolute_y);
+
+        // Get height (uses cache if valid)
+        const abs_idx = virt.absoluteIndex(local_idx);
+        const height = try getMessageHeight(app, message, abs_idx);
+        absolute_y += height;
+    }
+
+    // Add estimated heights for messages AFTER loaded range
+    for (virt.loaded_end..virt.total_message_count) |abs_idx| {
+        absolute_y += virt.getEstimatedHeight(abs_idx);
+    }
+
+    cache.total_content_height = absolute_y;
+    cache.cache_valid = true;
+    cache.last_message_count = app.messages.items.len;
+}
+
+/// Get the range of visible messages based on current scroll position
+/// Returns start and end indices (inclusive) of messages to render
+pub fn getVisibleMessageRange(app: *App) !VisibleRange {
+    const cache = &app.render_cache;
+
+    // Ensure cache is valid
+    if (!cache.cache_valid or cache.last_message_count != app.messages.items.len) {
+        try rebuildPositionCache(app);
+    }
+
+    const input_field_height = try calculateInputFieldHeight(app);
+    const viewport_height = if (app.terminal_size.height > input_field_height + 1)
+        app.terminal_size.height - input_field_height - 1
+    else
+        1;
+
+    const viewport_top = app.scroll_y;
+    const viewport_bottom = app.scroll_y + viewport_height;
+
+    // Find first visible message (binary search would be better for large lists)
+    var start: usize = 0;
+    var visible_msg_idx: usize = 0;
+    for (cache.message_y_positions.items, 0..) |_, idx| {
+        // Get the next position to determine message end
+        const next_y = if (idx + 1 < cache.message_y_positions.items.len)
+            cache.message_y_positions.items[idx + 1]
+        else
+            cache.total_content_height;
+
+        // Message is visible if it overlaps with viewport
+        if (next_y > viewport_top) {
+            start = visible_msg_idx;
+            break;
+        }
+        visible_msg_idx += 1;
+    }
+
+    // Find last visible message
+    var end: usize = if (cache.message_y_positions.items.len > 0)
+        cache.message_y_positions.items.len - 1
+    else
+        0;
+
+    visible_msg_idx = 0;
+    for (cache.message_y_positions.items) |y_pos| {
+        _ = y_pos; // Unused but needed for iteration
+        if (cache.message_y_positions.items[visible_msg_idx] > viewport_bottom) {
+            end = if (visible_msg_idx > 0) visible_msg_idx - 1 else 0;
+            break;
+        }
+        visible_msg_idx += 1;
+    }
+
+    return VisibleRange{
+        .start = start,
+        .end = end,
+    };
+}
+
+/// Map cursor position index to absolute message index
+/// Used by scroll handlers to determine loading target
+pub fn cursorIndexToMessageIndex(app: *App, cursor_idx: usize) usize {
+    const virt = &app.virtualization;
+
+    // cursor_idx is index into valid_cursor_positions
+    // valid_cursor_positions maps 1:1 to rendered messages (after skipping hidden ones)
+    // We need to find which absolute message index this corresponds to
+
+    var rendered_count: usize = 0;
+    for (app.messages.items, 0..) |*message, local_idx| {
+        if (message.role == .tool and !app.config.show_tool_json) continue;
+        if (message.role == .system and message.content.len == 0) continue;
+
+        if (rendered_count == cursor_idx) {
+            return virt.absoluteIndex(local_idx);
+        }
+        rendered_count += 1;
+    }
+
+    // Fallback: return last loaded message
+    return if (virt.loaded_end > 0) virt.loaded_end - 1 else 0;
+}
+
 // Recursive markdown rendering function
 pub fn renderItemsToLines(
     app: *App,
@@ -883,7 +1043,6 @@ pub fn drawMessage(
     app: *App,
     writer: anytype,
     message: *Message,
-    message_index: usize,
     absolute_y: *usize,
     input_field_height: usize,
 ) !void {
@@ -1393,7 +1552,7 @@ pub fn drawMessage(
         .y_end = absolute_y.* - 2, // -2 to exclude the spacing line
         .x_start = 1,
         .x_end = app.terminal_size.width,
-        .message = &app.messages.items[message_index],
+        .message = message,
     });
 }
 
@@ -1721,9 +1880,10 @@ pub fn calculateContentHeight(self: *App) !usize {
 // Unified dirty message redraw - handles both incremental updates and streaming
 // Falls back to fullRedraw for complex cases (height changes, scroll + content changes)
 
-/// Simplified unified rendering function
-/// Renders all messages and automatically keeps the last message visible
-/// Only clears screen on terminal resize
+/// Optimized rendering function with viewport culling
+/// Uses height caching to avoid double-computation:
+/// 1. rebuildPositionCache calculates heights once (using cached values)
+/// 2. Only visible messages are actually rendered
 fn renderMessages(self: *App, clear_screen: bool) !usize {
     self.terminal_size = try ui.Tui.getTerminalSize();
     var stdout_buffer: [8192]u8 = undefined;
@@ -1738,11 +1898,32 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
     else
         1;
 
-    const total_content_height = try calculateContentHeight(self);
-    if (total_content_height > viewport_height) {
-        self.scroll_y = total_content_height - viewport_height;
+    // Invalidate cache on resize
+    if (clear_screen) {
+        self.render_cache.invalidate();
+    }
+
+    // Rebuild position cache (uses cached heights, single pass)
+    try rebuildPositionCache(self);
+    const total_content_height = self.render_cache.total_content_height;
+
+    // Auto-scroll to bottom (only if user hasn't manually scrolled away)
+    if (!self.user_scrolled_away) {
+        if (total_content_height > viewport_height) {
+            self.scroll_y = total_content_height - viewport_height;
+        } else {
+            self.scroll_y = 0;
+        }
     } else {
-        self.scroll_y = 0;
+        // Even when manually scrolled, ensure scroll_y stays within valid bounds
+        // This prevents cursor from going below the input field when content grows
+        const max_scroll = if (total_content_height > viewport_height)
+            total_content_height - viewport_height
+        else
+            0;
+        if (self.scroll_y > max_scroll) {
+            self.scroll_y = max_scroll;
+        }
     }
 
     // Clear screen only on resize or first render
@@ -1755,10 +1936,8 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
 
     var absolute_y: usize = 1;
 
-    // Render all messages
-    for (self.messages.items, 0..) |_, i| {
-        const message = &self.messages.items[i];
-
+    // Render all messages (viewport clipping happens inside drawMessage)
+    for (self.messages.items) |*message| {
         // Skip tool JSON if hidden by config
         if (message.role == .tool and !self.config.show_tool_json) continue;
 
@@ -1766,7 +1945,7 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
         if (message.role == .system and message.content.len == 0) continue;
 
         // Draw message
-        try drawMessage(self, writer, message, i, &absolute_y, input_field_height);
+        try drawMessage(self, writer, message, &absolute_y, input_field_height);
     }
 
     // Render pending user messages (queued while streaming/agent active)
@@ -1789,8 +1968,8 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
             .timestamp = std.time.milliTimestamp(),
         };
 
-        // Draw the pending message (use messages.len as a fake index - won't be clicked)
-        try drawMessage(self, writer, &pending_msg, self.messages.items.len, &absolute_y, input_field_height);
+        // Draw the pending message
+        try drawMessage(self, writer, &pending_msg, &absolute_y, input_field_height);
     }
 
     // scroll_y was pre-calculated before drawing - no need to recalculate here
@@ -1840,6 +2019,11 @@ pub fn redrawScreen(self: *App) !usize {
     const terminal_resized =
         self.render_cache.last_terminal_width != self.terminal_size.width or
         self.render_cache.last_terminal_height != self.terminal_size.height;
+
+    // On resize, invalidate all message height caches (text reflows)
+    if (terminal_resized) {
+        self.invalidateAllMessageCaches();
+    }
 
     // Update cache metadata
     self.render_cache.last_terminal_width = self.terminal_size.width;

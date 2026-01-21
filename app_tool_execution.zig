@@ -19,6 +19,9 @@ const app_streaming = @import("app_streaming.zig");
 // Import agent module for progress callback and context
 const app_agents = @import("app_agents.zig");
 
+// Import message loader for virtualization
+const message_loader = @import("message_loader");
+
 /// Result of tool execution tick
 pub const ToolTickResult = enum {
     no_action,
@@ -68,6 +71,7 @@ pub fn showPermissionPrompt(
             .timestamp = std.time.milliTimestamp(),
         },
     });
+    message_loader.onMessageAdded(app);
 
     // Persist permission request immediately
     try app.persistMessage(app.messages.items.len - 1);
@@ -203,6 +207,7 @@ pub fn tickToolExecution(app: *App) !ToolTickResult {
                 .thinking_expanded = false,
                 .timestamp = std.time.milliTimestamp(),
             });
+            message_loader.onMessageAdded(app);
 
             // Persist error message immediately
             try app.persistMessage(app.messages.items.len - 1);
@@ -248,6 +253,7 @@ fn executeCurrentTool(app: *App, tool_call: ollama.ToolCall) !void {
         .tool_success = result.success,
         .tool_execution_time = result.metadata.execution_time_ms,
     });
+    message_loader.onMessageAdded(app);
 
     // Persist tool execution display immediately
     try app.persistMessage(app.messages.items.len - 1);
@@ -273,6 +279,7 @@ fn executeCurrentTool(app: *App, tool_call: ollama.ToolCall) !void {
         .timestamp = std.time.milliTimestamp(),
         .tool_call_id = tool_id_copy,
     });
+    message_loader.onMessageAdded(app);
 
     // Persist tool result immediately
     try app.persistMessage(app.messages.items.len - 1);
@@ -327,6 +334,7 @@ fn createDenialResult(app: *App, tool_call: ollama.ToolCall) !void {
         .tool_success = false,
         .tool_execution_time = result.metadata.execution_time_ms,
     });
+    message_loader.onMessageAdded(app);
 
     // Persist tool error display immediately
     try app.persistMessage(app.messages.items.len - 1);
@@ -352,6 +360,7 @@ fn createDenialResult(app: *App, tool_call: ollama.ToolCall) !void {
         .timestamp = std.time.milliTimestamp(),
         .tool_call_id = tool_id_copy,
     });
+    message_loader.onMessageAdded(app);
 
     // Persist tool error result immediately
     try app.persistMessage(app.messages.items.len - 1);

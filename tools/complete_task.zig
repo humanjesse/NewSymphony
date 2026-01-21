@@ -78,7 +78,6 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     // Parse arguments
     var task_id: task_store.TaskId = undefined;
     var summary: ?[]const u8 = null;
-    var was_current_task = false;
 
     if (arguments.len > 2) {
         const parsed = json.parseFromSlice(json.Value, allocator, arguments, .{}) catch null;
@@ -94,12 +93,9 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
                 }
             } else {
                 // Use current task
-                if (store.getCurrentTaskId()) |cid| {
-                    task_id = cid;
-                    was_current_task = true;
-                } else {
+                task_id = store.getCurrentTaskId() orelse {
                     return ToolResult.err(allocator, .invalid_arguments, "No current task. Specify task_id explicitly.", start_time);
-                }
+                };
             }
 
             // Get optional summary
@@ -108,29 +104,25 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
             }
         } else {
             // No args provided, use current task
-            if (store.getCurrentTaskId()) |cid| {
-                task_id = cid;
-                was_current_task = true;
-            } else {
+            task_id = store.getCurrentTaskId() orelse {
                 return ToolResult.err(allocator, .invalid_arguments, "No current task. Specify task_id explicitly.", start_time);
-            }
+            };
         }
     } else {
         // No args provided, use current task
-        if (store.getCurrentTaskId()) |cid| {
-            task_id = cid;
-            was_current_task = true;
-        } else {
+        task_id = store.getCurrentTaskId() orelse {
             return ToolResult.err(allocator, .invalid_arguments, "No current task. Specify task_id explicitly.", start_time);
-        }
+        };
     }
 
-    // Get task title before completion
-    const task = store.getTask(task_id) orelse {
+    // Get task title before completion (using arena - auto-freed when tool returns)
+    const task_alloc = if (context.task_arena) |a| a.allocator() else allocator;
+    const task = (try store.getTaskWithAllocator(task_id, task_alloc)) orelse {
         return ToolResult.err(allocator, .not_found, "Task not found", start_time);
     };
+    // No defer needed - arena handles cleanup
 
-    // Complete the task
+    // Complete the task (automatically persisted to SQLite)
     const complete_result = store.completeTask(task_id) catch |err| {
         const msg = switch (err) {
             error.TaskNotFound => "Task not found",
@@ -140,15 +132,6 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     };
     defer allocator.free(complete_result.unblocked);
 
-    // Persist to database if available
-    if (context.task_db) |db| {
-        if (store.getTask(task_id)) |t| {
-            db.saveTask(t) catch |err| {
-                std.log.warn("Failed to persist completed task to SQLite: {}", .{err});
-            };
-        }
-    }
-
     // Build unblocked IDs array
     var unblocked_ids = std.ArrayListUnmanaged([]const u8){};
     defer unblocked_ids.deinit(allocator);
@@ -156,9 +139,9 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         try unblocked_ids.append(allocator, &unblocked_id);
     }
 
-    // Auto-advance: get next ready task
-    const ready_tasks = store.getReadyTasks() catch &[_]task_store.Task{};
-    defer allocator.free(ready_tasks);
+    // Auto-advance: get next ready task (using arena - auto-freed when tool returns)
+    const ready_tasks = store.getReadyTasksWithAllocator(task_alloc) catch &[_]task_store.Task{};
+    // No defer needed - arena handles cleanup
 
     var next_task: ?NextTask = null;
     if (ready_tasks.len > 0) {

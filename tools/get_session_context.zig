@@ -102,8 +102,15 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
 
     // Build current task info
     var current_task: ?CurrentTask = null;
+    var current_task_obj: ?task_store.Task = null;
+    defer {
+        if (current_task_obj) |*ct| {
+            ct.deinit(allocator);
+        }
+    }
     if (store.getCurrentTaskId()) |cid| {
-        if (store.tasks.get(cid)) |task| {
+        if (try store.getTask(cid)) |task| {
+            current_task_obj = task;
             current_task = .{
                 .id = &task.id,
                 .title = task.title,
@@ -115,7 +122,13 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
 
     // Build ready tasks array
     const ready = store.getReadyTasks() catch &[_]task_store.Task{};
-    defer allocator.free(ready);
+    defer {
+        for (ready) |*r| {
+            var task = r.*;
+            task.deinit(allocator);
+        }
+        allocator.free(ready);
+    }
 
     var ready_tasks = std.ArrayListUnmanaged(ReadyTask){};
     defer ready_tasks.deinit(allocator);
@@ -128,19 +141,18 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         });
     }
 
-    // Build recently completed array
-    var completed_tasks_raw = std.ArrayListUnmanaged(task_store.Task){};
-    defer completed_tasks_raw.deinit(allocator);
-
-    var iter = store.tasks.valueIterator();
-    while (iter.next()) |task| {
-        if (task.status == .completed and task.completed_at != null) {
-            try completed_tasks_raw.append(allocator, task.*);
+    // Build recently completed array from SQLite
+    const completed_tasks_raw = try store.db.getTasksByStatus(.completed);
+    defer {
+        for (completed_tasks_raw) |*t| {
+            var task = t.*;
+            task.deinit(allocator);
         }
+        allocator.free(completed_tasks_raw);
     }
 
     // Sort by completion time (most recent first)
-    std.mem.sort(task_store.Task, completed_tasks_raw.items, {}, struct {
+    std.mem.sort(task_store.Task, completed_tasks_raw, {}, struct {
         fn cmp(_: void, a: task_store.Task, b: task_store.Task) bool {
             return (a.completed_at orelse 0) > (b.completed_at orelse 0);
         }
@@ -149,8 +161,8 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     var recently_completed = std.ArrayListUnmanaged(CompletedTask){};
     defer recently_completed.deinit(allocator);
 
-    const show_count = @min(depth, completed_tasks_raw.items.len);
-    for (completed_tasks_raw.items[0..show_count]) |task| {
+    const show_count = @min(depth, completed_tasks_raw.len);
+    for (completed_tasks_raw[0..show_count]) |task| {
         try recently_completed.append(allocator, .{
             .id = &task.id,
             .title = task.title,
@@ -159,7 +171,7 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     }
 
     // Counts
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
 
     // Session notes from git_sync if available
     var session_notes: ?[]const u8 = null;

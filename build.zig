@@ -37,11 +37,15 @@ pub fn build(b: *std.Build) void {
     task_db_module.addImport("sqlite", sqlite_module);
     task_db_module.addImport("task_store", task_store_module);
 
+    // Add task_db to task_store (facade pattern - store delegates to db)
+    task_store_module.addImport("task_db", task_db_module);
+
     // Git sync module for task persistence
     const git_sync_module = b.createModule(.{
         .root_source_file = b.path("git_sync.zig"),
     });
     git_sync_module.addImport("task_store", task_store_module);
+    git_sync_module.addImport("task_db", task_db_module);
     // Note: html_utils will be added after it's created
 
     // Git utilities module (commit tracking for Tinkerer/Judge workflow)
@@ -402,6 +406,17 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("task_db", task_db_module);
     app_module.addImport("git_sync", git_sync_module);
 
+    // Message loader module (Phase 3: Virtualization)
+    // Note: Defined early so it can be added to app_module and other modules
+    const message_loader_module = b.createModule(.{
+        .root_source_file = b.path("message_loader.zig"),
+    });
+    message_loader_module.addImport("types", types_module);
+    message_loader_module.addImport("markdown", markdown_module);
+    message_loader_module.addImport("conversation_db", conversation_db_module);
+    message_loader_module.addImport("app", app_module);
+    message_loader_module.addImport("message_renderer", message_renderer_module);
+
     // Extracted app modules (Phase 1-4 of app.zig refactoring)
     const app_streaming_module = b.createModule(.{
         .root_source_file = b.path("app_streaming.zig"),
@@ -412,6 +427,7 @@ pub fn build(b: *std.Build) void {
     app_streaming_module.addImport("markdown", markdown_module);
     app_streaming_module.addImport("types", types_module);
     app_streaming_module.addImport("message_renderer", message_renderer_module);
+    app_streaming_module.addImport("message_loader", message_loader_module);
 
     const app_agents_module = b.createModule(.{
         .root_source_file = b.path("app_agents.zig"),
@@ -421,6 +437,7 @@ pub fn build(b: *std.Build) void {
     app_agents_module.addImport("markdown", markdown_module);
     app_agents_module.addImport("tools", tools_module);
     app_agents_module.addImport("message_renderer", message_renderer_module);
+    app_agents_module.addImport("message_loader", message_loader_module);
     app_agents_module.addImport("context", context_module);
     app_agents_module.addImport("agents", agents_module);
     app_agents_module.addImport("agent_executor", agent_executor_module);
@@ -455,6 +472,7 @@ pub fn build(b: *std.Build) void {
     app_tool_execution_module.addImport("permission", permission_module);
     app_tool_execution_module.addImport("tools", tools_module);
     app_tool_execution_module.addImport("message_renderer", message_renderer_module);
+    app_tool_execution_module.addImport("message_loader", message_loader_module);
     app_tool_execution_module.addImport("tool_executor", tool_executor_module);
     app_tool_execution_module.addImport("agents", agents_module);
     app_tool_execution_module.addImport("types", types_module);
@@ -466,6 +484,7 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("app_agents", app_agents_module);
     app_module.addImport("modal_dispatcher", modal_dispatcher_module);
     app_module.addImport("app_tool_execution", app_tool_execution_module);
+    app_module.addImport("message_loader", message_loader_module);
 
     // Now add app and types to agents and agent modules (circular dependency is OK with modules)
     agents_module.addImport("app", app_module);
@@ -485,6 +504,8 @@ pub fn build(b: *std.Build) void {
     ui_module.addImport("profile_commands", profile_commands_module);
     ui_module.addImport("profile_ui_state", profile_ui_state_module);
     ui_module.addImport("profile_manager", profile_manager_module);
+    ui_module.addImport("message_loader", message_loader_module);
+    ui_module.addImport("message_renderer", message_renderer_module);
 
     // Main executable imports
     exe.root_module.addImport("ui", ui_module);
@@ -513,4 +534,70 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);
+
+    // ============================================================
+    // Test Configuration
+    // ============================================================
+
+    // Unit tests for task_db (SQLite persistence layer)
+    const task_db_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_task_db.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    task_db_tests.root_module.addImport("sqlite", sqlite_module);
+    task_db_tests.root_module.addImport("task_store", task_store_module);
+    task_db_tests.root_module.addImport("task_db", task_db_module);
+    task_db_tests.linkSystemLibrary("c");
+    task_db_tests.linkSystemLibrary("sqlite3");
+
+    const run_task_db_tests = b.addRunArtifact(task_db_tests);
+    const test_task_db_step = b.step("test-task-db", "Run task_db unit tests");
+    test_task_db_step.dependOn(&run_task_db_tests.step);
+
+    // Unit tests for task_store (facade over SQLite)
+    const task_store_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_task_store.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    task_store_tests.root_module.addImport("sqlite", sqlite_module);
+    task_store_tests.root_module.addImport("task_store", task_store_module);
+    task_store_tests.root_module.addImport("task_db", task_db_module);
+    task_store_tests.linkSystemLibrary("c");
+    task_store_tests.linkSystemLibrary("sqlite3");
+
+    const run_task_store_tests = b.addRunArtifact(task_store_tests);
+    const test_task_store_step = b.step("test-task-store", "Run task_store unit tests");
+    test_task_store_step.dependOn(&run_task_store_tests.step);
+
+    // Integration tests (cross-component functionality)
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    integration_tests.root_module.addImport("sqlite", sqlite_module);
+    integration_tests.root_module.addImport("task_store", task_store_module);
+    integration_tests.root_module.addImport("task_db", task_db_module);
+    integration_tests.root_module.addImport("git_sync", git_sync_module);
+    integration_tests.root_module.addImport("html_utils", html_utils_module);
+    integration_tests.linkSystemLibrary("c");
+    integration_tests.linkSystemLibrary("sqlite3");
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const test_integration_step = b.step("test-integration", "Run integration tests");
+    test_integration_step.dependOn(&run_integration_tests.step);
+
+    // Combined test step: runs all tests
+    const test_step = b.step("test", "Run all unit tests");
+    test_step.dependOn(&run_task_db_tests.step);
+    test_step.dependOn(&run_task_store_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
 }

@@ -115,14 +115,21 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     };
 
     // Build task counts
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
     const total = counts.pending + counts.in_progress + counts.completed + counts.blocked;
 
     // Build current task
     var current_task: ?CurrentTask = null;
     var current_task_id_buf: [8]u8 = undefined;
+    var current_task_obj: ?task_store.Task = null;
+    defer {
+        if (current_task_obj) |*ct| {
+            ct.deinit(allocator);
+        }
+    }
     if (store.getCurrentTaskId()) |cid| {
-        if (store.tasks.get(cid)) |task| {
+        if (try store.getTask(cid)) |task| {
+            current_task_obj = task;
             @memcpy(&current_task_id_buf, &task.id);
             current_task = .{
                 .id = &current_task_id_buf,
@@ -188,31 +195,30 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         });
     }
 
-    // Build recently completed tasks
-    var completed_tasks = std.ArrayListUnmanaged(task_store.Task){};
-    defer completed_tasks.deinit(allocator);
-
-    var iter = store.tasks.valueIterator();
-    while (iter.next()) |task| {
-        if (task.status == .completed and task.completed_at != null) {
-            try completed_tasks.append(allocator, task.*);
+    // Build recently completed tasks from SQLite
+    const completed_tasks = try store.db.getTasksByStatus(.completed);
+    defer {
+        for (completed_tasks) |*ct| {
+            var task = ct.*;
+            task.deinit(allocator);
         }
+        allocator.free(completed_tasks);
     }
 
-    std.mem.sort(task_store.Task, completed_tasks.items, {}, struct {
+    std.mem.sort(task_store.Task, completed_tasks, {}, struct {
         fn cmp(_: void, a: task_store.Task, b: task_store.Task) bool {
             return (a.completed_at orelse 0) > (b.completed_at orelse 0);
         }
     }.cmp);
 
-    const show_count = @min(include_recent, completed_tasks.items.len);
+    const show_count = @min(include_recent, completed_tasks.len);
     var recently_completed_list = std.ArrayListUnmanaged(CompletedTask){};
     defer recently_completed_list.deinit(allocator);
 
     var completed_id_bufs = try allocator.alloc([8]u8, show_count);
     defer allocator.free(completed_id_bufs);
 
-    for (completed_tasks.items[0..show_count], 0..) |task, i| {
+    for (completed_tasks[0..show_count], 0..) |task, i| {
         @memcpy(&completed_id_bufs[i], &task.id);
         try recently_completed_list.append(allocator, .{
             .id = &completed_id_bufs[i],
@@ -221,30 +227,28 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         });
     }
 
-    // Build in-progress tasks
+    // Build in-progress tasks from SQLite
+    const in_progress_tasks = try store.db.getTasksByStatus(.in_progress);
+    defer {
+        for (in_progress_tasks) |*ipt| {
+            var task = ipt.*;
+            task.deinit(allocator);
+        }
+        allocator.free(in_progress_tasks);
+    }
+
     var in_progress_list = std.ArrayListUnmanaged(InProgressTask){};
     defer in_progress_list.deinit(allocator);
 
-    var in_progress_count: usize = 0;
-    var iter2 = store.tasks.valueIterator();
-    while (iter2.next()) |task| {
-        if (task.status == .in_progress) in_progress_count += 1;
-    }
-
-    var in_progress_id_bufs = try allocator.alloc([8]u8, in_progress_count);
+    var in_progress_id_bufs = try allocator.alloc([8]u8, in_progress_tasks.len);
     defer allocator.free(in_progress_id_bufs);
 
-    var ip_idx: usize = 0;
-    var iter3 = store.tasks.valueIterator();
-    while (iter3.next()) |task| {
-        if (task.status == .in_progress) {
-            @memcpy(&in_progress_id_bufs[ip_idx], &task.id);
-            try in_progress_list.append(allocator, .{
-                .id = &in_progress_id_bufs[ip_idx],
-                .title = task.title,
-            });
-            ip_idx += 1;
-        }
+    for (in_progress_tasks, 0..) |task, i| {
+        @memcpy(&in_progress_id_bufs[i], &task.id);
+        try in_progress_list.append(allocator, .{
+            .id = &in_progress_id_bufs[i],
+            .title = task.title,
+        });
     }
 
     // Session metadata

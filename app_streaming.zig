@@ -5,6 +5,7 @@ const ollama = @import("ollama");
 const markdown = @import("markdown");
 const llm_provider_module = @import("llm_provider");
 const message_renderer = @import("message_renderer");
+const message_loader = @import("message_loader");
 const types = @import("types");
 
 // Forward declare App type to avoid circular dependency
@@ -239,10 +240,15 @@ pub fn startStreaming(app: *App, format: ?[]const u8) !void {
         .thinking_expanded = true,
         .timestamp = std.time.milliTimestamp(),
     });
+    message_loader.onMessageAdded(app);
 
     // Redraw to show empty placeholder (receipt printer mode)
     _ = try message_renderer.redrawScreen(app);
     app.updateCursorToBottom();
+
+    // Set streaming protection for the new message (Phase 3: Virtualization)
+    const streaming_idx = app.messages.items.len - 1;
+    message_loader.setStreamingProtection(app, streaming_idx);
 
     // Prepare thread context
     const messages_slice = try ollama_messages.toOwnedSlice(app.allocator);
@@ -289,20 +295,27 @@ pub fn processStreamChunks(
         if (chunk.done) {
             // Streaming complete - clean up
             app.streaming_active = false;
+            app.user_scrolled_away = false; // Reset scroll state for next message
             result.streaming_complete = true;
 
             thinking_accumulator.clearRetainingCapacity();
             content_accumulator.clearRetainingCapacity();
 
             // Auto-collapse thinking box when streaming finishes
-            // Use streaming_message_idx if set (for agent streaming with tool calls)
-            const collapse_idx = app.streaming_message_idx orelse (if (app.messages.items.len > 0) app.messages.items.len - 1 else null);
-            if (collapse_idx) |idx| {
-                app.messages.items[idx].thinking_expanded = false;
+            // Convert absolute index to local before accessing array
+            if (app.streaming_message_idx) |abs_idx| {
+                if (app.virtualization.localIndex(abs_idx)) |local_idx| {
+                    app.messages.items[local_idx].thinking_expanded = false;
+                }
+            } else if (app.messages.items.len > 0) {
+                app.messages.items[app.messages.items.len - 1].thinking_expanded = false;
             }
 
             // Clear the streaming message index
             app.streaming_message_idx = null;
+
+            // Clear streaming protection (Phase 3: Virtualization)
+            message_loader.clearStreamingProtection(app);
 
             // Wait for thread to finish and clean up context
             if (app.stream_thread) |thread| {
@@ -338,6 +351,7 @@ pub fn processStreamChunks(
                         .thinking_expanded = false,
                         .timestamp = std.time.milliTimestamp(),
                     });
+                    message_loader.onMessageAdded(app);
 
                     // Persist streaming error immediately
                     try app.persistMessage(app.messages.items.len - 1);
@@ -397,8 +411,17 @@ pub fn processStreamChunks(
             }
 
             // Update the target message (use streaming_message_idx if set, for agents with tool calls)
-            const target_idx = app.streaming_message_idx orelse (if (app.messages.items.len > 0) app.messages.items.len - 1 else null);
-            if (target_idx) |msg_idx| {
+            // Convert absolute streaming index to local array index
+            const local_target_idx: ?usize = blk: {
+                if (app.streaming_message_idx) |abs_idx| {
+                    break :blk app.virtualization.localIndex(abs_idx);
+                }
+                if (app.messages.items.len > 0) {
+                    break :blk app.messages.items.len - 1;
+                }
+                break :blk null;
+            };
+            if (local_target_idx) |msg_idx| {
                 var last_message = &app.messages.items[msg_idx];
 
                 // Update thinking content if we have any

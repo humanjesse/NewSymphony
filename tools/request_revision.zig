@@ -104,7 +104,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     };
 
     // Get rejection count from comments
-    const rejection_count = task_store.countCommentsWithPrefix(task_id, agent_name, "REJECTED:");
+    const rejection_count = try task_store.countCommentsWithPrefix(task_id, agent_name, "REJECTED:");
 
     // Response struct for JSON serialization
     const Response = struct {

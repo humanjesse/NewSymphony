@@ -7,6 +7,8 @@ const types_module = @import("types");
 const tree = @import("tree");
 const markdown = @import("markdown");
 const config_editor_state = @import("config_editor_state");
+const message_renderer = @import("message_renderer");
+const message_loader = @import("message_loader");
 
 // --- START: Merged from c_api.zig ---
 pub const c = @cImport({
@@ -464,6 +466,7 @@ pub fn handleInput(
                             .thinking_expanded = false,
                             .timestamp = std.time.milliTimestamp(),
                         });
+                        message_loader.onMessageAdded(app);
 
                         return false;
                     }
@@ -678,14 +681,17 @@ pub fn handleInput(
                     // Move cursor up by scroll_lines positions
                     if (cursor_idx > 0) {
                         const scroll_amount = @min(app.config.scroll_lines, cursor_idx);
-                        app.cursor_y = app.valid_cursor_positions.items[cursor_idx - scroll_amount];
+                        const new_cursor_idx = cursor_idx - scroll_amount;
+                        app.cursor_y = app.valid_cursor_positions.items[new_cursor_idx];
                         // Removed dirty state tracking - rendering now automatic
                         should_redraw.* = true;
 
+                        // Trigger message loading around new cursor position
+                        const target_idx = message_renderer.cursorIndexToMessageIndex(app, new_cursor_idx);
+                        message_loader.ensureMessagesLoaded(app, target_idx) catch {};
+
                         // Mark that user manually scrolled away (disables auto-scroll during streaming)
-                        if (app.streaming_active) {
-                            // Removed user_scrolled_away tracking
-                        }
+                        app.user_scrolled_away = true;
                     }
                 } else if (app.valid_cursor_positions.items.len > 0) {
                     // Cursor not in valid positions - snap to nearest and scroll up
@@ -694,9 +700,7 @@ pub fn handleInput(
                     should_redraw.* = true;
 
                     // Mark that user manually scrolled away (disables auto-scroll during streaming)
-                    if (app.streaming_active) {
-                        // Removed user_scrolled_away tracking
-                    }
+                    app.user_scrolled_away = true;
                 }
                 return false;
             } else if (button == 65) { // Scroll down
@@ -705,9 +709,20 @@ pub fn handleInput(
                     const max_idx = app.valid_cursor_positions.items.len - 1;
                     if (cursor_idx < max_idx) {
                         const scroll_amount = @min(app.config.scroll_lines, max_idx - cursor_idx);
-                        app.cursor_y = app.valid_cursor_positions.items[cursor_idx + scroll_amount];
+                        const new_cursor_idx = cursor_idx + scroll_amount;
+                        app.cursor_y = app.valid_cursor_positions.items[new_cursor_idx];
                         // Removed dirty state tracking - rendering now automatic
                         should_redraw.* = true;
+
+                        // Trigger message loading around new cursor position
+                        const target_idx = message_renderer.cursorIndexToMessageIndex(app, new_cursor_idx);
+                        message_loader.ensureMessagesLoaded(app, target_idx) catch {};
+
+                        // Re-enable auto-scroll if near the bottom (within 3 lines)
+                        // This allows users to resume auto-scroll by scrolling back down
+                        if (max_idx - new_cursor_idx <= 3) {
+                            app.user_scrolled_away = false;
+                        }
                     }
                 } else if (app.valid_cursor_positions.items.len > 0) {
                     // Cursor not in valid positions - snap to nearest and scroll down

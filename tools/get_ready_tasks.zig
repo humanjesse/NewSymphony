@@ -58,11 +58,12 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         return ToolResult.err(allocator, .internal_error, "Task store not initialized", start_time);
     };
 
-    // Get ready tasks (sorted by priority)
-    const ready_tasks = store.getReadyTasks() catch {
+    // Get ready tasks using arena allocator (auto-freed when tool returns)
+    const task_alloc = if (context.task_arena) |a| a.allocator() else allocator;
+    const ready_tasks = store.getReadyTasksWithAllocator(task_alloc) catch {
         return ToolResult.err(allocator, .internal_error, "Failed to get ready tasks", start_time);
     };
-    defer allocator.free(ready_tasks);
+    // No defer needed - arena handles cleanup
 
     // Build ready tasks array
     var ready_array = std.ArrayListUnmanaged(ReadyTask){};
@@ -77,7 +78,7 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         });
     }
 
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
 
     const response = Response{
         .ready = ready_array.items,

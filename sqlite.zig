@@ -60,7 +60,7 @@ extern "c" fn sqlite3_step(stmt: *Stmt) c_int;
 extern "c" fn sqlite3_finalize(stmt: *Stmt) c_int;
 extern "c" fn sqlite3_reset(stmt: *Stmt) c_int;
 extern "c" fn sqlite3_bind_int64(stmt: *Stmt, index: c_int, value: i64) c_int;
-extern "c" fn sqlite3_bind_text(stmt: *Stmt, index: c_int, value: [*:0]const u8, n: c_int, destructor: ?*const fn () callconv(.c) void) c_int;
+extern "c" fn sqlite3_bind_text(stmt: *Stmt, index: c_int, value: [*]const u8, n: c_int, destructor: ?*const fn () callconv(.c) void) c_int;
 extern "c" fn sqlite3_bind_null(stmt: *Stmt, index: c_int) c_int;
 extern "c" fn sqlite3_column_int64(stmt: *Stmt, iCol: c_int) i64;
 extern "c" fn sqlite3_column_text(stmt: *Stmt, iCol: c_int) [*:0]const u8;
@@ -98,7 +98,7 @@ pub fn exec(db: *Db, sql: []const u8) !void {
     const rc = sqlite3_exec(db, sql_z.ptr, null, null, null);
     if (rc != SQLITE_OK) {
         const err = sqlite3_errmsg(db);
-        std.debug.print("SQLite error: {s}\n", .{err});
+        std.log.err("SQLite exec failed: {s}", .{err});
         return error.SqliteExecFailed;
     }
 }
@@ -111,7 +111,7 @@ pub fn prepare(db: *Db, sql: []const u8) !*Stmt {
     const rc = sqlite3_prepare_v2(db, sql_z.ptr, -1, &stmt, null);
     if (rc != SQLITE_OK) {
         const err = sqlite3_errmsg(db);
-        std.debug.print("SQLite prepare error: {s}\n", .{err});
+        std.log.err("SQLite prepare failed: {s}", .{err});
         return error.SqlitePrepareFailed;
     }
     return stmt;
@@ -144,10 +144,7 @@ pub fn bindInt64(stmt: *Stmt, index: c_int, value: i64) !void {
 }
 
 pub fn bindText(stmt: *Stmt, index: c_int, value: []const u8) !void {
-    const value_z = try std.heap.page_allocator.dupeZ(u8, value);
-    // Note: Using TRANSIENT so SQLite makes its own copy
-    const rc = sqlite3_bind_text(stmt, index, value_z.ptr, @intCast(value.len), SQLITE_TRANSIENT);
-    std.heap.page_allocator.free(value_z);
+    const rc = sqlite3_bind_text(stmt, index, value.ptr, @intCast(value.len), SQLITE_TRANSIENT);
     if (rc != SQLITE_OK) {
         return error.SqliteBindFailed;
     }

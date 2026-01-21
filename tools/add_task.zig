@@ -154,20 +154,10 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
             error.SourceTaskNotFound => "Blocking task not found",
             error.DestTaskNotFound => "Target task not found",
             error.SelfDependency => "Cannot create self-dependency",
-            error.CircularDependency => "Would create circular dependency",
             else => "Failed to create task",
         };
         return ToolResult.err(allocator, .internal_error, msg, start_time);
     };
-
-    // Persist to database if available
-    if (context.task_db) |db| {
-        if (store.getTask(task_id)) |task| {
-            db.saveTask(task) catch |err| {
-                std.log.warn("Failed to persist task to SQLite: {}", .{err});
-            };
-        }
-    }
 
     // Return JSON result
     const result_msg = try std.fmt.allocPrint(allocator, "{{\"task_id\": \"{s}\", \"status\": \"pending\", \"priority\": {d}}}", .{

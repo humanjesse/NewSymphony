@@ -5,13 +5,44 @@ const mem = std.mem;
 const fs = std.fs;
 const Allocator = mem.Allocator;
 const task_store_module = @import("task_store");
+const task_db_module = @import("task_db");
 const TaskStore = task_store_module.TaskStore;
+const TaskDB = task_db_module.TaskDB;
 const Task = task_store_module.Task;
 const TaskId = task_store_module.TaskId;
 const TaskStatus = task_store_module.TaskStatus;
 const Dependency = task_store_module.Dependency;
 const Comment = task_store_module.Comment;
 const html_utils = @import("html_utils");
+
+// JSON schema structs for JSONL import/export
+const CommentJson = struct {
+    agent: []const u8,
+    content: []const u8,
+    timestamp: i64,
+};
+
+const TaskJson = struct {
+    id: []const u8,
+    title: []const u8,
+    description: ?[]const u8 = null,
+    status: []const u8,
+    priority: u8,
+    type: []const u8,
+    labels: ?[]const []const u8 = null,
+    created_at: i64,
+    updated_at: i64,
+    completed_at: ?i64 = null,
+    parent_id: ?[]const u8 = null,
+    comments: ?[]const CommentJson = null,
+};
+
+const DepJson = struct {
+    src: []const u8,
+    dst: []const u8,
+    type: []const u8,
+    weight: ?f32 = null,
+};
 
 /// Session state summary for cold start
 pub const SessionState = struct {
@@ -90,13 +121,21 @@ pub const GitSync = struct {
         var content = std.ArrayListUnmanaged(u8){};
         defer content.deinit(self.allocator);
 
-        // Iterate all tasks and write as JSONL
-        var iter = store.tasks.valueIterator();
-        while (iter.next()) |task| {
+        // Get all tasks from SQLite via TaskStore's db
+        const all_tasks = try store.db.loadAllTasks();
+        defer {
+            for (all_tasks) |*t| {
+                var task = t.*;
+                task.deinit(self.allocator);
+            }
+            self.allocator.free(all_tasks);
+        }
+
+        for (all_tasks) |task| {
             // Skip wisps - they're ephemeral
             if (task.task_type == .wisp) continue;
 
-            try self.writeTaskJson(&content, task.*);
+            try self.writeTaskJson(&content, task);
             try content.append(self.allocator, '\n');
         }
 
@@ -117,7 +156,11 @@ pub const GitSync = struct {
         var content = std.ArrayListUnmanaged(u8){};
         defer content.deinit(self.allocator);
 
-        for (store.dependencies.items) |dep| {
+        // Get all dependencies from SQLite via TaskStore's db
+        const all_deps = try store.db.loadAllDependencies();
+        defer self.allocator.free(all_deps);
+
+        for (all_deps) |dep| {
             try content.writer(self.allocator).print("{{\"src\":\"{s}\",\"dst\":\"{s}\",\"type\":\"{s}\",\"weight\":{d}}}\n", .{
                 &dep.src_id,
                 &dep.dst_id,
@@ -203,8 +246,8 @@ pub const GitSync = struct {
         try writer.writeByte('}');
     }
 
-    /// Import tasks from JSONL files
-    pub fn importTasks(self: *Self, store: *TaskStore) !usize {
+    /// Import tasks from JSONL files to TaskDB (for fresh clone scenario)
+    pub fn importTasks(self: *Self, db: *TaskDB) !usize {
         var imported: usize = 0;
 
         // Import tasks
@@ -213,7 +256,7 @@ pub const GitSync = struct {
 
         if (fs.cwd().openFile(tasks_path, .{})) |file| {
             defer file.close();
-            imported += try self.importTasksFromFile(file, store);
+            imported += try self.importTasksFromFile(file, db);
         } else |_| {
             // File doesn't exist, that's fine
         }
@@ -224,7 +267,7 @@ pub const GitSync = struct {
 
         if (fs.cwd().openFile(deps_path, .{})) |file| {
             defer file.close();
-            try self.importDependenciesFromFile(file, store);
+            try self.importDependenciesFromFile(file, db);
         } else |_| {
             // File doesn't exist, that's fine
         }
@@ -232,8 +275,8 @@ pub const GitSync = struct {
         return imported;
     }
 
-    /// Import tasks from a JSONL file
-    fn importTasksFromFile(self: *Self, file: fs.File, store: *TaskStore) !usize {
+    /// Import tasks from a JSONL file directly to TaskDB
+    fn importTasksFromFile(self: *Self, file: fs.File, db: *TaskDB) !usize {
         var imported: usize = 0;
         var buf: [16384]u8 = undefined;
         var line_buf = std.ArrayListUnmanaged(u8){};
@@ -246,7 +289,7 @@ pub const GitSync = struct {
             for (buf[0..bytes_read]) |c| {
                 if (c == '\n') {
                     if (line_buf.items.len > 0) {
-                        if (try self.parseAndAddTask(line_buf.items, store)) {
+                        if (try self.parseAndSaveTask(line_buf.items, db)) {
                             imported += 1;
                         }
                         line_buf.clearRetainingCapacity();
@@ -259,7 +302,7 @@ pub const GitSync = struct {
 
         // Handle last line without newline
         if (line_buf.items.len > 0) {
-            if (try self.parseAndAddTask(line_buf.items, store)) {
+            if (try self.parseAndSaveTask(line_buf.items, db)) {
                 imported += 1;
             }
         }
@@ -267,29 +310,8 @@ pub const GitSync = struct {
         return imported;
     }
 
-    /// Parse a JSON line and add task to store
-    fn parseAndAddTask(self: *Self, json_line: []const u8, store: *TaskStore) !bool {
-        const CommentJson = struct {
-            agent: []const u8,
-            content: []const u8,
-            timestamp: i64,
-        };
-
-        const TaskJson = struct {
-            id: []const u8,
-            title: []const u8,
-            description: ?[]const u8 = null,
-            status: []const u8,
-            priority: u8,
-            type: []const u8,
-            labels: ?[]const []const u8 = null,
-            created_at: i64,
-            updated_at: i64,
-            completed_at: ?i64 = null,
-            parent_id: ?[]const u8 = null,
-            comments: ?[]const CommentJson = null,
-        };
-
+    /// Parse a JSON line and save task directly to TaskDB
+    fn parseAndSaveTask(self: *Self, json_line: []const u8, db: *TaskDB) !bool {
         const parsed = std.json.parseFromSlice(TaskJson, self.allocator, json_line, .{
             .ignore_unknown_fields = true,
         }) catch return false;
@@ -303,7 +325,7 @@ pub const GitSync = struct {
         @memcpy(&id, data.id[0..8]);
 
         // Check for collision
-        if (store.tasks.contains(id)) return false;
+        if (try db.taskExists(id)) return false;
 
         // Clone strings
         const title = try self.allocator.dupe(u8, data.title);
@@ -362,7 +384,7 @@ pub const GitSync = struct {
             }
         }
 
-        const task = Task{
+        var task = Task{
             .id = id,
             .title = title,
             .description = description,
@@ -375,15 +397,20 @@ pub const GitSync = struct {
             .completed_at = data.completed_at,
             .parent_id = parent_id,
             .comments = comments,
-            .blocked_by_count = 0, // Will be computed when loading dependencies
+            .blocked_by_count = 0, // Will be computed via SQL
         };
 
-        try store.tasks.put(id, task);
+        // Save to SQLite
+        try db.saveTask(&task);
+
+        // Free the task memory since SQLite owns the data now
+        task.deinit(self.allocator);
+
         return true;
     }
 
-    /// Import dependencies from file
-    fn importDependenciesFromFile(self: *Self, file: fs.File, store: *TaskStore) !void {
+    /// Import dependencies from file directly to TaskDB
+    fn importDependenciesFromFile(self: *Self, file: fs.File, db: *TaskDB) !void {
         var buf: [4096]u8 = undefined;
         var line_buf = std.ArrayListUnmanaged(u8){};
         defer line_buf.deinit(self.allocator);
@@ -395,7 +422,7 @@ pub const GitSync = struct {
             for (buf[0..bytes_read]) |c| {
                 if (c == '\n') {
                     if (line_buf.items.len > 0) {
-                        try self.parseAndAddDependency(line_buf.items, store);
+                        try self.parseAndSaveDependency(line_buf.items, db);
                         line_buf.clearRetainingCapacity();
                     }
                 } else {
@@ -406,19 +433,12 @@ pub const GitSync = struct {
 
         // Handle last line
         if (line_buf.items.len > 0) {
-            try self.parseAndAddDependency(line_buf.items, store);
+            try self.parseAndSaveDependency(line_buf.items, db);
         }
     }
 
-    /// Parse and add a dependency
-    fn parseAndAddDependency(self: *Self, json_line: []const u8, store: *TaskStore) !void {
-        const DepJson = struct {
-            src: []const u8,
-            dst: []const u8,
-            type: []const u8,
-            weight: ?f32 = null,
-        };
-
+    /// Parse and save a dependency directly to TaskDB
+    fn parseAndSaveDependency(self: *Self, json_line: []const u8, db: *TaskDB) !void {
         const parsed = std.json.parseFromSlice(DepJson, self.allocator, json_line, .{
             .ignore_unknown_fields = true,
         }) catch return;
@@ -435,10 +455,15 @@ pub const GitSync = struct {
 
         const dep_type = task_store_module.DependencyType.fromString(data.type) orelse return;
 
-        // Use addDependency to properly update blocked_by_count
-        store.addDependency(src_id, dst_id, dep_type) catch {
-            // Dependency might already exist or tasks might not exist
+        const dep = Dependency{
+            .src_id = src_id,
+            .dst_id = dst_id,
+            .dep_type = dep_type,
+            .weight = data.weight orelse 1.0,
         };
+
+        // Save directly to SQLite (ignore errors for duplicates)
+        db.saveDependency(&dep) catch {};
     }
 
     /// Generate SESSION_STATE.md for cold start
@@ -460,7 +485,11 @@ pub const GitSync = struct {
         // Current Task section
         try writer.writeAll("## Current Task\n");
         if (store.current_task_id) |cid| {
-            if (store.tasks.get(cid)) |task| {
+            if (try store.getTask(cid)) |task| {
+                defer {
+                    var t = task;
+                    t.deinit(self.allocator);
+                }
                 try writer.print("ID: {s}\n", .{&task.id});
                 try writer.print("Title: {s}\n", .{task.title});
                 try writer.print("Status: {s}\n", .{task.status.toString()});
@@ -481,7 +510,13 @@ pub const GitSync = struct {
 
         // Ready Queue section
         const ready = try store.getReadyTasks();
-        defer self.allocator.free(ready);
+        defer {
+            for (ready) |*r| {
+                var task = r.*;
+                task.deinit(self.allocator);
+            }
+            self.allocator.free(ready);
+        }
 
         try writer.print("## Ready Queue ({d})\n", .{ready.len});
         for (ready) |task| {
@@ -497,48 +532,61 @@ pub const GitSync = struct {
         try writer.writeByte('\n');
 
         // Blocked section
-        const counts = store.getTaskCounts();
+        const counts = try store.getTaskCounts();
         try writer.print("## Blocked ({d})\n", .{counts.blocked});
 
-        var blocked_iter = store.tasks.valueIterator();
-        while (blocked_iter.next()) |task| {
-            if (task.status == .blocked) {
-                try writer.print("- {s}: {s}", .{ &task.id, task.title });
-
-                // Find what's blocking it
-                var blockers = std.ArrayListUnmanaged([]const u8){};
-                defer blockers.deinit(self.allocator);
-
-                for (store.dependencies.items) |dep| {
-                    if (mem.eql(u8, &dep.dst_id, &task.id) and dep.dep_type.isBlocking()) {
-                        try blockers.append(self.allocator, &dep.src_id);
-                    }
-                }
-
-                if (blockers.items.len > 0) {
-                    try writer.writeAll(" (blocked by: ");
-                    for (blockers.items, 0..) |blocker_id, i| {
-                        if (i > 0) try writer.writeAll(", ");
-                        try writer.writeAll(blocker_id);
-                    }
-                    try writer.writeByte(')');
-                }
-                try writer.writeByte('\n');
+        const blocked_tasks = try store.db.getTasksByStatus(.blocked);
+        defer {
+            for (blocked_tasks) |*bt| {
+                var task = bt.*;
+                task.deinit(self.allocator);
             }
+            self.allocator.free(blocked_tasks);
+        }
+
+        for (blocked_tasks) |task| {
+            try writer.print("- {s}: {s}", .{ &task.id, task.title });
+
+            // Find what's blocking it
+            const blockers = try store.db.getBlockedBy(task.id);
+            defer {
+                for (blockers) |*b| {
+                    var blocker = b.*;
+                    blocker.deinit(self.allocator);
+                }
+                self.allocator.free(blockers);
+            }
+
+            if (blockers.len > 0) {
+                try writer.writeAll(" (blocked by: ");
+                for (blockers, 0..) |blocker, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.writeAll(&blocker.id);
+                }
+                try writer.writeByte(')');
+            }
+            try writer.writeByte('\n');
         }
         try writer.writeByte('\n');
 
         // Recently Completed section
-        var last_completed: ?*Task = null;
+        const completed_tasks = try store.db.getTasksByStatus(.completed);
+        defer {
+            for (completed_tasks) |*ct| {
+                var task = ct.*;
+                task.deinit(self.allocator);
+            }
+            self.allocator.free(completed_tasks);
+        }
+
+        // Find most recently completed
+        var last_completed: ?Task = null;
         var last_completed_time: i64 = 0;
-        var completed_iter = store.tasks.valueIterator();
-        while (completed_iter.next()) |task| {
-            if (task.status == .completed) {
-                if (task.completed_at) |ct| {
-                    if (ct > last_completed_time) {
-                        last_completed_time = ct;
-                        last_completed = task;
-                    }
+        for (completed_tasks) |task| {
+            if (task.completed_at) |ct| {
+                if (ct > last_completed_time) {
+                    last_completed_time = ct;
+                    last_completed = task;
                 }
             }
         }

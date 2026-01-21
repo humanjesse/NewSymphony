@@ -88,9 +88,13 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     }
 
     // Get the task
-    const task = store.getTask(task_id) orelse {
+    const task = (try store.getTask(task_id)) orelse {
         return ToolResult.err(allocator, .internal_error, "Task not found", start_time);
     };
+    defer {
+        var t = task;
+        t.deinit(allocator);
+    }
 
     // Build comments array
     var comments_array = std.ArrayListUnmanaged(Comment){};

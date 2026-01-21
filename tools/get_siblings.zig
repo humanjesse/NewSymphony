@@ -93,19 +93,21 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         return ToolResult.err(allocator, .invalid_arguments, "Invalid task ID format", start_time);
     };
 
-    // Get the task first to find its parent
-    const task = store.getTask(task_id) orelse {
+    // Get the task first to find its parent (using arena - auto-freed when tool returns)
+    const task_alloc = if (context.task_arena) |a| a.allocator() else allocator;
+    const task = (try store.getTaskWithAllocator(task_id, task_alloc)) orelse {
         return ToolResult.err(allocator, .not_found, "Task not found", start_time);
     };
+    // No defer needed - arena handles cleanup
 
-    // Get siblings
-    const siblings = store.getSiblings(task_id) catch |err| {
+    // Get siblings (using arena - auto-freed when tool returns)
+    const siblings = store.getSiblingsWithAllocator(task_id, task_alloc) catch |err| {
         if (err == error.TaskNotFound) {
             return ToolResult.err(allocator, .not_found, "Task not found", start_time);
         }
         return ToolResult.err(allocator, .internal_error, "Failed to get siblings", start_time);
     };
-    defer allocator.free(siblings);
+    // No defer needed - arena handles cleanup
 
     // Build siblings array
     var siblings_array = std.ArrayListUnmanaged(Sibling){};

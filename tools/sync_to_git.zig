@@ -116,7 +116,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     }
 
     // Get task counts for response
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
 
     // Build response
     var json = std.ArrayListUnmanaged(u8){};
@@ -125,7 +125,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     try json.writer(allocator).print(
         "{{\"success\":true,\"tasks_exported\":{d},\"committed\":{s},\"tasks_dir\":\"{s}/.tasks/\",",
         .{
-            store.count(),
+            try store.count(),
             if (committed) "true" else "false",
             cwd,
         },

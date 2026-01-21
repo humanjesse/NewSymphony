@@ -76,41 +76,40 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     }
 
     // Get task counts for summary
-    const counts = store.getTaskCounts();
+    const counts = try store.getTaskCounts();
 
     // Auto-generate summary from completed tasks if not provided
     var auto_summary = std.ArrayListUnmanaged(u8){};
     defer auto_summary.deinit(allocator);
 
     if (user_summary == null) {
-        // Collect recently completed tasks
-        var completed_tasks = std.ArrayListUnmanaged(task_store.Task){};
-        defer completed_tasks.deinit(allocator);
-
-        var iter = store.tasks.valueIterator();
-        while (iter.next()) |task| {
-            if (task.status == .completed) {
-                try completed_tasks.append(allocator, task.*);
+        // Collect recently completed tasks from SQLite
+        const completed_tasks = try store.db.getTasksByStatus(.completed);
+        defer {
+            for (completed_tasks) |*t| {
+                var task = t.*;
+                task.deinit(allocator);
             }
+            allocator.free(completed_tasks);
         }
 
         // Sort by completion time (most recent first)
-        std.mem.sort(task_store.Task, completed_tasks.items, {}, struct {
+        std.mem.sort(task_store.Task, completed_tasks, {}, struct {
             fn cmp(_: void, a: task_store.Task, b: task_store.Task) bool {
                 return (a.completed_at orelse 0) > (b.completed_at orelse 0);
             }
         }.cmp);
 
         // Build summary from completed task titles
-        if (completed_tasks.items.len > 0) {
+        if (completed_tasks.len > 0) {
             try auto_summary.appendSlice(allocator, "Completed: ");
-            const max_items = @min(5, completed_tasks.items.len);
-            for (completed_tasks.items[0..max_items], 0..) |task, i| {
+            const max_items = @min(5, completed_tasks.len);
+            for (completed_tasks[0..max_items], 0..) |task, i| {
                 if (i > 0) try auto_summary.appendSlice(allocator, ", ");
                 try auto_summary.appendSlice(allocator, task.title);
             }
-            if (completed_tasks.items.len > 5) {
-                try auto_summary.writer(allocator).print(" (+{d} more)", .{completed_tasks.items.len - 5});
+            if (completed_tasks.len > 5) {
+                try auto_summary.writer(allocator).print(" (+{d} more)", .{completed_tasks.len - 5});
             }
         } else {
             try auto_summary.appendSlice(allocator, "Session ended (no tasks completed)");
@@ -197,7 +196,7 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     const response = Response{
         .ended = true,
         .summary = final_summary,
-        .tasks_saved = store.tasks.count(),
+        .tasks_saved = try store.count(),
         .completed = counts.completed,
         .pending = counts.pending,
         .blocked = counts.blocked,

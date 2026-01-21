@@ -44,11 +44,12 @@ fn execute(allocator: std.mem.Allocator, _: []const u8, context: *AppContext) !T
         return ToolResult.err(allocator, .internal_error, "Task store not initialized", start_time);
     };
 
-    // Get tasks with BLOCKED: comments (need decomposition)
-    const blocked_tasks = store.getTasksWithCommentPrefix("BLOCKED:") catch {
+    // Get tasks with BLOCKED: comments using arena allocator (auto-freed when tool returns)
+    const task_alloc = if (context.task_arena) |a| a.allocator() else allocator;
+    const blocked_tasks = store.getTasksWithCommentPrefixWithAllocator("BLOCKED:", task_alloc) catch {
         return ToolResult.err(allocator, .internal_error, "Failed to get blocked tasks", start_time);
     };
-    defer allocator.free(blocked_tasks);
+    // No defer needed - arena handles cleanup
 
     // Response structs for JSON serialization
     const BlockedTaskInfo = struct {

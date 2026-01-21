@@ -102,32 +102,21 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     }
 
     // Get the task (verify it exists)
-    const task = store.getTask(task_id) orelse {
+    const task = (try store.getTask(task_id)) orelse {
         return ToolResult.err(allocator, .internal_error, "Task not found", start_time);
     };
+    defer {
+        var t = task;
+        t.deinit(allocator);
+    }
 
     // Determine agent name from context (default to "unknown")
     const agent_name = context.current_agent_name orelse "unknown";
 
-    // Add the comment
+    // Add the comment (automatically persisted to SQLite)
     store.addComment(task_id, agent_name, comment.?) catch {
         return ToolResult.err(allocator, .internal_error, "Failed to add comment", start_time);
     };
-
-    // Get the updated task to access the newly added comment
-    const updated_task = store.getTask(task_id) orelse {
-        return ToolResult.err(allocator, .internal_error, "Task not found after adding comment", start_time);
-    };
-
-    // Persist comment to database if available (O(1) append instead of O(n) replace)
-    if (context.task_db) |db| {
-        if (updated_task.comments.len > 0) {
-            const new_comment = updated_task.comments[updated_task.comments.len - 1];
-            db.appendComment(&task_id, new_comment) catch |err| {
-                std.log.warn("Failed to persist comment to SQLite: {}", .{err});
-            };
-        }
-    }
 
     // Build response
     const response = Response{
@@ -138,7 +127,7 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         },
         .agent = agent_name,
         .comment = comment.?,
-        .total_comments = updated_task.comments.len,
+        .total_comments = task.comments.len + 1,
     };
 
     const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});
