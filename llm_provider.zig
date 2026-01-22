@@ -1,7 +1,8 @@
-// LLM Provider Abstraction - Unified interface for Ollama, LM Studio, and future providers
+// LLM Provider Abstraction - Unified interface for Ollama, LM Studio, OpenRouter, and future providers
 const std = @import("std");
 const ollama = @import("ollama");
 const lmstudio = @import("lmstudio");
+const openrouter = @import("openrouter");
 
 /// Configuration warning for a specific provider
 pub const ConfigWarning = struct {
@@ -161,13 +162,47 @@ pub const ProviderRegistry = struct {
         },
     };
 
+    /// OpenRouter provider capabilities (cloud-hosted, no embeddings)
+    pub const OPENROUTER = ProviderCapabilities{
+        .supports_thinking = false,
+        .supports_keep_alive = false,
+        .supports_tools = true,
+        .supports_json_mode = true,
+        .supports_streaming = true,
+        .supports_embeddings = false,
+        .supports_context_api = false,
+        .name = "OpenRouter",
+        .default_port = 443,
+        .config_warnings = &[_]ConfigWarning{
+            .{ .message = "Embeddings not supported - use Ollama for semantic search." },
+            .{ .message = "API usage billed per token at openrouter.ai" },
+        },
+        .config_fields = &[_]ProviderConfigField{
+            .{
+                .key = "api_key",
+                .label = "API Key",
+                .field_type = .masked_input,
+                .help_text = "OpenRouter API key (starts with 'sk-or-'). Get one at openrouter.ai/keys",
+                .default_value = .{ .text = "" },
+            },
+            .{
+                .key = "host",
+                .label = "API Host",
+                .field_type = .text_input,
+                .help_text = "OpenRouter API endpoint (usually https://openrouter.ai)",
+                .default_value = .{ .text = "https://openrouter.ai" },
+            },
+        },
+    };
+
     /// All available providers
-    pub const ALL = [_]ProviderCapabilities{ OLLAMA, LMSTUDIO };
+    pub const ALL = [_]ProviderCapabilities{ OLLAMA, LMSTUDIO, OPENROUTER };
 
     /// Get provider capabilities by name
     pub fn get(name: []const u8) ?ProviderCapabilities {
         if (std.mem.eql(u8, name, "ollama")) return OLLAMA;
         if (std.mem.eql(u8, name, "lmstudio")) return LMSTUDIO;
+        if (std.mem.eql(u8, name, "openrouter")) return OPENROUTER;
         return null;
     }
 
@@ -185,6 +220,7 @@ pub const ProviderRegistry = struct {
         const identifiers = try allocator.alloc([]const u8, ALL.len);
         identifiers[0] = "ollama";
         identifiers[1] = "lmstudio";
+        identifiers[2] = "openrouter";
         return identifiers;
     }
 };
@@ -338,16 +374,97 @@ pub const LMStudioProvider = struct {
     }
 };
 
+/// OpenRouter provider implementation (cloud-hosted, no embeddings)
+pub const OpenRouterProvider = struct {
+    chat_client: openrouter.OpenRouterClient,
+
+    pub fn init(allocator: std.mem.Allocator, host: []const u8, api_key: []const u8) OpenRouterProvider {
+        return .{
+            .chat_client = openrouter.OpenRouterClient.init(allocator, host, api_key),
+        };
+    }
+
+    pub fn deinit(self: *OpenRouterProvider) void {
+        self.chat_client.deinit();
+    }
+
+    pub fn getCapabilities() ProviderCapabilities {
+        return ProviderRegistry.OPENROUTER;
+    }
+
+    pub fn chatStream(
+        self: *OpenRouterProvider,
+        model: []const u8,
+        messages: []const ollama.ChatMessage,
+        think: bool, // Ignored - not supported
+        format: ?[]const u8,
+        tools: ?[]const ollama.Tool,
+        keep_alive: ?[]const u8, // Ignored - not supported
+        num_ctx: ?usize, // Ignored - not supported
+        num_predict: ?isize,
+        temperature: ?f32,
+        repeat_penalty: ?f32, // Ignored - not supported
+        context: anytype,
+        callback: fn (
+            ctx: @TypeOf(context),
+            thinking_chunk: ?[]const u8,
+            content_chunk: ?[]const u8,
+            tool_calls_chunk: ?[]const ollama.ToolCall,
+        ) void,
+    ) !void {
+        _ = think;
+        _ = keep_alive;
+        _ = num_ctx;
+        _ = repeat_penalty;
+
+        return self.chat_client.chatStream(
+            model,
+            messages,
+            format,
+            tools,
+            num_predict,
+            temperature,
+            context,
+            callback,
+        );
+    }
+
+    // Embeddings not supported by OpenRouter
+    pub fn embed(
+        self: *OpenRouterProvider,
+        model: []const u8,
+        text: []const u8,
+    ) ![]f32 {
+        _ = self;
+        _ = model;
+        _ = text;
+        return error.EmbeddingsNotSupported;
+    }
+
+    pub fn embedBatch(
+        self: *OpenRouterProvider,
+        model: []const u8,
+        texts: []const []const u8,
+    ) ![][]f32 {
+        _ = self;
+        _ = model;
+        _ = texts;
+        return error.EmbeddingsNotSupported;
+    }
+};
+
 /// Unified LLM Provider - can be any supported provider
 pub const LLMProvider = union(enum) {
     ollama: OllamaProvider,
     lmstudio: LMStudioProvider,
+    openrouter: OpenRouterProvider,
 
     /// Get the capabilities of the current provider
     pub fn getCapabilities(self: *const LLMProvider) ProviderCapabilities {
         return switch (self.*) {
             .ollama => OllamaProvider.getCapabilities(),
             .lmstudio => LMStudioProvider.getCapabilities(),
+            .openrouter => OpenRouterProvider.getCapabilities(),
         };
     }
 
@@ -405,6 +522,22 @@ pub const LLMProvider = union(enum) {
                     callback,
                 );
             },
+            .openrouter => |*provider| {
+                return provider.chatStream(
+                    model,
+                    messages,
+                    think,
+                    format,
+                    tools,
+                    keep_alive,
+                    num_ctx,
+                    num_predict,
+                    temperature,
+                    repeat_penalty,
+                    context,
+                    callback,
+                );
+            },
         }
     }
 
@@ -417,6 +550,7 @@ pub const LLMProvider = union(enum) {
         return switch (self.*) {
             .ollama => |*provider| provider.embed(model, text),
             .lmstudio => |*provider| provider.embed(model, text),
+            .openrouter => |*provider| provider.embed(model, text),
         };
     }
 
@@ -429,6 +563,7 @@ pub const LLMProvider = union(enum) {
         return switch (self.*) {
             .ollama => |*provider| provider.embedBatch(model, texts),
             .lmstudio => |*provider| provider.embedBatch(model, texts),
+            .openrouter => |*provider| provider.embedBatch(model, texts),
         };
     }
 
@@ -437,6 +572,7 @@ pub const LLMProvider = union(enum) {
         switch (self.*) {
             .ollama => |*provider| provider.deinit(),
             .lmstudio => |*provider| provider.deinit(),
+            .openrouter => |*provider| provider.deinit(),
         }
     }
 };
@@ -621,6 +757,21 @@ pub fn createProvider(
             .lmstudio = LMStudioProvider.init(
                 allocator,
                 config.lmstudio_host,
+            ),
+        };
+    } else if (std.mem.eql(u8, provider_type, "openrouter")) {
+        // Verify API key is configured
+        const api_key = config.openrouter_api_key orelse {
+            std.debug.print("❌ Error: OpenRouter requires an API key.\n", .{});
+            std.debug.print("   Configure at /config or get a key at https://openrouter.ai/keys\n\n", .{});
+            return error.MissingAPIKey;
+        };
+
+        return LLMProvider{
+            .openrouter = OpenRouterProvider.init(
+                allocator,
+                config.openrouter_host,
+                api_key,
             ),
         };
     } else {

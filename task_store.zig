@@ -401,6 +401,14 @@ pub const TaskStore = struct {
             self.current_task_id = null;
         }
 
+        // Check for orphaned in_progress tasks (from previous sessions that didn't clean up)
+        // This prevents tasks from getting "stuck" when session state is lost
+        if (try self.getCurrentInProgressTaskWithAllocator(alloc)) |in_progress_task| {
+            // Found an orphaned in_progress task - adopt it as current
+            self.current_task_id = in_progress_task.id;
+            return in_progress_task;
+        }
+
         // Auto-assign from ready queue
         const ready = try self.getReadyTasksWithAllocator(alloc);
         defer {

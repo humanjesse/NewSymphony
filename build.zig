@@ -98,6 +98,11 @@ pub fn build(b: *std.Build) void {
     });
     lmstudio_module.addImport("ollama", ollama_module);
 
+    const openrouter_module = b.createModule(.{
+        .root_source_file = b.path("openrouter.zig"),
+    });
+    openrouter_module.addImport("ollama", ollama_module);
+
     const embeddings_module = b.createModule(.{
         .root_source_file = b.path("embeddings.zig"),
     });
@@ -117,6 +122,7 @@ pub fn build(b: *std.Build) void {
     });
     llm_provider_module.addImport("ollama", ollama_module);
     llm_provider_module.addImport("lmstudio", lmstudio_module);
+    llm_provider_module.addImport("openrouter", openrouter_module);
     llm_provider_module.addImport("embeddings", embeddings_module);
 
     const permission_module = b.createModule(.{

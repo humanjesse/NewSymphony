@@ -923,6 +923,19 @@ pub fn processAgentCommandEvents(app: *App) !bool {
     if (app.agent_thread != null) return false;
     if (app.app_context.active_agent != null) return false;
 
+    // Clear any stale streaming state before starting new agent
+    // This prevents chunks from a fast-starting agent (e.g., OpenRouter) from
+    // hitting the fallback "last message" path during agent transitions
+    {
+        app.stream_mutex.lock();
+        defer app.stream_mutex.unlock();
+        for (app.stream_chunks.items) |chunk| {
+            if (chunk.thinking) |t| app.allocator.free(t);
+            if (chunk.content) |c| app.allocator.free(c);
+        }
+        app.stream_chunks.clearRetainingCapacity();
+    }
+
     // Pop first event (FIFO order)
     var event = app.agent_command_events.orderedRemove(0);
     defer event.deinit(app.allocator);

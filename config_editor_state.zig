@@ -110,6 +110,8 @@ pub const ConfigEditorState = struct {
             .file_read_small_threshold = current_config.file_read_small_threshold,
             .google_search_api_key = if (current_config.google_search_api_key) |key| try allocator.dupe(u8, key) else null,
             .google_search_engine_id = if (current_config.google_search_engine_id) |id| try allocator.dupe(u8, id) else null,
+            .openrouter_api_key = if (current_config.openrouter_api_key) |key| try allocator.dupe(u8, key) else null,
+            .openrouter_host = try allocator.dupe(u8, current_config.openrouter_host),
         };
 
         // Get current profile name

@@ -298,6 +298,8 @@ fn getFieldValue(state: *const ConfigEditorState, key: []const u8) []const u8 {
     if (std.mem.eql(u8, key, "model")) return config.model;
     if (std.mem.eql(u8, key, "google_search_api_key")) return config.google_search_api_key orelse "";
     if (std.mem.eql(u8, key, "google_search_engine_id")) return config.google_search_engine_id orelse "";
+    if (std.mem.eql(u8, key, "openrouter_api_key")) return config.openrouter_api_key orelse "";
+    if (std.mem.eql(u8, key, "openrouter_host")) return config.openrouter_host;
 
     return "";
 }

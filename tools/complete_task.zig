@@ -156,7 +156,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     const response = Response{
         .completed = true,
         .task = .{
-            .id = &task_id,
+            .id = task_id[0..],
             .title = task.title,
         },
         .unblocked = unblocked_ids.items,

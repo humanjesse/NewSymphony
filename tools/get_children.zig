@@ -97,7 +97,12 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     const children = store.getChildren(task_id) catch {
         return ToolResult.err(allocator, .internal_error, "Failed to get children", start_time);
     };
-    defer allocator.free(children);
+    defer {
+        for (children) |*child| {
+            child.deinit(allocator);
+        }
+        allocator.free(children);
+    }
 
     // Build children array
     var children_array = std.ArrayListUnmanaged(ChildTask){};

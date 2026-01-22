@@ -725,8 +725,8 @@ pub fn handleInput(
                         }
                     }
                 } else if (app.valid_cursor_positions.items.len > 0) {
-                    // Cursor not in valid positions - snap to nearest and scroll down
-                    app.cursor_y = app.valid_cursor_positions.items[0];
+                    // Cursor not in valid positions - snap to bottom (where user is scrolling toward)
+                    app.cursor_y = app.valid_cursor_positions.items[app.valid_cursor_positions.items.len - 1];
                     // Removed dirty state tracking - rendering now automatic
                     should_redraw.* = true;
                 }

@@ -37,6 +37,9 @@ pub const Config = struct {
     // Web search (Google Custom Search API)
     google_search_api_key: ?[]const u8 = null, // Google Custom Search API key (required for web_search tool)
     google_search_engine_id: ?[]const u8 = null, // Programmable Search Engine ID (cx parameter)
+    // OpenRouter (cloud-hosted inference)
+    openrouter_api_key: ?[]const u8 = null, // OpenRouter API key (starts with 'sk-or-')
+    openrouter_host: []const u8 = "https://openrouter.ai", // OpenRouter API host
 
     /// Validate configuration values and warn about incompatibilities
     pub fn validate(self: *const Config) !void {
@@ -84,6 +87,16 @@ pub const Config = struct {
             }
         }
 
+        // Validate OpenRouter API credentials
+        if (self.openrouter_api_key) |api_key| {
+            if (!mem.startsWith(u8, api_key, "sk-or-")) {
+                std.debug.print("⚠ Warning: OpenRouter API key should start with 'sk-or-'\n", .{});
+            }
+            if (api_key.len < 30) {
+                std.debug.print("⚠ Warning: OpenRouter API key appears too short\n", .{});
+            }
+        }
+
         // Warn about unsupported feature combinations
         if (self.enable_thinking and !caps.supports_thinking) {
             std.debug.print("⚠ Warning: {s} doesn't support thinking mode. Feature will be disabled.\n", .{caps.name});
@@ -111,6 +124,11 @@ pub const Config = struct {
             if (mem.eql(u8, field_key, "auto_load_model")) return .{ .boolean = self.lmstudio_auto_load_model };
             if (mem.eql(u8, field_key, "gpu_offload")) return .{ .text = self.lmstudio_gpu_offload };
             if (mem.eql(u8, field_key, "ttl")) return .{ .number = @as(isize, @intCast(self.lmstudio_ttl)) };
+        } else if (mem.eql(u8, provider, "openrouter")) {
+            if (mem.eql(u8, field_key, "host")) return .{ .text = self.openrouter_host };
+            if (mem.eql(u8, field_key, "api_key")) {
+                return if (self.openrouter_api_key) |key| .{ .text = key } else .{ .text = "" };
+            }
         }
 
         // Return default empty value if not found
@@ -150,6 +168,17 @@ pub const Config = struct {
             } else if (mem.eql(u8, field_key, "ttl")) {
                 self.lmstudio_ttl = @as(usize, @intCast(@max(0, value.number)));
             }
+        } else if (mem.eql(u8, provider, "openrouter")) {
+            if (mem.eql(u8, field_key, "host")) {
+                allocator.free(self.openrouter_host);
+                self.openrouter_host = try allocator.dupe(u8, value.text);
+            } else if (mem.eql(u8, field_key, "api_key")) {
+                if (self.openrouter_api_key) |old| allocator.free(old);
+                self.openrouter_api_key = if (value.text.len > 0)
+                    try allocator.dupe(u8, value.text)
+                else
+                    null;
+            }
         }
     }
 
@@ -175,6 +204,10 @@ pub const Config = struct {
         }
         if (self.google_search_engine_id) |engine_id| {
             allocator.free(engine_id);
+        }
+        allocator.free(self.openrouter_host);
+        if (self.openrouter_api_key) |api_key| {
+            allocator.free(api_key);
         }
     }
 };
@@ -205,6 +238,8 @@ pub const ConfigFile = struct {
     file_read_small_threshold: ?usize = null,
     google_search_api_key: ?[]const u8 = null,
     google_search_engine_id: ?[]const u8 = null,
+    openrouter_api_key: ?[]const u8 = null,
+    openrouter_host: ?[]const u8 = null,
 };
 
 /// JSON-serializable policy structure
@@ -239,6 +274,7 @@ pub fn loadConfigFromFile(allocator: mem.Allocator) !Config {
         .color_thinking_header = try allocator.dupe(u8, "\x1b[36m"),
         .color_thinking_dim = try allocator.dupe(u8, "\x1b[2m"),
         .color_inline_code_bg = try allocator.dupe(u8, "\x1b[48;5;237m"),
+        .openrouter_host = try allocator.dupe(u8, "https://openrouter.ai"),
     };
 
     // Try to get home directory
@@ -423,6 +459,18 @@ pub fn loadConfigFromFile(allocator: mem.Allocator) !Config {
             allocator.free(old_id);
         }
         config.google_search_engine_id = try allocator.dupe(u8, google_search_engine_id);
+    }
+
+    if (parsed.value.openrouter_api_key) |openrouter_api_key| {
+        if (config.openrouter_api_key) |old_key| {
+            allocator.free(old_key);
+        }
+        config.openrouter_api_key = try allocator.dupe(u8, openrouter_api_key);
+    }
+
+    if (parsed.value.openrouter_host) |openrouter_host| {
+        allocator.free(config.openrouter_host);
+        config.openrouter_host = try allocator.dupe(u8, openrouter_host);
     }
 
     // Validate configuration before returning

@@ -79,6 +79,7 @@ pub const RenderCache = struct {
     last_terminal_height: u16 = 0,
     message_y_positions: std.ArrayListUnmanaged(usize) = .{}, // Y position where each message starts
     total_content_height: usize = 0, // Total height of all messages
+    previous_content_height: usize = 0, // Previous height for delta-based scrolling
     cache_valid: bool = false, // Whether position cache is valid
     last_message_count: usize = 0, // Message count when cache was built
 
@@ -161,45 +162,28 @@ pub const VirtualizationState = struct {
     }
 };
 
-/// Find the git root directory by walking up from cwd
-/// Returns null if not in a git repository
-fn findGitRoot(allocator: mem.Allocator) !?[]const u8 {
-    // Get current working directory
-    const cwd = fs.cwd();
+/// Check if the current working directory has a .git folder
+/// Returns true if .git exists in cwd, false otherwise
+fn cwdHasGit(allocator: mem.Allocator) !bool {
     var path_buf: [fs.max_path_bytes]u8 = undefined;
-    const cwd_path = try cwd.realpath(".", &path_buf);
+    const cwd_path = try fs.cwd().realpath(".", &path_buf);
 
-    // Walk up the directory tree looking for .git
-    var current_path = try allocator.dupe(u8, cwd_path);
-    defer allocator.free(current_path);
+    const git_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{cwd_path});
+    defer allocator.free(git_path);
 
-    while (true) {
-        // Check if .git exists in current directory
-        const git_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{current_path});
-        defer allocator.free(git_path);
-
-        if (fs.cwd().statFile(git_path)) |stat| {
-            // .git exists - could be file (worktree) or directory
-            _ = stat;
-            return try allocator.dupe(u8, current_path);
-        } else |_| {
-            // .git doesn't exist, try parent directory
-        }
-
-        // Find parent directory
-        if (mem.lastIndexOf(u8, current_path, "/")) |last_slash| {
-            if (last_slash == 0) {
-                // We're at root, no .git found
-                return null;
-            }
-            const new_path = try allocator.dupe(u8, current_path[0..last_slash]);
-            allocator.free(current_path);
-            current_path = new_path;
-        } else {
-            // No slash found, we're done
-            return null;
-        }
+    if (fs.cwd().statFile(git_path)) |_| {
+        return true;
+    } else |_| {
+        return false;
     }
+}
+
+/// Initialize a git repository in the current working directory
+fn initGitRepo() !void {
+    var child = std.process.Child.init(&.{ "git", "init" }, std.heap.page_allocator);
+    child.stderr_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    _ = try child.spawnAndWait();
 }
 
 pub const App = struct {
@@ -413,17 +397,20 @@ pub const App = struct {
         try message_loader.initVirtualization(&app);
 
         // Initialize task memory system (Beads-style per-project)
-        // Use git root if in a repo, otherwise use current working directory
-        // This ensures .tasks/ is always created for task persistence
-        const project_root = if (try findGitRoot(allocator)) |git_root|
-            git_root
-        else blk: {
-            // Not in a git repo - use current working directory
-            var path_buf: [fs.max_path_bytes]u8 = undefined;
-            const cwd_path = try fs.cwd().realpath(".", &path_buf);
-            break :blk try allocator.dupe(u8, cwd_path);
-        };
+        // Always use current working directory as project root
+        // This ensures .tasks/ is created where the app was started
+        var path_buf: [fs.max_path_bytes]u8 = undefined;
+        const cwd_path = try fs.cwd().realpath(".", &path_buf);
+        const project_root = try allocator.dupe(u8, cwd_path);
         app.git_root = project_root;
+
+        // Initialize git repo if one doesn't exist in current directory
+        if (!try cwdHasGit(allocator)) {
+            std.log.info("No git repo in current directory, initializing one...", .{});
+            initGitRepo() catch |err| {
+                std.log.warn("Failed to initialize git repo: {}", .{err});
+            };
+        }
 
         // Initialize GitSync for this project
         const git_sync_ptr = try allocator.create(git_sync_module.GitSync);
@@ -1045,57 +1032,10 @@ pub const App = struct {
 
             // 5. Render (when not streaming)
             if (!self.streaming_active) {
-                // Handle resize signals
                 if (ui.resize_pending) {
                     ui.resize_pending = false;
                 }
-
-                self.terminal_size = try ui.Tui.getTerminalSize();
-                var stdout_buffer: [8192]u8 = undefined;
-                var buffered_writer = ui.BufferedStdoutWriter.init(&stdout_buffer);
-                const writer = buffered_writer.writer();
-
-                // Calculate input field height once for this render
-                const input_field_height = try message_renderer.calculateInputFieldHeight(self);
-
-                // Move cursor to home WITHOUT clearing - prevents flicker
-                try writer.writeAll("\x1b[H");
-                self.clickable_areas.clearRetainingCapacity();
-                self.valid_cursor_positions.clearRetainingCapacity();
-
-                var absolute_y: usize = 1;
-                for (self.messages.items, 0..) |_, local_i| {
-                    const message = &self.messages.items[local_i];
-
-                    // Skip tool JSON if hidden by config
-                    if (message.role == .tool and !self.config.show_tool_json) continue;
-
-                    // Skip empty system messages (hot context placeholder before first update)
-                    if (message.role == .system and message.content.len == 0) continue;
-
-                    // Draw message (handles both thinking and content)
-                    try message_renderer.drawMessage(self, writer, message, &absolute_y, input_field_height);
-                }
-
-                // Position cursor after last message content to clear any leftover content
-                const screen_y_for_clear = if (absolute_y > self.scroll_y)
-                    (absolute_y - self.scroll_y) + 1
-                else
-                    1;
-
-                // Only clear if there's space between content and input field
-                const input_area_start = if (self.terminal_size.height > input_field_height + 1)
-                    self.terminal_size.height - input_field_height
-                else
-                    1;
-                if (screen_y_for_clear < input_area_start) {
-                    try writer.print("\x1b[{d};1H\x1b[J", .{screen_y_for_clear});
-                }
-
-                // Draw input field at the bottom (3 rows before status)
-                try message_renderer.drawInputField(self, writer);
-                try ui.drawTaskbar(self, writer);
-                try buffered_writer.flush();
+                _ = try message_renderer.redrawScreen(self);
             }
 
             // 6. Input handling

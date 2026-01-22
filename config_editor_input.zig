@@ -25,6 +25,21 @@ pub fn handleInput(
 ) !InputResult {
     // Handle escape sequences first (arrow keys, function keys, etc.)
     if (input.len >= 3 and input[0] == 0x1B and input[1] == '[') {
+        // Check for bracketed paste start: \x1b[200~
+        if (input.len >= 6 and std.mem.startsWith(u8, input[2..], "200~")) {
+            // Bracketed paste mode - extract content between markers
+            // Format: \x1b[200~ ... pasted content ... \x1b[201~
+            const paste_start = 6; // After "\x1b[200~"
+            const paste_end_marker = "\x1b[201~";
+
+            if (std.mem.indexOf(u8, input[paste_start..], paste_end_marker)) |end_offset| {
+                const pasted_text = input[paste_start..paste_start + end_offset];
+                return try handlePastedText(state, pasted_text);
+            } else {
+                // No end marker found, treat entire remainder as pasted text
+                return try handlePastedText(state, input[paste_start..]);
+            }
+        }
         return try handleEscapeSequence(state, input);
     }
 
@@ -33,8 +48,37 @@ pub fn handleInput(
         return try handleSingleKey(state, input[0]);
     }
 
-    // Handle multi-byte input (UTF-8, etc.)
-    return .@"continue";
+    // Handle multi-byte input (pasted text without bracketed paste mode, or UTF-8)
+    // Process each byte as if it were typed individually
+    return try handlePastedText(state, input);
+}
+
+/// Handle pasted text by processing each character
+fn handlePastedText(state: *ConfigEditorState, text: []const u8) !InputResult {
+    var needs_redraw = false;
+
+    for (text) |byte| {
+        // Skip control characters except printable ones
+        if (byte < 0x20 and byte != '\t' and byte != '\r' and byte != '\n') {
+            continue;
+        }
+        // Skip DEL and high bytes (UTF-8 continuation bytes)
+        if (byte == 0x7F or byte > 0x7E) {
+            continue;
+        }
+
+        // Process printable ASCII characters
+        if (state.getFocusedField()) |field| {
+            if (field.is_editing and (field.field_type == .text_input or field.field_type == .masked_input or field.field_type == .number_input)) {
+                const result = try handleTextInput(state, field, byte);
+                if (result == .redraw) {
+                    needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    return if (needs_redraw) .redraw else .@"continue";
 }
 
 /// Handle escape sequences (arrow keys, etc.)

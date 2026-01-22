@@ -412,17 +412,24 @@ pub fn processStreamChunks(
 
             // Update the target message (use streaming_message_idx if set, for agents with tool calls)
             // Convert absolute streaming index to local array index
+            // NOTE: We no longer fallback to "last message" as this caused a race condition
+            // during agent transitions where chunks would write to the wrong message
             const local_target_idx: ?usize = blk: {
                 if (app.streaming_message_idx) |abs_idx| {
                     break :blk app.virtualization.localIndex(abs_idx);
                 }
-                if (app.messages.items.len > 0) {
-                    break :blk app.messages.items.len - 1;
-                }
+                // No streaming_message_idx set - skip this chunk (orphaned during transition)
                 break :blk null;
             };
             if (local_target_idx) |msg_idx| {
                 var last_message = &app.messages.items[msg_idx];
+
+                // Only update assistant messages - skip display_only_data, tool, user, etc.
+                // This can happen during agent transitions if chunks arrive out of order
+                // Note: Don't free here - the end-of-loop cleanup handles freeing
+                if (last_message.role != .assistant) {
+                    continue;
+                }
 
                 // Update thinking content if we have any
                 if (thinking_accumulator.items.len > 0) {

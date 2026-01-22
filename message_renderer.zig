@@ -248,16 +248,110 @@ pub fn buildMessageLayout(app: *App, message: *Message) !MessageLayout {
     }
 
     // Add permission request section if present
-    if (message.permission_request) |_| {
-        // Note: Permission rendering is complex and stays in drawMessage for now
-        // We just mark that there is permission UI here
-        try layout.lines.append(app.allocator, .{
-            .line_type = .permission_header,
-            .content = try app.allocator.dupe(u8, "[Permission Request]"),
-        });
+    if (message.permission_request) |perm_req| {
+        // Calculate height to match actual rendering in drawMessage (lines 1192-1476)
+        // Base lines: separator + header + empty + tool_name = 4
+        try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "SEPARATOR") });
+        try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Permission Request") });
+        try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "") });
+        try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Tool:") });
+
+        // Tool-specific lines
+        if (mem.eql(u8, perm_req.tool_call.function.name, "replace_lines")) {
+            const ReplaceArgs = struct { path: []const u8, line_start: usize, line_end: usize, new_content: []const u8 };
+            if (json.parseFromSlice(ReplaceArgs, app.allocator, perm_req.tool_call.function.arguments, .{})) |parsed| {
+                defer parsed.deinit();
+                // File path + line range + empty + "Changes:" = 4
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "File:") });
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Replacing lines:") });
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "") });
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Changes:") });
+
+                // Old lines (estimate from line range)
+                const num_old_lines = if (parsed.value.line_end >= parsed.value.line_start)
+                    parsed.value.line_end - parsed.value.line_start + 1
+                else
+                    1;
+                for (0..num_old_lines) |_| {
+                    try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "- old") });
+                }
+
+                // Empty line separator
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "") });
+
+                // New lines (count newlines in new_content)
+                var new_line_count: usize = 1;
+                for (parsed.value.new_content) |c| {
+                    if (c == '\n') new_line_count += 1;
+                }
+                // Don't count trailing newline as extra line
+                if (parsed.value.new_content.len > 0 and parsed.value.new_content[parsed.value.new_content.len - 1] == '\n') {
+                    new_line_count -= 1;
+                }
+                for (0..new_line_count) |_| {
+                    try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "+ new") });
+                }
+            } else |_| {
+                // Fallback: just arguments line
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Arguments:") });
+            }
+        } else if (mem.eql(u8, perm_req.tool_call.function.name, "insert_lines")) {
+            const InsertArgs = struct { path: []const u8, line_start: usize, line_end: usize, new_content: []const u8 };
+            if (json.parseFromSlice(InsertArgs, app.allocator, perm_req.tool_call.function.arguments, .{})) |parsed| {
+                defer parsed.deinit();
+                // File path + insertion point + empty + "Changes:" = 4
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "File:") });
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Inserting before:") });
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "") });
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Changes:") });
+
+                // Context lines before (up to 2)
+                for (0..2) |_| {
+                    try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "context") });
+                }
+
+                // Empty line
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "") });
+
+                // New lines (count newlines in new_content)
+                var new_line_count: usize = 1;
+                for (parsed.value.new_content) |c| {
+                    if (c == '\n') new_line_count += 1;
+                }
+                if (parsed.value.new_content.len > 0 and parsed.value.new_content[parsed.value.new_content.len - 1] == '\n') {
+                    new_line_count -= 1;
+                }
+                for (0..new_line_count) |_| {
+                    try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "+ new") });
+                }
+
+                // Context lines after (empty + up to 2)
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "") });
+                for (0..2) |_| {
+                    try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "context") });
+                }
+            } else |_| {
+                // Fallback: just arguments line
+                try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Arguments:") });
+            }
+        } else {
+            // Default: just arguments line
+            try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Arguments:") });
+        }
+
+        // Common trailing lines: risk + empty + buttons = 3
+        try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "Risk:") });
+        try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "") });
+        try layout.lines.append(app.allocator, .{ .line_type = .permission_header, .content = try app.allocator.dupe(u8, "[1] Allow Once  [2] Session  [3] Remember  [4] Deny") });
     }
 
     // Calculate total height: lines + borders + spacing
+    // Return height 0 for empty messages so they take no space
+    if (layout.lines.items.len == 0) {
+        layout.height = 0;
+        return layout;
+    }
+
     const box_height = layout.lines.items.len + 2; // +2 for top/bottom borders
     layout.height = box_height + 1; // +1 for spacing after message
 
@@ -1476,6 +1570,11 @@ pub fn drawMessage(
     }
 
     // Now render the unified box with all lines
+    // Skip rendering if there's no content (avoids empty boxes)
+    if (all_lines.items.len == 0) {
+        return;
+    }
+
     const box_height = all_lines.items.len + 2; // +2 for top and bottom borders
 
     // Calculate viewport height once (account for input field height + taskbar)
@@ -1854,11 +1953,14 @@ pub fn calculateContentHeight(self: *App) !usize {
             }
         }
 
-        const box_height = all_lines.items.len + 2;
-        absolute_y += box_height;
+        // Skip empty messages (no box to render)
+        if (all_lines.items.len > 0) {
+            const box_height = all_lines.items.len + 2;
+            absolute_y += box_height;
 
-        // Add spacing after each message (same as in drawMessage)
-        absolute_y += 1;
+            // Add spacing after each message (same as in drawMessage)
+            absolute_y += 1;
+        }
     }
 
     // Include pending user messages in height calculation
@@ -1901,29 +2003,46 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
     // Invalidate cache on resize
     if (clear_screen) {
         self.render_cache.invalidate();
+        // Reset previous height on resize to avoid stale delta calculations
+        self.render_cache.previous_content_height = 0;
     }
+
+    // Remember previous content height for delta-based scrolling
+    const previous_height = self.render_cache.previous_content_height;
 
     // Rebuild position cache (uses cached heights, single pass)
     try rebuildPositionCache(self);
     const total_content_height = self.render_cache.total_content_height;
 
+    // Update previous height tracking
+    self.render_cache.previous_content_height = total_content_height;
+
     // Auto-scroll to bottom (only if user hasn't manually scrolled away)
     if (!self.user_scrolled_away) {
-        if (total_content_height > viewport_height) {
-            self.scroll_y = total_content_height - viewport_height;
-        } else {
-            self.scroll_y = 0;
-        }
-    } else {
-        // Even when manually scrolled, ensure scroll_y stays within valid bounds
-        // This prevents cursor from going below the input field when content grows
         const max_scroll = if (total_content_height > viewport_height)
             total_content_height - viewport_height
         else
             0;
-        if (self.scroll_y > max_scroll) {
+
+        // Use delta-based scrolling to avoid jumps from height fluctuations
+        // Only scroll by the amount content actually grew
+        if (previous_height > 0 and total_content_height > previous_height) {
+            const height_delta = total_content_height - previous_height;
+            self.scroll_y = @min(self.scroll_y + height_delta, max_scroll);
+        } else if (previous_height == 0 or self.scroll_y < max_scroll) {
+            // First render or not yet at bottom - snap to bottom
             self.scroll_y = max_scroll;
         }
+        // Note: if content shrunk, keep scroll_y where it is (clamped below)
+    }
+
+    // Ensure scroll_y stays within valid bounds for all cases
+    const max_scroll = if (total_content_height > viewport_height)
+        total_content_height - viewport_height
+    else
+        0;
+    if (self.scroll_y > max_scroll) {
+        self.scroll_y = max_scroll;
     }
 
     // Clear screen only on resize or first render
@@ -1975,16 +2094,29 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
     // scroll_y was pre-calculated before drawing - no need to recalculate here
 
     // Ensure cursor_y is at a valid position
+    // Find the nearest valid position to avoid jumps when content heights shift slightly
     if (self.valid_cursor_positions.items.len > 0) {
-        var cursor_is_valid = false;
+        var best_pos = self.valid_cursor_positions.items[0];
+        var best_distance: usize = if (self.cursor_y >= best_pos)
+            self.cursor_y - best_pos
+        else
+            best_pos - self.cursor_y;
+
         for (self.valid_cursor_positions.items) |pos| {
-            if (pos == self.cursor_y) {
-                cursor_is_valid = true;
-                break;
+            const distance = if (self.cursor_y >= pos)
+                self.cursor_y - pos
+            else
+                pos - self.cursor_y;
+
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_pos = pos;
             }
         }
-        if (!cursor_is_valid) {
-            self.cursor_y = self.valid_cursor_positions.items[self.valid_cursor_positions.items.len - 1];
+
+        // Only update if cursor moved to a different position
+        if (self.cursor_y != best_pos) {
+            self.cursor_y = best_pos;
         }
     }
 

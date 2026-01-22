@@ -290,14 +290,6 @@ fn executeCurrentTool(app: *App, tool_call: ollama.ToolCall) !void {
 
     // Tell executor to advance to next tool
     app.tool_executor.advanceAfterExecution();
-
-    // DEBUG: Log state after advancing
-    if (std.posix.getenv("DEBUG_TOOLS")) |_| {
-        std.debug.print("[TOOL_EXEC] After advance: state={s}, hasPending={}\n", .{
-            @tagName(app.tool_executor.getCurrentState()),
-            app.tool_executor.hasPendingWork(),
-        });
-    }
 }
 
 /// Create denial result for a tool that was denied by user
