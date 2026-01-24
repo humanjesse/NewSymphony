@@ -9,36 +9,139 @@ const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
 const ToolResult = tools_module.ToolResult;
 
+// Output mode enum
+const OutputMode = enum {
+    files_with_matches,
+    content,
+    count,
+};
+
+/// File type to glob pattern mapping for grep search.
+///
+/// Design decisions:
+/// - Single extension per type (no composites like "*.{ts,tsx}")
+/// - Common aliases included (rust/rs, yaml/yml, bash/sh)
+/// - Only code-related file types (no binary formats)
+///
+/// Usage: `grep_search(pattern: "fn main", type: "zig")`
+/// Available types: zig, js, ts, tsx, jsx, py, go, rust, rs, md, json,
+///                  yaml, yml, toml, c, cpp, h, hpp, java, rb, php,
+///                  swift, kt, scala, sql, html, css, scss, xml, sh, bash
+const FileTypeExtensions = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "zig", "*.zig" },
+    .{ "js", "*.js" },
+    .{ "ts", "*.ts" },
+    .{ "tsx", "*.tsx" },
+    .{ "jsx", "*.jsx" },
+    .{ "py", "*.py" },
+    .{ "go", "*.go" },
+    .{ "rust", "*.rs" },
+    .{ "rs", "*.rs" },
+    .{ "md", "*.md" },
+    .{ "json", "*.json" },
+    .{ "yaml", "*.yaml" },
+    .{ "yml", "*.yml" },
+    .{ "toml", "*.toml" },
+    .{ "c", "*.c" },
+    .{ "cpp", "*.cpp" },
+    .{ "h", "*.h" },
+    .{ "hpp", "*.hpp" },
+    .{ "java", "*.java" },
+    .{ "rb", "*.rb" },
+    .{ "php", "*.php" },
+    .{ "swift", "*.swift" },
+    .{ "kt", "*.kt" },
+    .{ "scala", "*.scala" },
+    .{ "sql", "*.sql" },
+    .{ "html", "*.html" },
+    .{ "css", "*.css" },
+    .{ "scss", "*.scss" },
+    .{ "xml", "*.xml" },
+    .{ "sh", "*.sh" },
+    .{ "bash", "*.sh" },
+});
+
 pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     return .{
         .ollama_tool = .{
             .type = "function",
             .function = .{
                 .name = try allocator.dupe(u8, "grep_search"),
-                .description = try allocator.dupe(u8, "Search file contents for patterns. Supports wildcards and file filtering."),
+                .description = try allocator.dupe(u8,
+                    \\Search file contents for patterns.
+                    \\
+                    \\OUTPUT MODES (output_mode):
+                    \\- "files_with_matches" (default): Just file paths, one per line
+                    \\- "content": Shows matching lines with optional context (-A/-B/-C)
+                    \\- "count": Shows match counts per file
+                    \\
+                    \\FILTERING:
+                    \\- glob: Pattern like "*.zig" or "**/*.ts"
+                    \\- type: Shortcut - "zig", "js", "py", "go", "rust", etc.
+                    \\
+                    \\PAGINATION:
+                    \\- head_limit: Limit results (default: 50 for files, 100 for content)
+                    \\- offset: Skip N results for paging
+                ),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
                     \\  "properties": {
                     \\    "pattern": {
                     \\      "type": "string",
-                    \\      "description": "Text to search for (supports * wildcards, e.g., 'fn*init')"
+                    \\      "description": "Text or regex pattern to search for (supports * wildcards)"
                     \\    },
-                    \\    "file_filter": {
+                    \\    "path": {
                     \\      "type": "string",
-                    \\      "description": "Optional: limit to files matching glob (e.g., '*.zig', '**/*.md')"
+                    \\      "description": "Directory to search in (default: current working directory)"
                     \\    },
-                    \\    "max_results": {
+                    \\    "glob": {
+                    \\      "type": "string",
+                    \\      "description": "Glob pattern to filter files (e.g., '*.zig', '**/*.ts')"
+                    \\    },
+                    \\    "type": {
+                    \\      "type": "string",
+                    \\      "description": "File type shortcut: zig, js, ts, py, go, rust, md, json, etc."
+                    \\    },
+                    \\    "output_mode": {
+                    \\      "type": "string",
+                    \\      "description": "Output format: files_with_matches (default), content, or count"
+                    \\    },
+                    \\    "head_limit": {
                     \\      "type": "integer",
-                    \\      "description": "Optional: max results to return (default: 200, max: 1000)"
+                    \\      "description": "Limit to first N results (default varies by mode)"
+                    \\    },
+                    \\    "offset": {
+                    \\      "type": "integer",
+                    \\      "description": "Skip first N results for pagination"
+                    \\    },
+                    \\    "-A": {
+                    \\      "type": "integer",
+                    \\      "description": "Lines after each match (content mode only, max 10)"
+                    \\    },
+                    \\    "-B": {
+                    \\      "type": "integer",
+                    \\      "description": "Lines before each match (content mode only, max 10)"
+                    \\    },
+                    \\    "-C": {
+                    \\      "type": "integer",
+                    \\      "description": "Lines before AND after each match (overrides -A/-B, max 10)"
+                    \\    },
+                    \\    "-n": {
+                    \\      "type": "boolean",
+                    \\      "description": "Show line numbers (default: true for content mode)"
+                    \\    },
+                    \\    "-i": {
+                    \\      "type": "boolean",
+                    \\      "description": "Case insensitive search (default: true)"
                     \\    },
                     \\    "include_hidden": {
                     \\      "type": "boolean",
-                    \\      "description": "Optional: search hidden directories like .config (default: false, always skips .git)"
+                    \\      "description": "Search hidden directories (default: false, always skips .git)"
                     \\    },
                     \\    "ignore_gitignore": {
                     \\      "type": "boolean",
-                    \\      "description": "Optional: search files normally excluded by .gitignore (default: false)"
+                    \\      "description": "Search files excluded by .gitignore (default: false)"
                     \\    }
                     \\  },
                     \\  "required": ["pattern"]
@@ -48,8 +151,8 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
         },
         .permission_metadata = .{
             .name = "grep_search",
-            .description = "Search files in project (with optional hidden/gitignore bypass)",
-            .risk_level = .low, // Ask once per session due to powerful flags
+            .description = "Search files in project",
+            .risk_level = .low,
             .required_scopes = &.{.read_files},
             .validator = validate,
         },
@@ -57,25 +160,45 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
     };
 }
 
+const ContextLine = struct {
+    line_number: usize,
+    content: []const u8,
+};
+
 const SearchResult = struct {
     file_path: []const u8,
     line_number: usize,
     line_content: []const u8,
+    context_before: []ContextLine,
+    context_after: []ContextLine,
+};
+
+const FileMatch = struct {
+    file_path: []const u8,
+    match_count: usize,
 };
 
 const SearchContext = struct {
     allocator: std.mem.Allocator,
     pattern: []const u8,
     case_insensitive: bool,
-    max_results: usize,
+    head_limit: usize,
+    offset: usize,
     file_filter: ?[]const u8,
     include_hidden: bool,
     ignore_gitignore: bool,
+    context_before: usize,
+    context_after: usize,
+    show_line_numbers: bool,
+    output_mode: OutputMode,
+    search_path: ?[]const u8,
     gitignore_patterns: std.ArrayListUnmanaged([]const u8),
     results: std.ArrayListUnmanaged(SearchResult),
-    filename_matches: std.ArrayListUnmanaged([]const u8),
+    file_matches: std.ArrayListUnmanaged(FileMatch),
     files_searched: usize,
     files_skipped: usize,
+    results_collected: usize,
+    results_skipped: usize,
     current_path: std.ArrayListUnmanaged(u8),
 };
 
@@ -86,10 +209,23 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     // Parse arguments
     const Args = struct {
         pattern: []const u8,
-        file_filter: ?[]const u8 = null,
-        max_results: ?usize = null,
+        path: ?[]const u8 = null,
+        glob: ?[]const u8 = null,
+        type: ?[]const u8 = null,
+        output_mode: ?[]const u8 = null,
+        head_limit: ?usize = null,
+        offset: ?usize = null,
+        @"-A": ?usize = null,
+        @"-B": ?usize = null,
+        @"-C": ?usize = null,
+        @"-n": ?bool = null,
+        @"-i": ?bool = null,
         include_hidden: ?bool = null,
         ignore_gitignore: ?bool = null,
+        // Backwards compatibility
+        file_filter: ?[]const u8 = null,
+        max_results: ?usize = null,
+        context_lines: ?usize = null,
     };
 
     const parsed = std.json.parseFromSlice(Args, allocator, arguments, .{}) catch {
@@ -104,30 +240,78 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         return ToolResult.err(allocator, .validation_failed, "Pattern cannot be empty", start_time);
     }
 
-    // Apply defaults with validation
-    const max_results = if (args.max_results) |mr| @min(mr, 1000) else 200;
+    // Parse output mode
+    const output_mode: OutputMode = blk: {
+        if (args.output_mode) |mode_str| {
+            if (std.mem.eql(u8, mode_str, "content")) break :blk .content;
+            if (std.mem.eql(u8, mode_str, "count")) break :blk .count;
+            if (std.mem.eql(u8, mode_str, "files_with_matches")) break :blk .files_with_matches;
+            return ToolResult.err(allocator, .validation_failed, "Invalid output_mode. Use: files_with_matches, content, or count", start_time);
+        }
+        break :blk .files_with_matches;
+    };
+
+    // Resolve file filter: glob > type > file_filter (backwards compat)
+    const file_filter: ?[]const u8 = blk: {
+        if (args.glob) |g| break :blk g;
+        if (args.type) |t| {
+            if (FileTypeExtensions.get(t)) |ext| break :blk ext;
+            return ToolResult.err(allocator, .validation_failed, "Unknown file type. Use: zig, js, ts, py, go, rust, md, json, etc.", start_time);
+        }
+        if (args.file_filter) |f| break :blk f; // backwards compat
+        break :blk null;
+    };
+
+    // Set mode-specific defaults for head_limit
+    const default_head_limit: usize = switch (output_mode) {
+        .files_with_matches => 50,
+        .content => 100,
+        .count => 200,
+    };
+    const head_limit = if (args.head_limit) |hl|
+        @min(hl, 500)
+    else if (args.max_results) |mr| // backwards compat
+        @min(mr, 500)
+    else
+        default_head_limit;
+
+    const offset = args.offset orelse 0;
     const include_hidden = args.include_hidden orelse false;
     const ignore_gitignore = args.ignore_gitignore orelse false;
 
-    // Always use case-insensitive search
-    // This ensures searches work regardless of the case used in the pattern
-    // e.g., searching for "potato", "Potato", or "POTATO" will all find any case variation
-    const case_insensitive = true;
+    // Handle context lines: -C overrides -A/-B
+    const context_c = if (args.@"-C") |c| @min(c, 10) else if (args.context_lines) |cl| @min(cl, 10) else null;
+    const context_before = if (context_c) |c| c else if (args.@"-B") |b| @min(b, 10) else 0;
+    const context_after = if (context_c) |c| c else if (args.@"-A") |a| @min(a, 10) else 0;
+
+    // Line numbers default to true for content mode
+    const show_line_numbers = args.@"-n" orelse (output_mode == .content);
+
+    // Case insensitive defaults to true
+    const case_insensitive = args.@"-i" orelse true;
 
     // Initialize search context
     var search_ctx = SearchContext{
         .allocator = allocator,
         .pattern = args.pattern,
         .case_insensitive = case_insensitive,
-        .max_results = max_results,
-        .file_filter = args.file_filter,
+        .head_limit = head_limit,
+        .offset = offset,
+        .file_filter = file_filter,
         .include_hidden = include_hidden,
         .ignore_gitignore = ignore_gitignore,
+        .context_before = context_before,
+        .context_after = context_after,
+        .show_line_numbers = show_line_numbers,
+        .output_mode = output_mode,
+        .search_path = args.path,
         .gitignore_patterns = .{},
         .results = .{},
-        .filename_matches = .{},
+        .file_matches = .{},
         .files_searched = 0,
         .files_skipped = 0,
+        .results_collected = 0,
+        .results_skipped = 0,
         .current_path = .{},
     };
     defer {
@@ -138,12 +322,20 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         for (search_ctx.results.items) |result| {
             allocator.free(result.file_path);
             allocator.free(result.line_content);
+            for (result.context_before) |ctx_line| {
+                allocator.free(ctx_line.content);
+            }
+            allocator.free(result.context_before);
+            for (result.context_after) |ctx_line| {
+                allocator.free(ctx_line.content);
+            }
+            allocator.free(result.context_after);
         }
         search_ctx.results.deinit(allocator);
-        for (search_ctx.filename_matches.items) |path| {
-            allocator.free(path);
+        for (search_ctx.file_matches.items) |fm| {
+            allocator.free(fm.file_path);
         }
-        search_ctx.filename_matches.deinit(allocator);
+        search_ctx.file_matches.deinit(allocator);
         search_ctx.current_path.deinit(allocator);
     }
 
@@ -152,16 +344,27 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         // Continue without gitignore if it fails to load
     };
 
-    // Start recursive search from current directory
+    // Determine search directory
     const cwd = std.fs.cwd();
-    searchDirectory(&search_ctx, cwd, ".") catch |err| {
+    var opened_dir: ?std.fs.Dir = null;
+    defer if (opened_dir) |*d| d.close();
+
+    const search_dir: std.fs.Dir = if (args.path) |p| blk: {
+        opened_dir = cwd.openDir(p, .{ .iterate = true }) catch {
+            return ToolResult.err(allocator, .io_error, "Cannot open search path", start_time);
+        };
+        break :blk opened_dir.?;
+    } else cwd;
+
+    const start_path = args.path orelse ".";
+    searchDirectory(&search_ctx, search_dir, start_path) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "Search failed: {}", .{err});
         defer allocator.free(msg);
         return ToolResult.err(allocator, .io_error, msg, start_time);
     };
 
     // Format results
-    const formatted = try formatResults(&search_ctx, args);
+    const formatted = try formatResults(&search_ctx);
     defer allocator.free(formatted);
     return ToolResult.ok(allocator, formatted, start_time, null);
 }
@@ -189,8 +392,8 @@ fn loadGitignore(ctx: *SearchContext) !void {
 }
 
 fn searchDirectory(ctx: *SearchContext, dir: std.fs.Dir, rel_path: []const u8) !void {
-    // Check if we've hit max results
-    if (ctx.results.items.len >= ctx.max_results) return;
+    // Check if we've hit the limit (after offset)
+    if (ctx.results_collected >= ctx.head_limit) return;
 
     var iter_dir = dir.openDir(rel_path, .{ .iterate = true }) catch {
         // Skip directories we can't open
@@ -200,8 +403,8 @@ fn searchDirectory(ctx: *SearchContext, dir: std.fs.Dir, rel_path: []const u8) !
 
     var iter = iter_dir.iterate();
     while (try iter.next()) |entry| {
-        // Check max results again
-        if (ctx.results.items.len >= ctx.max_results) return;
+        // Check limit again
+        if (ctx.results_collected >= ctx.head_limit) return;
 
         // Build full path
         const entry_path = if (std.mem.eql(u8, rel_path, "."))
@@ -250,13 +453,6 @@ fn searchDirectory(ctx: *SearchContext, dir: std.fs.Dir, rel_path: []const u8) !
                     }
                 }
 
-                // Check if filename matches the pattern
-                if (matchesFilename(ctx, entry.name)) {
-                    // Add to filename matches
-                    const matched_path = try ctx.allocator.dupe(u8, entry_path);
-                    try ctx.filename_matches.append(ctx.allocator, matched_path);
-                }
-
                 // Search the file content
                 try searchFile(ctx, dir, entry_path);
             },
@@ -287,21 +483,116 @@ fn searchFile(ctx: *SearchContext, dir: std.fs.Dir, path: []const u8) !void {
 
     ctx.files_searched += 1;
 
-    // Search line by line
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
-    var line_num: usize = 1;
-    while (line_iter.next()) |line| : (line_num += 1) {
-        if (ctx.results.items.len >= ctx.max_results) return;
+    // Collect all lines into an array for context access
+    var lines = std.ArrayListUnmanaged([]const u8){};
+    defer lines.deinit(ctx.allocator);
 
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        try lines.append(ctx.allocator, line);
+    }
+
+    // Count matches and find first match
+    var match_count: usize = 0;
+    var first_match_idx: ?usize = null;
+
+    for (lines.items, 0..) |line, idx| {
         if (matchesPattern(ctx, line)) {
-            // Store result
-            const result = SearchResult{
-                .file_path = try ctx.allocator.dupe(u8, path),
-                .line_number = line_num,
-                .line_content = try ctx.allocator.dupe(u8, line),
-            };
-            try ctx.results.append(ctx.allocator, result);
+            match_count += 1;
+            if (first_match_idx == null) first_match_idx = idx;
         }
+    }
+
+    // No matches in this file
+    if (match_count == 0) return;
+
+    // Handle based on output mode
+    switch (ctx.output_mode) {
+        .files_with_matches => {
+            // Just record the file path
+            const total_seen = ctx.file_matches.items.len;
+            if (total_seen < ctx.offset) {
+                ctx.results_skipped += 1;
+            } else if (ctx.results_collected < ctx.head_limit) {
+                try ctx.file_matches.append(ctx.allocator, .{
+                    .file_path = try ctx.allocator.dupe(u8, path),
+                    .match_count = match_count,
+                });
+                ctx.results_collected += 1;
+            }
+        },
+        .count => {
+            // Record file path with count
+            const total_seen = ctx.file_matches.items.len;
+            if (total_seen < ctx.offset) {
+                ctx.results_skipped += 1;
+            } else if (ctx.results_collected < ctx.head_limit) {
+                try ctx.file_matches.append(ctx.allocator, .{
+                    .file_path = try ctx.allocator.dupe(u8, path),
+                    .match_count = match_count,
+                });
+                ctx.results_collected += 1;
+            }
+        },
+        .content => {
+            // Collect matching lines with context
+            for (lines.items, 0..) |line, idx| {
+                if (ctx.results_collected >= ctx.head_limit) return;
+
+                if (matchesPattern(ctx, line)) {
+                    const total_seen = ctx.results.items.len + ctx.results_skipped;
+                    if (total_seen < ctx.offset) {
+                        ctx.results_skipped += 1;
+                        continue;
+                    }
+
+                    const line_num = idx + 1;
+
+                    // Collect context before
+                    var cb = std.ArrayListUnmanaged(ContextLine){};
+                    errdefer {
+                        for (cb.items) |ctx_line| ctx.allocator.free(ctx_line.content);
+                        cb.deinit(ctx.allocator);
+                    }
+                    if (ctx.context_before > 0) {
+                        const start = if (idx >= ctx.context_before) idx - ctx.context_before else 0;
+                        for (start..idx) |ctx_idx| {
+                            try cb.append(ctx.allocator, .{
+                                .line_number = ctx_idx + 1,
+                                .content = try ctx.allocator.dupe(u8, lines.items[ctx_idx]),
+                            });
+                        }
+                    }
+
+                    // Collect context after
+                    var ca = std.ArrayListUnmanaged(ContextLine){};
+                    errdefer {
+                        for (ca.items) |ctx_line| ctx.allocator.free(ctx_line.content);
+                        ca.deinit(ctx.allocator);
+                    }
+                    if (ctx.context_after > 0) {
+                        const end = @min(idx + ctx.context_after + 1, lines.items.len);
+                        for ((idx + 1)..end) |ctx_idx| {
+                            try ca.append(ctx.allocator, .{
+                                .line_number = ctx_idx + 1,
+                                .content = try ctx.allocator.dupe(u8, lines.items[ctx_idx]),
+                            });
+                        }
+                    }
+
+                    // Store result
+                    const result = SearchResult{
+                        .file_path = try ctx.allocator.dupe(u8, path),
+                        .line_number = line_num,
+                        .line_content = try ctx.allocator.dupe(u8, line),
+                        .context_before = try cb.toOwnedSlice(ctx.allocator),
+                        .context_after = try ca.toOwnedSlice(ctx.allocator),
+                    };
+                    try ctx.results.append(ctx.allocator, result);
+                    ctx.results_collected += 1;
+                }
+            }
+        },
     }
 }
 
@@ -328,11 +619,6 @@ fn matchesPattern(ctx: *SearchContext, line: []const u8) bool {
     }
 }
 
-fn matchesFilename(ctx: *SearchContext, filename: []const u8) bool {
-    // Check if filename (basename only) matches the pattern
-    // Uses same logic as content matching: case-insensitive with wildcard support
-    return matchesPattern(ctx, filename);
-}
 
 fn matchesWildcard(text: []const u8, pattern: []const u8, case_insensitive: bool) bool {
     // Simple wildcard matching with * support
@@ -469,115 +755,98 @@ fn isBinary(content: []const u8) bool {
     return false;
 }
 
-fn formatResults(ctx: *SearchContext, args: anytype) ![]const u8 {
+fn formatResults(ctx: *SearchContext) ![]const u8 {
     var output = std.ArrayListUnmanaged(u8){};
     defer output.deinit(ctx.allocator);
     const writer = output.writer(ctx.allocator);
 
-    // Wrap in code fence
-    try writer.writeAll("```\n");
-
-    // Header
-    try writer.print("Search: \"{s}\"", .{args.pattern});
-    if (ctx.file_filter) |filter| {
-        try writer.print(" in {s} files", .{filter});
-    }
-    if (ctx.case_insensitive) {
-        try writer.writeAll(" (case-insensitive)");
-    } else {
-        try writer.writeAll(" (case-sensitive)");
-    }
-
-    // Show active special flags
-    if (ctx.include_hidden) try writer.writeAll(" [+hidden]");
-    if (ctx.ignore_gitignore) try writer.writeAll(" [+gitignored]");
-
-    try writer.writeAll("\n\n");
-
-    // Show filename matches if any
-    if (ctx.filename_matches.items.len > 0) {
-        try writer.writeAll("=== Filename Matches ===\n");
-        for (ctx.filename_matches.items) |path| {
-            try writer.print("{s}\n", .{path});
-        }
-        if (ctx.results.items.len > 0) {
-            try writer.writeAll("\n");
-        }
-    }
-
-    // Show content matches if any
-    if (ctx.results.items.len > 0) {
-        if (ctx.filename_matches.items.len > 0) {
-            try writer.writeAll("=== Content Matches ===\n");
-        }
-
-        // Group results by file
-        var current_file: ?[]const u8 = null;
-        for (ctx.results.items) |result| {
-            if (current_file == null or !std.mem.eql(u8, current_file.?, result.file_path)) {
-                if (current_file != null) {
-                    try writer.writeAll("\n");
+    switch (ctx.output_mode) {
+        .files_with_matches => {
+            // Clean file paths, one per line
+            if (ctx.file_matches.items.len == 0) {
+                try writer.writeAll("No matches found.\n");
+            } else {
+                for (ctx.file_matches.items) |fm| {
+                    try writer.print("{s}\n", .{fm.file_path});
                 }
-                try writer.print("File: {s}\n", .{result.file_path});
-                current_file = result.file_path;
             }
-
-            try writer.print("  {d}: {s}\n", .{ result.line_number, result.line_content });
-        }
-    }
-
-    // Show message if no matches at all
-    if (ctx.filename_matches.items.len == 0 and ctx.results.items.len == 0) {
-        try writer.writeAll("No matches found.\n");
-    }
-
-    // Summary
-    try writer.writeAll("\n");
-
-    // Show filename match count
-    if (ctx.filename_matches.items.len > 0) {
-        try writer.print("Summary: {d} filename match", .{ctx.filename_matches.items.len});
-        if (ctx.filename_matches.items.len != 1) try writer.writeAll("es");
-
-        if (ctx.results.items.len > 0) {
-            try writer.writeAll(", ");
-        }
-    } else {
-        try writer.writeAll("Summary: ");
-    }
-
-    // Show content match count
-    if (ctx.results.items.len > 0) {
-        try writer.print("{d} content match", .{ctx.results.items.len});
-        if (ctx.results.items.len != 1) try writer.writeAll("es");
-
-        // Count unique files with content matches
-        var file_count: usize = 0;
-        var last_file: ?[]const u8 = null;
-        for (ctx.results.items) |result| {
-            if (last_file == null or !std.mem.eql(u8, last_file.?, result.file_path)) {
-                file_count += 1;
-                last_file = result.file_path;
+        },
+        .count => {
+            // path:count format
+            if (ctx.file_matches.items.len == 0) {
+                try writer.writeAll("No matches found.\n");
+            } else {
+                for (ctx.file_matches.items) |fm| {
+                    try writer.print("{s}:{d}\n", .{ fm.file_path, fm.match_count });
+                }
             }
-        }
+        },
+        .content => {
+            // Grep-style output with optional context
+            if (ctx.results.items.len == 0) {
+                try writer.writeAll("No matches found.\n");
+            } else {
+                var current_file: ?[]const u8 = null;
+                var last_line_shown: usize = 0;
 
-        try writer.print(" in {d} file", .{file_count});
-        if (file_count != 1) try writer.writeAll("s");
-    } else if (ctx.filename_matches.items.len == 0) {
-        try writer.writeAll("No matches found");
+                for (ctx.results.items) |result| {
+                    const file_changed = current_file == null or !std.mem.eql(u8, current_file.?, result.file_path);
+                    if (file_changed) {
+                        current_file = result.file_path;
+                        last_line_shown = 0;
+                    }
+
+                    // Show context before (with deduplication)
+                    for (result.context_before) |ctx_line| {
+                        if (ctx_line.line_number > last_line_shown) {
+                            // Add separator if there's a gap
+                            if (last_line_shown > 0 and ctx_line.line_number > last_line_shown + 1) {
+                                try writer.writeAll("--\n");
+                            }
+                            if (ctx.show_line_numbers) {
+                                try writer.print("{s}-{d}-{s}\n", .{ result.file_path, ctx_line.line_number, ctx_line.content });
+                            } else {
+                                try writer.print("{s}-{s}\n", .{ result.file_path, ctx_line.content });
+                            }
+                            last_line_shown = ctx_line.line_number;
+                        }
+                    }
+
+                    // Show the match line
+                    if (last_line_shown > 0 and result.line_number > last_line_shown + 1) {
+                        try writer.writeAll("--\n");
+                    }
+                    if (ctx.show_line_numbers) {
+                        try writer.print("{s}:{d}:{s}\n", .{ result.file_path, result.line_number, result.line_content });
+                    } else {
+                        try writer.print("{s}:{s}\n", .{ result.file_path, result.line_content });
+                    }
+                    last_line_shown = result.line_number;
+
+                    // Show context after
+                    for (result.context_after) |ctx_line| {
+                        if (ctx_line.line_number > last_line_shown) {
+                            if (ctx.show_line_numbers) {
+                                try writer.print("{s}-{d}-{s}\n", .{ result.file_path, ctx_line.line_number, ctx_line.content });
+                            } else {
+                                try writer.print("{s}-{s}\n", .{ result.file_path, ctx_line.content });
+                            }
+                            last_line_shown = ctx_line.line_number;
+                        }
+                    }
+                }
+            }
+        },
     }
 
-    try writer.print(" (searched {d} files, skipped {d} ignored)", .{ ctx.files_searched, ctx.files_skipped });
-
-    const total_matches = ctx.filename_matches.items.len + ctx.results.items.len;
-    if (total_matches >= ctx.max_results) {
-        try writer.print(
-            \\
-            \\⚠️  Result limit ({d}) reached! Refine your pattern or use max_results parameter.
-        , .{ctx.max_results});
+    // Add limit warning if needed
+    if (ctx.results_collected >= ctx.head_limit) {
+        try writer.print("\n[Showing {d} of {d}+ results. Use offset={d} to see more.]\n", .{
+            ctx.head_limit,
+            ctx.head_limit + ctx.results_skipped,
+            ctx.head_limit + ctx.offset,
+        });
     }
-
-    try writer.writeAll("\n```");
 
     return try output.toOwnedSlice(ctx.allocator);
 }
@@ -585,10 +854,23 @@ fn formatResults(ctx: *SearchContext, args: anytype) ![]const u8 {
 fn validate(allocator: std.mem.Allocator, arguments: []const u8) bool {
     const Args = struct {
         pattern: []const u8,
-        file_filter: ?[]const u8 = null,
-        max_results: ?usize = null,
+        path: ?[]const u8 = null,
+        glob: ?[]const u8 = null,
+        type: ?[]const u8 = null,
+        output_mode: ?[]const u8 = null,
+        head_limit: ?usize = null,
+        offset: ?usize = null,
+        @"-A": ?usize = null,
+        @"-B": ?usize = null,
+        @"-C": ?usize = null,
+        @"-n": ?bool = null,
+        @"-i": ?bool = null,
         include_hidden: ?bool = null,
         ignore_gitignore: ?bool = null,
+        // Backwards compatibility
+        file_filter: ?[]const u8 = null,
+        max_results: ?usize = null,
+        context_lines: ?usize = null,
     };
     const parsed = std.json.parseFromSlice(Args, allocator, arguments, .{}) catch return false;
     defer parsed.deinit();
@@ -597,16 +879,58 @@ fn validate(allocator: std.mem.Allocator, arguments: []const u8) bool {
     // Block empty pattern
     if (args.pattern.len == 0) return false;
 
-    // Validate max_results range
-    if (args.max_results) |mr| {
-        if (mr == 0 or mr > 1000) return false;
+    // Validate output_mode if provided
+    if (args.output_mode) |mode| {
+        const valid_modes = [_][]const u8{ "files_with_matches", "content", "count" };
+        var valid = false;
+        for (valid_modes) |m| {
+            if (std.mem.eql(u8, mode, m)) {
+                valid = true;
+                break;
+            }
+        }
+        if (!valid) return false;
     }
 
-    // Validate file filter if provided
+    // Validate type if provided
+    if (args.type) |t| {
+        if (FileTypeExtensions.get(t) == null) return false;
+    }
+
+    // Validate head_limit range
+    if (args.head_limit) |hl| {
+        if (hl == 0 or hl > 500) return false;
+    }
+
+    // Validate max_results range (backwards compat)
+    if (args.max_results) |mr| {
+        if (mr == 0 or mr > 500) return false;
+    }
+
+    // Validate context params (0-10 range)
+    if (args.@"-A") |a| {
+        if (a > 10) return false;
+    }
+    if (args.@"-B") |b| {
+        if (b > 10) return false;
+    }
+    if (args.@"-C") |c| {
+        if (c > 10) return false;
+    }
+
+    // Validate path if provided - block directory traversal
+    if (args.path) |p| {
+        if (std.mem.startsWith(u8, p, "/")) return false;
+        if (std.mem.indexOf(u8, p, "..") != null) return false;
+    }
+
+    // Validate file filters if provided
+    if (args.glob) |g| {
+        if (std.mem.startsWith(u8, g, "/")) return false;
+        if (std.mem.indexOf(u8, g, "..") != null) return false;
+    }
     if (args.file_filter) |filter| {
-        // Block absolute paths
         if (std.mem.startsWith(u8, filter, "/")) return false;
-        // Block directory traversal
         if (std.mem.indexOf(u8, filter, "..") != null) return false;
     }
 

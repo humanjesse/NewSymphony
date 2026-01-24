@@ -19,7 +19,6 @@ const update_todo = @import("tools/update_todo.zig");
 // Task memory system tools (Beads-inspired)
 const add_task = @import("tools/add_task.zig");
 const list_tasks = @import("tools/list_tasks.zig");
-const get_ready_tasks = @import("tools/get_ready_tasks.zig");
 const get_blocked_tasks = @import("tools/get_blocked_tasks.zig");
 const add_dependency = @import("tools/add_dependency.zig");
 const complete_task = @import("tools/complete_task.zig");
@@ -28,7 +27,6 @@ const update_task = @import("tools/update_task.zig");
 const get_current_task = @import("tools/get_current_task.zig");
 const start_task = @import("tools/start_task.zig");
 const block_task = @import("tools/block_task.zig");
-const approve_task = @import("tools/approve_task.zig");
 const add_task_comment = @import("tools/add_task_comment.zig");
 const list_task_comments = @import("tools/list_task_comments.zig");
 const add_subtask = @import("tools/add_subtask.zig");
@@ -39,15 +37,11 @@ const check_environment = @import("tools/check_environment.zig");
 const init_environment = @import("tools/init_environment.zig");
 const get_session_status = @import("tools/get_session_status.zig");
 const end_session = @import("tools/end_session.zig");
-// Task hierarchy and graph tools (zvdb-integrated)
-const get_children = @import("tools/get_children.zig");
-const get_siblings = @import("tools/get_siblings.zig");
-const get_epic_summary = @import("tools/get_epic_summary.zig");
+// Task hierarchy and sync tools
 const sync_to_git = @import("tools/sync_to_git.zig");
 const run_agent = @import("tools/run_agent.zig");
 const list_agents = @import("tools/list_agents.zig");
 const planning_done = @import("tools/planning_done.zig");
-const tinkering_done = @import("tools/tinkering_done.zig");
 const submit_work = @import("tools/submit_work.zig");
 const request_revision = @import("tools/request_revision.zig");
 const git_status = @import("tools/git_status.zig");
@@ -252,7 +246,6 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     // Task memory system tools (Beads-inspired)
     try tools.append(allocator, try add_task.getDefinition(allocator));
     try tools.append(allocator, try list_tasks.getDefinition(allocator));
-    try tools.append(allocator, try get_ready_tasks.getDefinition(allocator));
     try tools.append(allocator, try get_blocked_tasks.getDefinition(allocator));
     try tools.append(allocator, try add_dependency.getDefinition(allocator));
     try tools.append(allocator, try complete_task.getDefinition(allocator));
@@ -262,7 +255,6 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try get_current_task.getDefinition(allocator));
     try tools.append(allocator, try start_task.getDefinition(allocator));
     try tools.append(allocator, try block_task.getDefinition(allocator));
-    try tools.append(allocator, try approve_task.getDefinition(allocator));
     try tools.append(allocator, try add_task_comment.getDefinition(allocator));
     try tools.append(allocator, try list_task_comments.getDefinition(allocator));
     try tools.append(allocator, try add_subtask.getDefinition(allocator));
@@ -275,17 +267,13 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try get_session_status.getDefinition(allocator));
     try tools.append(allocator, try end_session.getDefinition(allocator));
 
-    // Task hierarchy and graph tools (zvdb-integrated)
-    try tools.append(allocator, try get_children.getDefinition(allocator));
-    try tools.append(allocator, try get_siblings.getDefinition(allocator));
-    try tools.append(allocator, try get_epic_summary.getDefinition(allocator));
+    // Task sync tools
     try tools.append(allocator, try sync_to_git.getDefinition(allocator));
 
     // Agent tools
     try tools.append(allocator, try run_agent.getDefinition(allocator));
     try tools.append(allocator, try list_agents.getDefinition(allocator));
     try tools.append(allocator, try planning_done.getDefinition(allocator));
-    try tools.append(allocator, try tinkering_done.getDefinition(allocator));
     try tools.append(allocator, try submit_work.getDefinition(allocator));
     try tools.append(allocator, try request_revision.getDefinition(allocator));
 

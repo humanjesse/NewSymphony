@@ -11,6 +11,7 @@ const conversation_db_module = @import("conversation_db");
 const app_module = @import("app");
 const App = app_module.App;
 const Message = types.Message;
+const VirtualizationState = app_module.VirtualizationState;
 
 /// Free all allocations owned by a message
 pub fn freeMessage(allocator: mem.Allocator, message: *Message) void {
@@ -97,24 +98,35 @@ pub fn unloadOutsideRange(app: *App, keep_start: usize, keep_end: usize) !void {
         }
     }
 
-    // Store height estimates and free messages from start
-    for (0..unload_from_start) |_| {
-        if (app.messages.items.len == 0) break;
+    // Batch removal from start - O(n) total instead of O(n²)
+    if (unload_from_start > 0 and app.messages.items.len > 0) {
+        const actual_unload = @min(unload_from_start, app.messages.items.len);
 
-        const msg = &app.messages.items[0];
-        const abs_idx = virt.loaded_start;
+        // First pass: store heights and free message contents
+        for (0..actual_unload) |i| {
+            const msg = &app.messages.items[i];
+            const abs_idx = virt.loaded_start + i;
 
-        // Store height estimate if cached
-        if (msg.cached_height) |height| {
-            try virt.storeHeightEstimate(allocator, abs_idx, height);
+            // Store height estimate if cached
+            if (msg.cached_height) |height| {
+                try virt.storeHeightEstimate(allocator, abs_idx, height);
+            }
+
+            // Free the message contents
+            freeMessage(allocator, msg);
         }
 
-        // Free the message
-        freeMessage(allocator, msg);
-
-        // Remove from array (shift everything left)
-        _ = app.messages.orderedRemove(0);
-        virt.loaded_start += 1;
+        // Single batch shift using copyForwards (O(n) instead of O(n²))
+        const remaining = app.messages.items.len - actual_unload;
+        if (remaining > 0) {
+            std.mem.copyForwards(
+                Message,
+                app.messages.items[0..remaining],
+                app.messages.items[actual_unload..app.messages.items.len],
+            );
+        }
+        app.messages.shrinkRetainingCapacity(remaining);
+        virt.loaded_start += actual_unload;
     }
 
     // Store height estimates and free messages from end

@@ -15,12 +15,11 @@ const task_store_module = @import("task_store");
 const App = @import("app.zig").App;
 
 /// Thread function context for background agent execution
+/// Note: Uses agent_context.allocator for memory management (reduces stamp coupling)
 pub const AgentThreadContext = struct {
-    allocator: mem.Allocator,
     app: *App,
     executor: *agent_executor.AgentExecutor,
     agent_context: agents_module.AgentContext,
-    system_prompt: []const u8,
     user_input: []const u8,
     available_tools: []const ollama.Tool,
     progress_ctx: *ProgressDisplayContext,
@@ -28,10 +27,11 @@ pub const AgentThreadContext = struct {
 
     /// Clean up all owned allocations
     pub fn deinit(self: *AgentThreadContext) void {
-        self.progress_ctx.deinit(self.allocator);
-        self.allocator.destroy(self.progress_ctx);
-        self.allocator.free(self.user_input);
-        freeOllamaTools(self.allocator, self.available_tools);
+        const allocator = self.agent_context.allocator;
+        self.progress_ctx.deinit(allocator);
+        allocator.destroy(self.progress_ctx);
+        allocator.free(self.user_input);
+        freeOllamaTools(allocator, self.available_tools);
     }
 };
 
@@ -319,31 +319,32 @@ pub fn agentThreadFn(ctx: *AgentThreadContext) void {
     }.f;
 
     // Run the agent (blocking in this thread, non-blocking from main thread's perspective)
+    const allocator = ctx.agent_context.allocator;
     const result: agents_module.AgentResult = if (ctx.is_continuation)
         ctx.executor.resumeWithUserInput(
             ctx.agent_context,
-            ctx.system_prompt,
+            ctx.agent_context.system_prompt,
             ctx.user_input,
             ctx.available_tools,
             agentProgressCallback,
             @ptrCast(ctx.progress_ctx),
-        ) catch |err| makeErrorResult(ctx.allocator, err)
+        ) catch |err| makeErrorResult(allocator, err)
     else
         ctx.executor.run(
             ctx.agent_context,
-            ctx.system_prompt,
+            ctx.agent_context.system_prompt,
             ctx.user_input,
             ctx.available_tools,
             agentProgressCallback,
             @ptrCast(ctx.progress_ctx),
-        ) catch |err| makeErrorResult(ctx.allocator, err);
+        ) catch |err| makeErrorResult(allocator, err);
 
     // Send "done" chunk to signal streaming complete
     // This must happen AFTER all iterations finish, not per-iteration
     {
         ctx.app.stream_mutex.lock();
         defer ctx.app.stream_mutex.unlock();
-        ctx.app.stream_chunks.append(ctx.allocator, .{
+        ctx.app.stream_chunks.append(allocator, .{
             .thinking = null,
             .content = null,
             .done = true,
@@ -409,8 +410,15 @@ pub fn handleAgentCommand(app: *App, agent_name: []const u8, task: ?[]const u8, 
 /// Start a new agent conversation session
 /// display_text is the full user input for display (e.g., "/planner hello")
 fn startAgentSession(app: *App, agent_name: []const u8, initial_task: []const u8, display_text: []const u8) !void {
-    const registry = app.app_context.agent_registry orelse return;
-    const agent_def = registry.get(agent_name) orelse return;
+    std.log.info("startAgentSession: starting {s}", .{agent_name});
+    const registry = app.app_context.agent_registry orelse {
+        std.log.warn("startAgentSession: agent_registry is null, cannot start {s}", .{agent_name});
+        return;
+    };
+    const agent_def = registry.get(agent_name) orelse {
+        std.log.warn("startAgentSession: agent '{s}' not found in registry", .{agent_name});
+        return;
+    };
 
     // Create heap-allocated executor
     const executor = try app.allocator.create(agent_executor.AgentExecutor);
@@ -477,6 +485,18 @@ pub fn sendToAgent(app: *App, user_input: []const u8, display_text: ?[]const u8)
     });
     message_loader.onMessageAdded(app);
 
+    // Clear any pending stream chunks from previous sessions (race condition fix)
+    // This prevents old "done" chunks from clearing state for the new session
+    {
+        app.stream_mutex.lock();
+        defer app.stream_mutex.unlock();
+        for (app.stream_chunks.items) |chunk| {
+            if (chunk.thinking) |t| app.allocator.free(t);
+            if (chunk.content) |c| app.allocator.free(c);
+        }
+        app.stream_chunks.clearRetainingCapacity();
+    }
+
     // Enable streaming mode and track the specific message to update
     // (important: tool messages may be inserted, so we can't just use "last message")
     app.streaming_active = true;
@@ -486,11 +506,15 @@ pub fn sendToAgent(app: *App, user_input: []const u8, display_text: ?[]const u8)
     app.streaming_message_idx = abs_idx;
     message_loader.setStreamingProtection(app, abs_idx);
 
+    // Assign stable message ID for streaming target (survives virtualization shifts)
+    const message_id = app.assignMessageId(&app.messages.items[local_idx]);
+    app.streaming_message_id = message_id;
+
     _ = try message_renderer.redrawScreen(app);
     app.updateCursorToBottom();
 
-    // Reset scroll state so response auto-scrolls
-    app.user_scrolled_away = false;
+    // Enable auto-scroll for response
+    app.scroll.enableAutoScroll();
 
     // Get the executor through the type-safe interface
     const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
@@ -503,15 +527,11 @@ pub fn sendToAgent(app: *App, user_input: []const u8, display_text: ?[]const u8)
     errdefer app.allocator.destroy(thread_ctx);
 
     // Allocate progress context on heap (owned by thread)
+    // Note: current_message_idx, task_name, task_icon, start_time are unused - use defaults
     const progress_ctx = try app.allocator.create(ProgressDisplayContext);
     errdefer app.allocator.destroy(progress_ctx);
     progress_ctx.* = .{
         .app = app,
-        .current_message_idx = app.messages.items.len - 1, // Index of assistant placeholder
-        .task_name = try app.allocator.dupe(u8, session.agent_name),
-        .task_name_owned = true,
-        .task_icon = "🤖",
-        .start_time = std.time.milliTimestamp(),
         .is_background_thread = true, // Routes chunks through stream_chunks queue
     };
 
@@ -544,11 +564,9 @@ pub fn sendToAgent(app: *App, user_input: []const u8, display_text: ?[]const u8)
     };
 
     thread_ctx.* = .{
-        .allocator = app.allocator,
         .app = app,
         .executor = executor,
         .agent_context = agent_context,
-        .system_prompt = session.system_prompt,
         .user_input = owned_user_input,
         .available_tools = available_tools,
         .progress_ctx = progress_ctx,
@@ -651,14 +669,21 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
             handleQuestionerComplete(app);
         }
 
-        // Tinkerer → routing based on whether task was blocked
-        if (result.success and mem.eql(u8, agent_name_copy, "tinkerer")) {
-            if (hasBlockedTasks(app)) {
-                // Tinkerer explicitly blocked - go to Planner for decomposition
-                triggerPlannerKickback(app);
+        // Tinkerer → routing based on whether CURRENT task was blocked
+        if (mem.eql(u8, agent_name_copy, "tinkerer")) {
+            std.log.info("Tinkerer completed: success={}, status={}", .{ result.success, result.status });
+            if (result.success) {
+                if (currentTaskIsBlocked(app)) {
+                    // Tinkerer explicitly blocked THIS task - go to Planner for decomposition
+                    std.log.info("Current task is blocked, triggering planner kickback", .{});
+                    triggerPlannerKickback(app);
+                } else {
+                    // Task not blocked - Judge reviews the work
+                    std.log.info("Triggering judge after tinkerer success", .{});
+                    triggerJudge(app);
+                }
             } else {
-                // Either complete or max iterations - Judge reviews the work
-                triggerJudge(app);
+                std.log.warn("Tinkerer failed (success=false), NOT triggering judge", .{});
             }
         }
 
@@ -675,8 +700,15 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
 
 /// Queue an agent command event with proper memory management
 fn queueAgentCommand(app: *App, agent_name: []const u8, task_desc: []const u8, display_prefix: []const u8) void {
-    const registry = app.app_context.agent_registry orelse return;
-    if (registry.get(agent_name) == null) return;
+    const registry = app.app_context.agent_registry orelse {
+        std.log.warn("queueAgentCommand: agent_registry is null, cannot queue {s}", .{agent_name});
+        return;
+    };
+    if (registry.get(agent_name) == null) {
+        std.log.warn("queueAgentCommand: agent '{s}' not found in registry", .{agent_name});
+        return;
+    }
+    std.log.info("queueAgentCommand: queueing {s} agent", .{agent_name});
 
     const task = app.allocator.dupe(u8, task_desc) catch return;
     const display = std.fmt.allocPrint(app.allocator, "{s} {s}", .{ display_prefix, task_desc }) catch {
@@ -721,49 +753,69 @@ pub fn triggerJudge(app: *App) void {
 
 /// Handle Judge completion - either move to next task or retry Tinkerer
 pub fn handleJudgeComplete(app: *App) void {
-    const task_store = app.app_context.task_store orelse return;
+    const store = app.app_context.task_store orelse return;
 
-    // Check if Judge rejected (look for REJECTED: comment from judge)
-    // Note: complete_task changes status to completed, so if still in_progress
-    // with recent rejection, it means Judge rejected
-    const maybe_task = task_store.getCurrentInProgressTask() catch |err| blk: {
-        std.log.warn("Failed to get current task in Judge complete: {}", .{err});
-        break :blk null;
+    // Get the tracked current task ID - this is the task the Judge was reviewing
+    // Use getCurrentTaskId() instead of getCurrentInProgressTask() because:
+    // 1. getCurrentInProgressTask() queries ANY in_progress task
+    // 2. We need the specific task that was being tracked during this session
+    const current_task_id = store.getCurrentTaskId() orelse {
+        // No tracked task - check for next ready task
+        checkForNextReadyTask(app, store);
+        return;
     };
+
+    // Load the specific tracked task to check for rejection
+    const maybe_task = store.getTaskWithAllocator(current_task_id, app.allocator) catch |err| {
+        std.log.warn("Failed to load tracked task in Judge complete: {}", .{err});
+        checkForNextReadyTask(app, store);
+        return;
+    };
+
     if (maybe_task) |task| {
         defer {
             var t = task;
             t.deinit(app.allocator);
         }
-        // Find most recent REJECTED: comment
-        var i = task.comments.len;
-        while (i > 0) {
-            i -= 1;
-            const comment = task.comments[i];
-            if (std.mem.startsWith(u8, comment.content, "REJECTED:")) {
-                // Extract feedback from comment
-                var feedback = comment.content[9..]; // Skip "REJECTED:"
-                while (feedback.len > 0 and feedback[0] == ' ') {
-                    feedback = feedback[1..];
+
+        // Only check for rejection if task is still in_progress
+        // (complete_task changes status to completed)
+        if (task.status == .in_progress) {
+            // Find most recent REJECTED: comment
+            var i = task.comments.len;
+            while (i > 0) {
+                i -= 1;
+                const comment = task.comments[i];
+                if (std.mem.startsWith(u8, comment.content, "REJECTED:")) {
+                    // Extract feedback from comment
+                    var feedback = comment.content[9..]; // Skip "REJECTED:"
+                    while (feedback.len > 0 and feedback[0] == ' ') {
+                        feedback = feedback[1..];
+                    }
+                    // Judge rejected - trigger Tinkerer to retry
+                    var task_id = task.id;
+                    triggerTinkererRevision(app, &task_id, feedback);
+                    return;
+                } else if (std.mem.startsWith(u8, comment.content, "SUMMARY:") or
+                    std.mem.startsWith(u8, comment.content, "APPROVED:"))
+                {
+                    // If we see SUMMARY or APPROVED before REJECTED, no rejection pending
+                    break;
                 }
-                // Judge rejected - trigger Tinkerer to retry
-                var task_id = task.id;
-                triggerTinkererRevision(app, &task_id, feedback);
-                return;
-            } else if (std.mem.startsWith(u8, comment.content, "SUMMARY:") or
-                std.mem.startsWith(u8, comment.content, "APPROVED:"))
-            {
-                // If we see SUMMARY or APPROVED before REJECTED, no rejection pending
-                break;
             }
         }
     }
 
-    // Judge approved (or no current task) - check for next ready task
+    // Judge approved (or task completed) - check for next ready task
+    checkForNextReadyTask(app, store);
+}
+
+/// Helper: Check for next ready task and trigger questioner if any exist
+fn checkForNextReadyTask(app: *App, store: *task_store_module.TaskStore) void {
     // Use local arena to properly manage task memory
     var task_arena = std.heap.ArenaAllocator.init(app.allocator);
     defer task_arena.deinit();
-    const ready_tasks = task_store.getReadyTasksWithAllocator(task_arena.allocator()) catch |err| {
+    const ready_tasks = store.getReadyTasksWithAllocator(task_arena.allocator()) catch |err| {
         std.log.warn("Failed to get ready tasks in Judge complete: {}", .{err});
         return;
     };
@@ -804,23 +856,58 @@ pub fn triggerTinkererRevision(app: *App, task_id: *const [8]u8, feedback: []con
     };
 }
 
-/// Handle questioner completion - either trigger tinkerer or planner for blocked tasks
+/// Handle questioner completion - route based on questioner's decision (BLOCKED or ready)
 pub fn handleQuestionerComplete(app: *App) void {
-    // Check for ready tasks FIRST - prioritize work over decomposition
-    if (hasReadyTasks(app)) {
-        triggerTinkerer(app);
-    } else if (hasBlockedTasks(app)) {
-        // Only kick back to planner if there's NO ready work
-        triggerPlannerKickback(app);
+    const store = app.app_context.task_store orelse return;
+
+    // Get the task questioner just evaluated (tracked via current_task_id)
+    const task_id = store.getCurrentTaskId() orelse return;
+
+    // Load the task to check its comments
+    const maybe_task = store.getTaskWithAllocator(task_id, app.allocator) catch return;
+    const task = maybe_task orelse return;
+    defer {
+        var t = task;
+        t.deinit(app.allocator);
     }
-    // else: no work to do, execution loop ends
+
+    // Check if questioner blocked the task
+    var is_blocked = false;
+    var i = task.comments.len;
+    while (i > 0) {
+        i -= 1;
+        const comment = task.comments[i];
+        if (std.mem.startsWith(u8, comment.content, "BLOCKED:")) {
+            is_blocked = true;
+            break;
+        }
+    }
+
+    if (is_blocked) {
+        // Questioner blocked → Planner decomposes
+        triggerPlannerKickback(app);
+    } else {
+        // Not blocked → Tinkerer implements (task is already in_progress from start_task)
+        triggerTinkerer(app);
+    }
 }
 
-/// Check if there are any tasks with blocked status
-fn hasBlockedTasks(app: *App) bool {
-    const task_store = app.app_context.task_store orelse return false;
-    const counts = task_store.getTaskCounts() catch return false;
-    return counts.blocked > 0;
+/// Check if the CURRENT task (that tinkerer was working on) is blocked
+/// This checks the specific task, not global blocked count
+fn currentTaskIsBlocked(app: *App) bool {
+    const store = app.app_context.task_store orelse return false;
+    const task_id = store.getCurrentTaskId() orelse return false;
+
+    // Load the task to check its status
+    const maybe_task = store.getTaskWithAllocator(task_id, app.allocator) catch return false;
+    const task = maybe_task orelse return false;
+    defer {
+        var t = task;
+        t.deinit(app.allocator);
+    }
+
+    // Check if this specific task is blocked
+    return task.status == .blocked;
 }
 
 /// Check if there are any ready tasks (pending, no blockers, not molecules)
@@ -919,9 +1006,17 @@ fn triggerPlannerKickback(app: *App) void {
 pub fn processAgentCommandEvents(app: *App) !bool {
     if (app.agent_command_events.items.len == 0) return false;
 
+    std.log.info("processAgentCommandEvents: {d} events in queue", .{app.agent_command_events.items.len});
+
     // Don't process if an agent is already running
-    if (app.agent_thread != null) return false;
-    if (app.app_context.active_agent != null) return false;
+    if (app.agent_thread != null) {
+        std.log.info("processAgentCommandEvents: agent_thread still running, skipping", .{});
+        return false;
+    }
+    if (app.app_context.active_agent != null) {
+        std.log.info("processAgentCommandEvents: active_agent still set, skipping", .{});
+        return false;
+    }
 
     // Clear any stale streaming state before starting new agent
     // This prevents chunks from a fast-starting agent (e.g., OpenRouter) from
@@ -999,7 +1094,9 @@ pub fn endAgentSession(app: *App) !void {
     // Clean up streaming state (agent sets streaming_active when it starts)
     app.streaming_active = false;
     app.streaming_message_idx = null;
-    app.user_scrolled_away = false; // Reset scroll state for next message
+    app.streaming_message_id = null;
+    message_loader.clearStreamingProtection(app); // Clear virtualization protection
+    app.scroll.enableAutoScroll();
 
     // Clear any pending stream chunks from the terminated agent
     {

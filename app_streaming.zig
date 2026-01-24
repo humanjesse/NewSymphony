@@ -246,9 +246,28 @@ pub fn startStreaming(app: *App, format: ?[]const u8) !void {
     _ = try message_renderer.redrawScreen(app);
     app.updateCursorToBottom();
 
-    // Set streaming protection for the new message (Phase 3: Virtualization)
-    const streaming_idx = app.messages.items.len - 1;
-    message_loader.setStreamingProtection(app, streaming_idx);
+    // Clear any pending stream chunks from previous sessions (race condition fix)
+    // This prevents old "done" chunks from clearing state for the new session
+    {
+        app.stream_mutex.lock();
+        defer app.stream_mutex.unlock();
+        for (app.stream_chunks.items) |chunk| {
+            if (chunk.thinking) |t| app.allocator.free(t);
+            if (chunk.content) |c| app.allocator.free(c);
+        }
+        app.stream_chunks.clearRetainingCapacity();
+    }
+
+    // Set streaming message ID and protection (matching agent pattern)
+    // Must use absolute index for virtualization compatibility
+    const local_idx = app.messages.items.len - 1;
+    const abs_idx = app.virtualization.absoluteIndex(local_idx);
+    app.streaming_message_idx = abs_idx;
+    message_loader.setStreamingProtection(app, abs_idx);
+
+    // Assign stable message ID for streaming target (survives virtualization shifts)
+    const message_id = app.assignMessageId(&app.messages.items[local_idx]);
+    app.streaming_message_id = message_id;
 
     // Prepare thread context
     const messages_slice = try ollama_messages.toOwnedSlice(app.allocator);
@@ -295,24 +314,53 @@ pub fn processStreamChunks(
         if (chunk.done) {
             // Streaming complete - clean up
             app.streaming_active = false;
-            app.user_scrolled_away = false; // Reset scroll state for next message
+            app.scroll.enableAutoScroll();
             result.streaming_complete = true;
+
+            // Find target message for final processing
+            const target_idx: ?usize = blk: {
+                if (app.streaming_message_id) |msg_id| {
+                    break :blk app.findMessageById(msg_id);
+                }
+                if (app.streaming_message_idx) |abs_idx| {
+                    break :blk app.virtualization.localIndex(abs_idx);
+                }
+                break :blk if (app.messages.items.len > 0) app.messages.items.len - 1 else null;
+            };
+
+            // Final markdown processing (bypasses throttle to ensure complete rendering)
+            if (target_idx) |idx| {
+                var final_message = &app.messages.items[idx];
+                if (final_message.role == .assistant) {
+                    // Final thinking content processing
+                    if (thinking_accumulator.items.len > 0) {
+                        if (final_message.thinking_content) |old| app.allocator.free(old);
+                        final_message.thinking_content = try app.allocator.dupe(u8, thinking_accumulator.items);
+                        if (final_message.processed_thinking_content) |*old_processed| {
+                            for (old_processed.items) |*item| item.deinit(app.allocator);
+                            old_processed.deinit(app.allocator);
+                        }
+                        final_message.processed_thinking_content = try markdown.processMarkdown(app.allocator, final_message.thinking_content.?);
+                    }
+                    // Final content processing
+                    if (content_accumulator.items.len > 0) {
+                        app.allocator.free(final_message.content);
+                        final_message.content = try app.allocator.dupe(u8, content_accumulator.items);
+                        for (final_message.processed_content.items) |*item| item.deinit(app.allocator);
+                        final_message.processed_content.deinit(app.allocator);
+                        final_message.processed_content = try markdown.processMarkdown(app.allocator, final_message.content);
+                    }
+                }
+                // Collapse thinking when done
+                final_message.thinking_expanded = false;
+            }
 
             thinking_accumulator.clearRetainingCapacity();
             content_accumulator.clearRetainingCapacity();
 
-            // Auto-collapse thinking box when streaming finishes
-            // Convert absolute index to local before accessing array
-            if (app.streaming_message_idx) |abs_idx| {
-                if (app.virtualization.localIndex(abs_idx)) |local_idx| {
-                    app.messages.items[local_idx].thinking_expanded = false;
-                }
-            } else if (app.messages.items.len > 0) {
-                app.messages.items[app.messages.items.len - 1].thinking_expanded = false;
-            }
-
-            // Clear the streaming message index
+            // Clear the streaming message index and ID
             app.streaming_message_idx = null;
+            app.streaming_message_id = null;
 
             // Clear streaming protection (Phase 3: Virtualization)
             message_loader.clearStreamingProtection(app);
@@ -410,15 +458,22 @@ pub fn processStreamChunks(
                 try content_accumulator.appendSlice(app.allocator, c);
             }
 
-            // Update the target message (use streaming_message_idx if set, for agents with tool calls)
-            // Convert absolute streaming index to local array index
-            // NOTE: We no longer fallback to "last message" as this caused a race condition
-            // during agent transitions where chunks would write to the wrong message
+            // Update the target message using stable message ID (survives virtualization shifts)
+            // Fall back to index-based lookup if no ID set (shouldn't happen)
             const local_target_idx: ?usize = blk: {
+                // Primary: Use stable message ID to find target (survives virtualization)
+                if (app.streaming_message_id) |msg_id| {
+                    if (app.findMessageById(msg_id)) |idx| {
+                        break :blk idx;
+                    }
+                    // Message with this ID not found (unloaded) - skip chunk
+                    break :blk null;
+                }
+                // Fallback: Use absolute index if no ID set
                 if (app.streaming_message_idx) |abs_idx| {
                     break :blk app.virtualization.localIndex(abs_idx);
                 }
-                // No streaming_message_idx set - skip this chunk (orphaned during transition)
+                // No streaming target set - skip this chunk (orphaned during transition)
                 break :blk null;
             };
             if (local_target_idx) |msg_idx| {
@@ -431,30 +486,43 @@ pub fn processStreamChunks(
                     continue;
                 }
 
+                // Throttle markdown reprocessing (100ms interval during streaming)
+                const MARKDOWN_THROTTLE_MS = 100;
+                const now = std.time.milliTimestamp();
+                const should_reprocess_markdown = (now - app.last_markdown_process_time) >= MARKDOWN_THROTTLE_MS;
+
                 // Update thinking content if we have any
                 if (thinking_accumulator.items.len > 0) {
                     if (last_message.thinking_content) |old_thinking| {
                         app.allocator.free(old_thinking);
                     }
-                    if (last_message.processed_thinking_content) |*old_processed| {
-                        for (old_processed.items) |*item| {
-                            item.deinit(app.allocator);
-                        }
-                        old_processed.deinit(app.allocator);
-                    }
-
                     last_message.thinking_content = try app.allocator.dupe(u8, thinking_accumulator.items);
-                    last_message.processed_thinking_content = try markdown.processMarkdown(app.allocator, last_message.thinking_content.?);
+
+                    // Only reprocess markdown if throttle allows
+                    if (should_reprocess_markdown) {
+                        if (last_message.processed_thinking_content) |*old_processed| {
+                            for (old_processed.items) |*item| {
+                                item.deinit(app.allocator);
+                            }
+                            old_processed.deinit(app.allocator);
+                        }
+                        last_message.processed_thinking_content = try markdown.processMarkdown(app.allocator, last_message.thinking_content.?);
+                    }
                 }
 
-                // Update main content
+                // Update main content (always update raw content, throttle markdown)
                 app.allocator.free(last_message.content);
-                for (last_message.processed_content.items) |*item| {
-                    item.deinit(app.allocator);
-                }
-                last_message.processed_content.deinit(app.allocator);
-
                 last_message.content = try app.allocator.dupe(u8, content_accumulator.items);
+
+                // Only reprocess markdown if throttle allows
+                if (should_reprocess_markdown) {
+                    for (last_message.processed_content.items) |*item| {
+                        item.deinit(app.allocator);
+                    }
+                    last_message.processed_content.deinit(app.allocator);
+                    last_message.processed_content = try markdown.processMarkdown(app.allocator, last_message.content);
+                    app.last_markdown_process_time = now;
+                }
 
                 // DEBUG: Check content encoding
                 if (std.posix.getenv("DEBUG_LMSTUDIO") != null and last_message.content.len > 0) {
@@ -481,8 +549,6 @@ pub fn processStreamChunks(
                         }
                     }
                 }
-
-                last_message.processed_content = try markdown.processMarkdown(app.allocator, last_message.content);
 
                 // DEBUG: Check if markdown processing worked
                 if (std.posix.getenv("DEBUG_LMSTUDIO") != null) {

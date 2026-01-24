@@ -243,6 +243,9 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     // Step 7: Signal tinkering complete (triggers Judge)
     if (context.tinkering_complete_ptr) |ptr| {
         ptr.* = true;
+        std.log.info("submit_work: tinkering_complete flag set to true", .{});
+    } else {
+        std.log.warn("submit_work: tinkering_complete_ptr is null, cannot signal completion!", .{});
     }
 
     // Response struct for JSON serialization

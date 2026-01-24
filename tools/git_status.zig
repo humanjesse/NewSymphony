@@ -71,11 +71,29 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         },
     }
 
-    // Format output - if empty, show clean message
+    // Get last commit info for context
+    var last_commit_info: []const u8 = "";
+    var last_commit_allocated = false;
+    const log_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "git", "log", "-1", "--oneline" },
+    }) catch null;
+    if (log_result) |lr| {
+        defer allocator.free(lr.stderr);
+        if (lr.term == .Exited and lr.term.Exited == 0 and lr.stdout.len > 0) {
+            const trimmed = std.mem.trim(u8, lr.stdout, " \t\r\n");
+            last_commit_info = std.fmt.allocPrint(allocator, "\nLast commit: {s}", .{trimmed}) catch "";
+            if (last_commit_info.len > 0) last_commit_allocated = true;
+        }
+        allocator.free(lr.stdout);
+    }
+    defer if (last_commit_allocated) allocator.free(last_commit_info);
+
+    // Format output - if empty, show clean message with last commit
     const formatted = if (result.stdout.len == 0)
-        try allocator.dupe(u8, "Working tree clean - no changes detected")
+        try std.fmt.allocPrint(allocator, "Working tree clean - all changes are committed.{s}\n\nNote: Use git_diff(from_commit: \"<started_at_commit>\") to see what was committed for this task.", .{last_commit_info})
     else
-        try std.fmt.allocPrint(allocator, "```\n{s}```", .{result.stdout});
+        try std.fmt.allocPrint(allocator, "```\n{s}```{s}", .{ result.stdout, last_commit_info });
     defer allocator.free(formatted);
 
     return ToolResult.ok(allocator, formatted, start_time, null);

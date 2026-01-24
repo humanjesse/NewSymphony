@@ -253,7 +253,7 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
 
     // Session metadata
     var session_duration_minutes: ?i64 = null;
-    if (store.session_started_at) |start| {
+    if (store.getSessionStartedAt()) |start| {
         const now = std.time.timestamp();
         session_duration_minutes = @divFloor(now - start, 60);
     }
@@ -272,8 +272,8 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         .blocked_tasks = blocked_tasks_list.items,
         .recently_completed = recently_completed_list.items,
         .in_progress_tasks = in_progress_list.items,
-        .session_id = store.session_id,
-        .session_start = store.session_started_at,
+        .session_id = store.getSessionId(),
+        .session_start = store.getSessionStartedAt(),
         .session_duration_minutes = session_duration_minutes,
     };
 

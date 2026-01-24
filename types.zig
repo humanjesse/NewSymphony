@@ -21,6 +21,8 @@ pub const Message = struct {
     processed_thinking_content: ?std.ArrayListUnmanaged(markdown.RenderableItem) = null,
     thinking_expanded: bool = true, // Controls thinking box expansion (main content always shown)
     timestamp: i64,
+    // Stable message ID for streaming (survives virtualization index shifts)
+    message_id: u64 = 0,
     // Tool calling fields
     tool_calls: ?[]ollama.ToolCall = null, // Present when assistant calls tools
     tool_call_id: ?[]const u8 = null, // Required when role is "tool"

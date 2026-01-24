@@ -138,7 +138,7 @@ test "Integration: Full task lifecycle - create, start, complete" {
 
     // Start a session
     try fixture.store.startSession();
-    try testing.expect(fixture.store.session_id != null);
+    try testing.expect(fixture.store.getSessionId() != null);
 
     // Step 1: Create a task
     const task_id = try fixture.store.createTask(.{
@@ -202,7 +202,7 @@ test "Integration: Full task lifecycle - create, start, complete" {
     }
 
     // Verify it's the current task
-    try testing.expectEqual(task_id, fixture.store.current_task_id.?);
+    try testing.expectEqual(task_id, fixture.store.getCurrentTaskId().?);
 
     // Add a comment while working
     try fixture.store.addComment(task_id, "Developer", "Started implementation");
@@ -225,7 +225,7 @@ test "Integration: Full task lifecycle - create, start, complete" {
     }
 
     // Verify current task was cleared
-    try testing.expect(fixture.store.current_task_id == null);
+    try testing.expect(fixture.store.getCurrentTaskId() == null);
 
     // Verify task counts
     const counts = try fixture.store.getTaskCounts();

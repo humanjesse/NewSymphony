@@ -68,7 +68,7 @@ pub const AppContext = struct {
     // When set to true, forces conversation_mode agent to complete
     planning_complete_ptr: ?*bool = null,
 
-    // Pointer to executor's tinkering_complete flag (set by tinkering_done tool)
+    // Pointer to executor's tinkering_complete flag (set by submit_work tool)
     // When set to true, signals that implementation is ready for Judge review
     tinkering_complete_ptr: ?*bool = null,
 

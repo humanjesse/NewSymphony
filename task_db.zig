@@ -901,6 +901,9 @@ pub const TaskDB = struct {
         if (filter.parent_id) |_| {
             try conditions.append(self.allocator, "parent_id = ?");
         }
+        if (filter.search) |_| {
+            try conditions.append(self.allocator, "(title LIKE '%' || ? || '%' OR description LIKE '%' || ? || '%')");
+        }
 
         // Build query
         var query = std.ArrayListUnmanaged(u8){};
@@ -942,6 +945,13 @@ pub const TaskDB = struct {
             try sqlite.bindText(stmt, @intCast(bind_idx), &pid);
             bind_idx += 1;
         }
+        if (filter.search) |s| {
+            // Bind twice for OR condition (title LIKE and description LIKE)
+            try sqlite.bindText(stmt, @intCast(bind_idx), s);
+            bind_idx += 1;
+            try sqlite.bindText(stmt, @intCast(bind_idx), s);
+            bind_idx += 1;
+        }
 
         var tasks = std.ArrayListUnmanaged(Task){};
         errdefer {
@@ -956,9 +966,10 @@ pub const TaskDB = struct {
             var task = try self.taskFromRowWithAllocator(stmt, alloc);
 
             // Post-filter for ready_only (requires checking dependencies)
+            // Ready means: pending status, no active blockers, and NOT a molecule (containers aren't actionable)
             if (filter.ready_only) {
                 const blocked_count = try self.getBlockedByCount(task.id);
-                if (blocked_count > 0 or task.status == .blocked or task.status != .pending) {
+                if (blocked_count > 0 or task.status != .pending or task.task_type == .molecule) {
                     task.deinit(alloc);
                     continue;
                 }
@@ -1268,6 +1279,125 @@ pub const TaskDB = struct {
         }
 
         return ids.toOwnedSlice(self.allocator);
+    }
+
+    /// Blocker info for list_tasks - includes all blockers (active + completed)
+    pub const BlockerInfo = struct {
+        id: TaskId,
+        title: []const u8, // Owned
+        completed: bool,
+
+        pub fn deinit(self: *BlockerInfo, alloc: Allocator) void {
+            alloc.free(self.title);
+        }
+    };
+
+    /// Get all tasks that block this one (both active and completed)
+    /// Returns BlockerInfo with id, title, and completion status
+    pub fn getAllBlockers(self: *Self, task_id: TaskId) ![]BlockerInfo {
+        return self.getAllBlockersWithAllocator(task_id, self.allocator);
+    }
+
+    /// Get all tasks that block this one with specified allocator
+    pub fn getAllBlockersWithAllocator(self: *Self, task_id: TaskId, alloc: Allocator) ![]BlockerInfo {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT t.id, t.title, t.status
+            \\FROM tasks t
+            \\JOIN task_dependencies d ON d.src_id = t.id
+            \\WHERE d.dst_id = ?
+            \\  AND d.dep_type = 'blocks'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+
+        var blockers = std.ArrayListUnmanaged(BlockerInfo){};
+        errdefer {
+            for (blockers.items) |*b| b.deinit(alloc);
+            blockers.deinit(alloc);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var id: TaskId = undefined;
+            if (sqlite.columnText(stmt, 0)) |id_text| {
+                if (id_text.len >= 8) {
+                    @memcpy(&id, id_text[0..8]);
+                } else continue;
+            } else continue;
+
+            const title = if (sqlite.columnText(stmt, 1)) |t|
+                try alloc.dupe(u8, t)
+            else
+                try alloc.dupe(u8, "");
+
+            const status_str = sqlite.columnText(stmt, 2) orelse "pending";
+            const completed = std.mem.eql(u8, status_str, "completed");
+
+            try blockers.append(alloc, .{
+                .id = id,
+                .title = title,
+                .completed = completed,
+            });
+        }
+
+        return blockers.toOwnedSlice(alloc);
+    }
+
+    /// Get all tasks that this task blocks (will be unblocked when completed)
+    /// Returns BlockerInfo with id, title, and completion status
+    pub fn getAllBlocking(self: *Self, task_id: TaskId) ![]BlockerInfo {
+        return self.getAllBlockingWithAllocator(task_id, self.allocator);
+    }
+
+    /// Get all tasks that this task blocks with specified allocator
+    pub fn getAllBlockingWithAllocator(self: *Self, task_id: TaskId, alloc: Allocator) ![]BlockerInfo {
+        const stmt = try sqlite.prepare(self.db,
+            \\SELECT t.id, t.title, t.status
+            \\FROM tasks t
+            \\JOIN task_dependencies d ON d.dst_id = t.id
+            \\WHERE d.src_id = ?
+            \\  AND d.dep_type = 'blocks'
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindText(stmt, 1, &task_id);
+
+        var blocking = std.ArrayListUnmanaged(BlockerInfo){};
+        errdefer {
+            for (blocking.items) |*b| b.deinit(alloc);
+            blocking.deinit(alloc);
+        }
+
+        while (true) {
+            const rc = try sqlite.step(stmt);
+            if (rc != sqlite.SQLITE_ROW) break;
+
+            var id: TaskId = undefined;
+            if (sqlite.columnText(stmt, 0)) |id_text| {
+                if (id_text.len >= 8) {
+                    @memcpy(&id, id_text[0..8]);
+                } else continue;
+            } else continue;
+
+            const title = if (sqlite.columnText(stmt, 1)) |t|
+                try alloc.dupe(u8, t)
+            else
+                try alloc.dupe(u8, "");
+
+            const status_str = sqlite.columnText(stmt, 2) orelse "pending";
+            const completed = std.mem.eql(u8, status_str, "completed");
+
+            try blocking.append(alloc, .{
+                .id = id,
+                .title = title,
+                .completed = completed,
+            });
+        }
+
+        return blocking.toOwnedSlice(alloc);
     }
 
     /// Get tasks that become unblocked when completed_id is completed

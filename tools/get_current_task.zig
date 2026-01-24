@@ -1,6 +1,6 @@
 // Get Current Task Tool - Returns the task you're currently working on
-// Auto-assigns from ready queue if no current task is set
-// Captures started_at_commit for commit tracking (Phase 2)
+// Returns null if no task explicitly set via start_task
+// Captures started_at_commit for commit tracking
 const std = @import("std");
 const ollama = @import("ollama");
 const permission = @import("permission");
@@ -53,7 +53,7 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
             .type = "function",
             .function = .{
                 .name = try allocator.dupe(u8, "get_current_task"),
-                .description = try allocator.dupe(u8, "Get the task you're currently working on. Auto-assigns from ready queue if none set. Includes parent_context when task is a subtask of a molecule."),
+                .description = try allocator.dupe(u8, "Get the task you're currently working on. Returns null if no task set - use list_tasks(ready_only=true) + start_task to select one."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",

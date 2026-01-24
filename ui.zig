@@ -691,7 +691,7 @@ pub fn handleInput(
                         message_loader.ensureMessagesLoaded(app, target_idx) catch {};
 
                         // Mark that user manually scrolled away (disables auto-scroll during streaming)
-                        app.user_scrolled_away = true;
+                        app.scroll.user_scrolled_away = true;
                     }
                 } else if (app.valid_cursor_positions.items.len > 0) {
                     // Cursor not in valid positions - snap to nearest and scroll up
@@ -700,7 +700,7 @@ pub fn handleInput(
                     should_redraw.* = true;
 
                     // Mark that user manually scrolled away (disables auto-scroll during streaming)
-                    app.user_scrolled_away = true;
+                    app.scroll.user_scrolled_away = true;
                 }
                 return false;
             } else if (button == 65) { // Scroll down
@@ -721,13 +721,14 @@ pub fn handleInput(
                         // Re-enable auto-scroll if near the bottom (within 3 lines)
                         // This allows users to resume auto-scroll by scrolling back down
                         if (max_idx - new_cursor_idx <= 3) {
-                            app.user_scrolled_away = false;
+                            app.scroll.scrollToBottom();
                         }
                     }
                 } else if (app.valid_cursor_positions.items.len > 0) {
                     // Cursor not in valid positions - snap to bottom (where user is scrolling toward)
                     app.cursor_y = app.valid_cursor_positions.items[app.valid_cursor_positions.items.len - 1];
-                    // Removed dirty state tracking - rendering now automatic
+                    // Also re-enable auto-scroll since we're at the bottom
+                    app.scroll.scrollToBottom();
                     should_redraw.* = true;
                 }
                 return false;

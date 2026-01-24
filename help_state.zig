@@ -1,10 +1,11 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
+const scroll_controller = @import("scroll_controller");
 
 pub const HelpState = struct {
     allocator: Allocator,
-    scroll_offset: usize,
+    scroll: scroll_controller.ScrollState,
     content_lines: std.ArrayListUnmanaged([]const u8),
     total_lines: usize,
 
@@ -129,7 +130,7 @@ pub const HelpState = struct {
 
         return HelpState{
             .allocator = allocator,
-            .scroll_offset = 0,
+            .scroll = .{ .content_height = content_lines.items.len },
             .content_lines = content_lines,
             .total_lines = content_lines.items.len,
         };
@@ -143,31 +144,34 @@ pub const HelpState = struct {
     }
 
     pub fn scrollUp(self: *HelpState, lines: usize) void {
-        if (self.scroll_offset >= lines) {
-            self.scroll_offset -= lines;
+        // HelpState doesn't track user_scrolled_away, so use direct offset manipulation
+        if (self.scroll.offset >= lines) {
+            self.scroll.offset -= lines;
         } else {
-            self.scroll_offset = 0;
+            self.scroll.offset = 0;
         }
     }
 
     pub fn scrollDown(self: *HelpState, lines: usize, visible_lines: usize) void {
-        const max_scroll = if (self.total_lines > visible_lines)
-            self.total_lines - visible_lines
-        else
-            0;
-
-        self.scroll_offset = @min(self.scroll_offset + lines, max_scroll);
+        // Update viewport for accurate max calculation
+        self.scroll.viewport_height = visible_lines;
+        self.scroll.content_height = self.total_lines;
+        const max = self.scroll.maxScroll();
+        self.scroll.offset = @min(self.scroll.offset + lines, max);
     }
 
     pub fn scrollToTop(self: *HelpState) void {
-        self.scroll_offset = 0;
+        self.scroll.offset = 0;
     }
 
     pub fn scrollToBottom(self: *HelpState, visible_lines: usize) void {
-        if (self.total_lines > visible_lines) {
-            self.scroll_offset = self.total_lines - visible_lines;
-        } else {
-            self.scroll_offset = 0;
-        }
+        self.scroll.viewport_height = visible_lines;
+        self.scroll.content_height = self.total_lines;
+        self.scroll.offset = self.scroll.maxScroll();
+    }
+
+    /// Convenience accessor for scroll offset (for rendering)
+    pub fn scrollOffset(self: *const HelpState) usize {
+        return self.scroll.offset;
     }
 };

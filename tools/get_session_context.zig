@@ -187,7 +187,7 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
     defer if (session_notes) |n| allocator.free(n);
 
     const response = Response{
-        .session_id = store.session_id,
+        .session_id = store.getSessionId(),
         .current_task = current_task,
         .ready_tasks = ready_tasks.items,
         .recently_completed = recently_completed.items,

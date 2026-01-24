@@ -357,21 +357,34 @@ pub const ConversationDB = struct {
         return sqlite.lastInsertRowId(self.db);
     }
 
-    /// Update conversation statistics
+    /// Update conversation statistics (incremental - O(1) instead of O(n) COUNT(*))
     fn updateConversationStats(self: *Self, conversation_id: i64) !void {
         const now = std.time.timestamp();
 
         const stmt = try sqlite.prepare(self.db,
             \\UPDATE conversations
             \\SET last_message_at = ?,
-            \\    message_count = (SELECT COUNT(*) FROM messages WHERE conversation_id = ?)
+            \\    message_count = message_count + 1
             \\WHERE id = ?
         );
         defer sqlite.finalize(stmt);
 
         try sqlite.bindInt64(stmt, 1, now);
         try sqlite.bindInt64(stmt, 2, conversation_id);
-        try sqlite.bindInt64(stmt, 3, conversation_id);
+
+        _ = try sqlite.step(stmt);
+    }
+
+    /// Decrement message count (for message deletion)
+    pub fn decrementMessageCount(self: *Self, conversation_id: i64) !void {
+        const stmt = try sqlite.prepare(self.db,
+            \\UPDATE conversations
+            \\SET message_count = CASE WHEN message_count > 0 THEN message_count - 1 ELSE 0 END
+            \\WHERE id = ?
+        );
+        defer sqlite.finalize(stmt);
+
+        try sqlite.bindInt64(stmt, 1, conversation_id);
 
         _ = try sqlite.step(stmt);
     }

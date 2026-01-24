@@ -115,7 +115,7 @@ pub const AgentExecutor = struct {
     // Planning completion flag (set by planning_done tool)
     planning_complete: bool = false,
 
-    // Tinkering completion flag (set by tinkering_done tool)
+    // Tinkering completion flag (set by submit_work tool)
     tinkering_complete: bool = false,
 
     // Current agent name (for attributing comments)
@@ -474,6 +474,27 @@ pub const AgentExecutor = struct {
                 // Notify completion
                 if (progress_callback) |callback| {
                     callback(callback_user_data, .complete, "Planning complete", null);
+                }
+
+                // Complete the invocation record
+                if (context.conversation_db) |db| {
+                    if (self.invocation_id) |inv_id| {
+                        db.completeAgentInvocation(inv_id, "completed", response_content, @intCast(self.tool_calls_made), @intCast(self.iterations_used)) catch {};
+                    }
+                }
+
+                return try AgentResult.ok(self.allocator, response_content, stats, final_thinking);
+            }
+
+            // Check if submit_work tool was called (overrides conversation_mode)
+            if (self.tinkering_complete) {
+                // Tinkering phase complete - force completion even in conversation mode
+                std.log.info("AgentExecutor: tinkering_complete detected, returning success", .{});
+                self.tinkering_complete = false; // Reset flag for next time
+
+                // Notify completion
+                if (progress_callback) |callback| {
+                    callback(callback_user_data, .complete, "Tinkering complete", null);
                 }
 
                 // Complete the invocation record

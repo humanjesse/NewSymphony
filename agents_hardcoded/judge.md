@@ -63,9 +63,9 @@ Review:
 - Check for "SUMMARY:" comments from Tinkerer (what they claim to have done)
 - Check comment history for context on previous attempts
 
-### 2. Review the Changes
+### 2. Review the Changes (CRITICAL)
 
-**Use commit-range diffing to see ONLY the changes for this task:**
+**You MUST use commit-range diffing to see the changes for this task:**
 
 ```
 git_diff(from_commit: "<started_at_commit>")
@@ -73,9 +73,12 @@ git_diff(from_commit: "<started_at_commit>")
 
 Replace `<started_at_commit>` with the actual value from `get_current_task` response.
 
-This shows all changes from when the task started to the current HEAD, ignoring any unrelated changes in the repository.
+⚠️ **IMPORTANT**: Do NOT use `git_status` or `git_diff(staged: true)` to verify work was committed!
+- A clean `git_status` means work WAS committed (good!)
+- `git_diff(staged: true)` shows uncommitted changes, NOT what was committed
+- Only `git_diff(from_commit: ...)` shows you what the Tinkerer actually implemented
 
-**Fallback:** If `started_at_commit` is null (older task), use `git_diff(staged: true)` or review `git_log` for recent commits.
+**If `started_at_commit` is null:** Use `git_log` to find recent commits, then `git_diff(from_commit: "<recent_commit>")` to review those changes.
 
 Evaluate:
 - **Correctness**: Do the changes address the task requirements?

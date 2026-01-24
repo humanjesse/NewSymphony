@@ -194,6 +194,7 @@ pub const TaskFilter = struct {
     parent_id: ?TaskId = null,
     ready_only: bool = false, // Only tasks with blocked_by_count == 0
     label: ?[]const u8 = null,
+    search: ?[]const u8 = null, // Text search in title/description (case-insensitive LIKE)
 };
 
 /// Session state for cold start recovery and current task tracking
@@ -209,40 +210,39 @@ pub const SessionState = struct {
     }
 };
 
-/// Generate a unique session ID: {timestamp}-{random_hex}
-pub fn generateSessionId(allocator: Allocator) ![]const u8 {
-    const timestamp = std.time.timestamp();
-
-    // Generate 4 random hex chars
-    var random_bytes: [2]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
-
-    const hex_chars = "0123456789abcdef";
-    var random_hex: [4]u8 = undefined;
-    random_hex[0] = hex_chars[random_bytes[0] >> 4];
-    random_hex[1] = hex_chars[random_bytes[0] & 0x0f];
-    random_hex[2] = hex_chars[random_bytes[1] >> 4];
-    random_hex[3] = hex_chars[random_bytes[1] & 0x0f];
-
-    return std.fmt.allocPrint(allocator, "{d}-{s}", .{ timestamp, random_hex });
-}
-
 // Forward import for TaskDB
 const task_db_module = @import("task_db");
 pub const TaskDB = task_db_module.TaskDB;
 
+// Import TaskScheduler for composition
+const task_scheduler = @import("task_scheduler");
+pub const TaskScheduler = task_scheduler.TaskScheduler;
+
 /// Task store - thin facade over SQLite (single source of truth)
-/// Maintains ready_cache for hot-path performance
+/// Composes TaskScheduler for scheduling logic (Single Responsibility Principle)
 pub const TaskStore = struct {
     allocator: Allocator,
     db: *TaskDB, // Required reference to SQLite database
-    ready_cache_valid: bool,
-    ready_cache: std.ArrayListUnmanaged(TaskId),
+    scheduler: TaskScheduler, // Handles ready queue, session state, current task
 
-    // Session state for current task tracking
-    current_task_id: ?TaskId = null,
-    session_id: ?[]const u8 = null,
-    session_started_at: ?i64 = null,
+    // Expose session state for backwards compatibility
+    // Note: These accessors allow existing code using store.session_id to work
+    // by providing getter methods that delegate to the scheduler
+    pub fn getSessionId(self: *const Self) ?[]const u8 {
+        return self.scheduler.session_id;
+    }
+
+    pub fn getSessionStartedAt(self: *const Self) ?i64 {
+        return self.scheduler.session_started_at;
+    }
+
+    // Setter for session_id (used during session restore)
+    pub fn setSessionIdDirect(self: *Self, sid: []const u8) !void {
+        if (self.scheduler.session_id) |old| {
+            self.allocator.free(old);
+        }
+        self.scheduler.session_id = try self.allocator.dupe(u8, sid);
+    }
 
     const Self = @This();
 
@@ -250,94 +250,28 @@ pub const TaskStore = struct {
         return .{
             .allocator = allocator,
             .db = db,
-            .ready_cache_valid = false,
-            .ready_cache = .{},
-            .current_task_id = null,
-            .session_id = null,
-            .session_started_at = null,
+            .scheduler = TaskScheduler.init(allocator, db),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.ready_cache.deinit(self.allocator);
-
-        // Free session state
-        if (self.session_id) |sid| {
-            self.allocator.free(sid);
-        }
+        self.scheduler.deinit();
         // Note: TaskDB is owned by app.zig, not freed here
     }
 
     /// Initialize a new session with a unique ID (transaction-safe)
     pub fn startSession(self: *Self) !void {
-        // Clean up old session if any
-        if (self.session_id) |old_sid| {
-            self.allocator.free(old_sid);
-        }
-
-        // Wrap in transaction for atomicity
-        try self.db.beginTransaction();
-        errdefer {
-            self.db.rollbackTransaction() catch |err| {
-                std.log.err("CRITICAL: Rollback failed: {s}. Database may be in inconsistent state.", .{@errorName(err)});
-            };
-        }
-
-        self.session_id = try generateSessionId(self.allocator);
-        self.session_started_at = std.time.timestamp();
-        self.current_task_id = null;
-
-        // Persist to SQLite
-        try self.db.saveSessionState(self.session_id.?, null, self.session_started_at.?);
-
-        try self.db.commitTransaction();
+        try self.scheduler.startSession();
     }
 
     /// Restore session state from cold start
-    pub fn restoreSession(self: *Self, session_id: []const u8, current_task_id: ?TaskId, started_at: i64) !void {
-        if (self.session_id) |old_sid| {
-            self.allocator.free(old_sid);
-        }
-        self.session_id = try self.allocator.dupe(u8, session_id);
-        self.session_started_at = started_at;
-        self.current_task_id = current_task_id;
+    pub fn restoreSession(self: *Self, session_id: []const u8, current_task_id_param: ?TaskId, started_at: i64) !void {
+        try self.scheduler.restoreSession(session_id, current_task_id_param, started_at);
     }
 
     /// Set the current task explicitly (for start_task) - transaction-safe
     pub fn setCurrentTask(self: *Self, task_id: TaskId) !void {
-        // Verify task exists via SQLite
-        if (!try self.db.taskExists(task_id)) {
-            return error.TaskNotFound;
-        }
-
-        try self.db.beginTransaction();
-        errdefer {
-            self.db.rollbackTransaction() catch |err| {
-                std.log.err("CRITICAL: Rollback failed: {s}. Database may be in inconsistent state.", .{@errorName(err)});
-                // Don't panic - propagate original error, caller can handle recovery
-            };
-        }
-
-        self.current_task_id = task_id;
-
-        // Update task status to in_progress if pending
-        if (try self.db.loadTask(task_id)) |task| {
-            defer {
-                var t = task;
-                t.deinit(self.allocator);
-            }
-            if (task.status == .pending) {
-                try self.db.updateTaskStatus(task_id, .in_progress, null);
-                self.ready_cache_valid = false;
-            }
-        }
-
-        // Persist session state
-        if (self.session_id) |sid| {
-            try self.db.saveSessionState(sid, self.current_task_id, self.session_started_at orelse std.time.timestamp());
-        }
-
-        try self.db.commitTransaction();
+        try self.scheduler.setCurrentTask(task_id);
     }
 
     /// Set the started_at_commit for a task (commit tracking for Tinkerer workflow)
@@ -376,73 +310,33 @@ pub const TaskStore = struct {
         }
     }
 
-    /// Get the current task, auto-assigning from ready queue if none set
+    /// Get the current task, with validation and orphan adoption for backwards compatibility
     /// Returns null if no tasks are ready
     /// IMPORTANT: Caller must free the returned Task via task.deinit(allocator)
     pub fn getCurrentTask(self: *Self) !?Task {
-        return self.getCurrentTaskWithAllocator(self.allocator);
+        // Validate and adopt for backwards compatibility (maintains original behavior)
+        try self.scheduler.validateCurrentTask();
+        _ = try self.scheduler.adoptOrphanedTask();
+        return self.scheduler.getCurrentTask();
     }
 
     /// Get current task with specified allocator
-    /// When used with arena allocator, no manual cleanup is needed
+    /// Validates and adopts orphaned tasks for backwards compatibility
     pub fn getCurrentTaskWithAllocator(self: *Self, alloc: Allocator) !?Task {
-        // If we have a current task, check if still valid
-        if (self.current_task_id) |cid| {
-            if (try self.db.loadTaskWithAllocator(cid, alloc)) |task| {
-                // Only return if task is still workable
-                if (task.status == .in_progress or task.status == .pending) {
-                    return task;
-                }
-                // Task no longer valid, free it and clear current
-                var t = task;
-                t.deinit(alloc);
-            }
-            // Current task is no longer valid, clear it
-            self.current_task_id = null;
-        }
-
-        // Check for orphaned in_progress tasks (from previous sessions that didn't clean up)
-        // This prevents tasks from getting "stuck" when session state is lost
-        if (try self.getCurrentInProgressTaskWithAllocator(alloc)) |in_progress_task| {
-            // Found an orphaned in_progress task - adopt it as current
-            self.current_task_id = in_progress_task.id;
-            return in_progress_task;
-        }
-
-        // Auto-assign from ready queue
-        const ready = try self.getReadyTasksWithAllocator(alloc);
-        defer {
-            for (ready) |*r| {
-                var task = r.*;
-                task.deinit(alloc);
-            }
-            alloc.free(ready);
-        }
-
-        if (ready.len > 0) {
-            // Pick highest priority (already sorted)
-            const task_id = ready[0].id;
-            self.current_task_id = task_id;
-
-            // Mark as in_progress
-            try self.db.updateTaskStatus(task_id, .in_progress, null);
-            self.ready_cache_valid = false;
-
-            // Return freshly loaded task
-            return try self.db.loadTaskWithAllocator(task_id, alloc);
-        }
-
-        return null;
+        // Validate and adopt for backwards compatibility (maintains original behavior)
+        try self.scheduler.validateCurrentTask();
+        _ = try self.scheduler.adoptOrphanedTask();
+        return self.scheduler.getCurrentTaskWithAllocator(alloc);
     }
 
     /// Clear the current task (called before auto-advance)
     pub fn clearCurrentTask(self: *Self) void {
-        self.current_task_id = null;
+        self.scheduler.clearCurrentTask();
     }
 
     /// Get current task ID without auto-assignment
     pub fn getCurrentTaskId(self: *Self) ?TaskId {
-        return self.current_task_id;
+        return self.scheduler.getCurrentTaskId();
     }
 
     /// Generate a hash-based task ID from title and timestamp
@@ -538,7 +432,7 @@ pub const TaskStore = struct {
         try self.db.commitTransaction();
 
         // Invalidate ready cache
-        self.ready_cache_valid = false;
+        self.scheduler.invalidateCache();
 
         return id;
     }
@@ -577,7 +471,9 @@ pub const TaskStore = struct {
 
         const completed_at: ?i64 = if (new_status == .completed) std.time.timestamp() else null;
         try self.db.updateTaskStatus(task_id, new_status, completed_at);
-        self.ready_cache_valid = false;
+
+        // Notify scheduler of status change
+        self.scheduler.handleTaskStatusChange(task_id, new_status, null);
     }
 
     /// Update task priority
@@ -594,7 +490,7 @@ pub const TaskStore = struct {
             return error.TaskNotFound;
         }
         try self.db.updateTaskTitle(task_id, new_title);
-        self.ready_cache_valid = false;
+        self.scheduler.invalidateCache();
     }
 
     /// Update task type (cannot change to/from wisp)
@@ -609,7 +505,9 @@ pub const TaskStore = struct {
                 return error.CannotChangeWispType;
             }
             try self.db.updateTaskType(task_id, new_type);
-            self.ready_cache_valid = false;
+
+            // Notify scheduler of type change (clears current if molecule)
+            self.scheduler.handleTaskStatusChange(task_id, task.status, new_type);
         } else {
             return error.TaskNotFound;
         }
@@ -669,6 +567,9 @@ pub const TaskStore = struct {
             if (new_type == .molecule and task.status == .blocked) {
                 try self.db.updateTaskStatus(task_id, .pending, null);
             }
+
+            // Notify scheduler of type change (clears current if molecule)
+            self.scheduler.handleTaskStatusChange(task_id, task.status, new_type);
         }
 
         var result: ?CompleteResult = null;
@@ -679,12 +580,8 @@ pub const TaskStore = struct {
                 const now = std.time.timestamp();
                 try self.db.updateTaskStatus(task_id, .completed, now);
 
-                // Clear current task if we just completed it
-                if (self.current_task_id) |cid| {
-                    if (mem.eql(u8, &cid, &task_id)) {
-                        self.current_task_id = null;
-                    }
-                }
+                // Notify scheduler of status change
+                self.scheduler.handleTaskStatusChange(task_id, new_status, null);
 
                 // Find tasks that become unblocked
                 const unblocked_ids = try self.db.getNewlyUnblockedTasks(task_id);
@@ -702,11 +599,14 @@ pub const TaskStore = struct {
             } else {
                 const completed_at: ?i64 = null;
                 try self.db.updateTaskStatus(task_id, new_status, completed_at);
+
+                // Notify scheduler of status change
+                self.scheduler.handleTaskStatusChange(task_id, new_status, null);
             }
         }
 
         try self.db.commitTransaction();
-        self.ready_cache_valid = false;
+        self.scheduler.invalidateCache();
 
         return result;
     }
@@ -755,44 +655,9 @@ pub const TaskStore = struct {
     }
 
     /// Check if adding a blocks dependency from src_id to dst_id would create a cycle
-    /// Uses DFS: starts from dst_id and follows .blocks edges forward
-    /// If we reach src_id, adding src->dst would create a cycle
+    /// Delegates to TaskScheduler
     fn wouldCreateCycle(self: *Self, src_id: TaskId, dst_id: TaskId) !bool {
-        // DFS from dst_id following .blocks edges
-        // If we can reach src_id, adding src->dst would create a cycle
-        var visited = std.AutoHashMap(TaskId, void).init(self.allocator);
-        defer visited.deinit();
-
-        var stack = std.ArrayListUnmanaged(TaskId){};
-        defer stack.deinit(self.allocator);
-
-        try stack.append(self.allocator, dst_id);
-
-        while (stack.items.len > 0) {
-            const last_idx = stack.items.len - 1;
-            const current = stack.items[last_idx];
-            _ = stack.orderedRemove(last_idx);
-
-            // If we reached src_id, we found a cycle
-            if (mem.eql(u8, &current, &src_id)) {
-                return true;
-            }
-
-            if (visited.contains(current)) continue;
-            try visited.put(current, {});
-
-            // Get all tasks that current blocks (follow edges forward)
-            const blocked_ids = try self.db.getBlockingTaskIds(current);
-            defer self.allocator.free(blocked_ids);
-
-            for (blocked_ids) |blocked_id| {
-                if (!visited.contains(blocked_id)) {
-                    try stack.append(self.allocator, blocked_id);
-                }
-            }
-        }
-
-        return false;
+        return self.scheduler.wouldCreateCycle(src_id, dst_id);
     }
 
     /// Internal: Add a dependency between tasks (for use within existing transactions)
@@ -840,7 +705,7 @@ pub const TaskStore = struct {
             }
         }
 
-        self.ready_cache_valid = false;
+        self.scheduler.invalidateCache();
     }
 
     /// Add a dependency between tasks (public API - transaction-safe)
@@ -888,7 +753,7 @@ pub const TaskStore = struct {
         }
 
         try self.db.commitTransaction();
-        self.ready_cache_valid = false;
+        self.scheduler.invalidateCache();
     }
 
     /// Complete a task and cascade to dependents
@@ -912,12 +777,8 @@ pub const TaskStore = struct {
         // Mark task as completed
         try self.db.updateTaskStatus(task_id, .completed, now);
 
-        // Clear current task if we just completed it
-        if (self.current_task_id) |cid| {
-            if (mem.eql(u8, &cid, &task_id)) {
-                self.current_task_id = null;
-            }
-        }
+        // Notify scheduler of status change
+        self.scheduler.handleTaskStatusChange(task_id, .completed, null);
 
         // Find tasks that become unblocked (no need to delete deps, filter at query time)
         const unblocked_ids = try self.db.getNewlyUnblockedTasks(task_id);
@@ -930,7 +791,7 @@ pub const TaskStore = struct {
 
         try self.db.commitTransaction();
 
-        self.ready_cache_valid = false;
+        self.scheduler.invalidateCache();
 
         return .{
             .task_id = task_id,
@@ -981,29 +842,13 @@ pub const TaskStore = struct {
     /// Get all ready tasks (pending with no blockers), sorted by priority
     /// IMPORTANT: Caller must free each returned Task via task.deinit(allocator)
     pub fn getReadyTasks(self: *Self) ![]Task {
-        return self.getReadyTasksWithAllocator(self.allocator);
+        return self.scheduler.getReadyTasks();
     }
 
     /// Get all ready tasks with specified allocator
     /// When used with arena allocator, no manual cleanup is needed
     pub fn getReadyTasksWithAllocator(self: *Self, alloc: Allocator) ![]Task {
-        // Use cache if valid
-        if (self.ready_cache_valid) {
-            // Rebuild tasks from cached IDs
-            return try self.db.getTasksByIdsWithAllocator(self.ready_cache.items, alloc);
-        }
-
-        // Cache miss: query SQLite for ready tasks
-        const tasks = try self.db.getReadyTasksWithAllocator(alloc);
-
-        // Update cache with IDs
-        self.ready_cache.clearRetainingCapacity();
-        for (tasks) |t| {
-            try self.ready_cache.append(self.allocator, t.id);
-        }
-        self.ready_cache_valid = true;
-
-        return tasks;
+        return self.scheduler.getReadyTasksWithAllocator(alloc);
     }
 
     /// Get count of tasks by status

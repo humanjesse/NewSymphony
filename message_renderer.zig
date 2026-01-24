@@ -223,10 +223,7 @@ pub fn buildMessageLayout(app: *App, message: *Message) !MessageLayout {
                 .line_type = .collapsed_tool,
                 .content = try summary.toOwnedSlice(app.allocator),
             });
-            try layout.lines.append(app.allocator, .{
-                .line_type = .separator,
-                .content = try app.allocator.dupe(u8, ""),
-            });
+            // No separator after collapsed tool - nothing follows it
         }
     }
 
@@ -586,8 +583,8 @@ pub fn getVisibleMessageRange(app: *App) !VisibleRange {
     else
         1;
 
-    const viewport_top = app.scroll_y;
-    const viewport_bottom = app.scroll_y + viewport_height;
+    const viewport_top = app.scroll.offset;
+    const viewport_bottom = app.scroll.offset + viewport_height;
 
     // Find first visible message (binary search would be better for large lists)
     var start: usize = 0;
@@ -1269,7 +1266,7 @@ pub fn drawMessage(
             }
             try summary.appendSlice(app.allocator, " - Ctrl+O to expand\x1b[0m");
             try all_lines.append(app.allocator, try summary.toOwnedSlice(app.allocator));
-            try all_lines.append(app.allocator, try app.allocator.dupe(u8, "SEPARATOR"));
+            // No separator after collapsed tool - nothing follows it
         }
     }
 
@@ -1588,8 +1585,8 @@ pub fn drawMessage(
         try app.valid_cursor_positions.append(app.allocator, current_absolute_y);
 
         // Render only rows within viewport (use <= to include last visible line)
-        if (current_absolute_y >= app.scroll_y and current_absolute_y - app.scroll_y <= viewport_height - 1) {
-            const screen_y = (current_absolute_y - app.scroll_y) + 1;
+        if (current_absolute_y >= app.scroll.offset and current_absolute_y - app.scroll.offset <= viewport_height - 1) {
+            const screen_y = (current_absolute_y - app.scroll.offset) + 1;
 
             // Draw cursor
             if (current_absolute_y == app.cursor_y) {
@@ -1639,8 +1636,8 @@ pub fn drawMessage(
     // Add spacing after each message for readability
     // Clear the spacing line if it's in the viewport
     const spacing_y = absolute_y.*;
-    if (spacing_y >= app.scroll_y and spacing_y - app.scroll_y <= viewport_height - 1) {
-        const screen_y = (spacing_y - app.scroll_y) + 1;
+    if (spacing_y >= app.scroll.offset and spacing_y - app.scroll.offset <= viewport_height - 1) {
+        const screen_y = (spacing_y - app.scroll.offset) + 1;
         try writer.print("\x1b[{d};1H\x1b[K", .{screen_y}); // Clear the spacing line
     }
     absolute_y.* += 1;
@@ -2007,43 +2004,15 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
         self.render_cache.previous_content_height = 0;
     }
 
-    // Remember previous content height for delta-based scrolling
-    const previous_height = self.render_cache.previous_content_height;
+    // Update viewport height for scroll calculations
+    self.scroll.updateViewportHeight(viewport_height);
 
     // Rebuild position cache (uses cached heights, single pass)
     try rebuildPositionCache(self);
     const total_content_height = self.render_cache.total_content_height;
 
-    // Update previous height tracking
-    self.render_cache.previous_content_height = total_content_height;
-
-    // Auto-scroll to bottom (only if user hasn't manually scrolled away)
-    if (!self.user_scrolled_away) {
-        const max_scroll = if (total_content_height > viewport_height)
-            total_content_height - viewport_height
-        else
-            0;
-
-        // Use delta-based scrolling to avoid jumps from height fluctuations
-        // Only scroll by the amount content actually grew
-        if (previous_height > 0 and total_content_height > previous_height) {
-            const height_delta = total_content_height - previous_height;
-            self.scroll_y = @min(self.scroll_y + height_delta, max_scroll);
-        } else if (previous_height == 0 or self.scroll_y < max_scroll) {
-            // First render or not yet at bottom - snap to bottom
-            self.scroll_y = max_scroll;
-        }
-        // Note: if content shrunk, keep scroll_y where it is (clamped below)
-    }
-
-    // Ensure scroll_y stays within valid bounds for all cases
-    const max_scroll = if (total_content_height > viewport_height)
-        total_content_height - viewport_height
-    else
-        0;
-    if (self.scroll_y > max_scroll) {
-        self.scroll_y = max_scroll;
-    }
+    // Update content height - this handles auto-scroll and clamping
+    self.scroll.updateContentHeight(total_content_height);
 
     // Clear screen only on resize or first render
     if (clear_screen) {
@@ -2054,6 +2023,12 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
     self.valid_cursor_positions.clearRetainingCapacity();
 
     var absolute_y: usize = 1;
+
+    // Account for unloaded messages before loaded range
+    // This must match rebuildPositionCache() to keep scroll offset and render positions in sync
+    for (0..self.virtualization.loaded_start) |abs_idx| {
+        absolute_y += self.virtualization.getEstimatedHeight(abs_idx);
+    }
 
     // Render all messages (viewport clipping happens inside drawMessage)
     for (self.messages.items) |*message| {
@@ -2121,8 +2096,8 @@ fn renderMessages(self: *App, clear_screen: bool) !usize {
     }
 
     // Clear leftover content below messages
-    const screen_y_for_clear = if (absolute_y > self.scroll_y)
-        (absolute_y - self.scroll_y) + 1
+    const screen_y_for_clear = if (absolute_y > self.scroll.offset)
+        (absolute_y - self.scroll.offset) + 1
     else
         1;
 

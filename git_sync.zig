@@ -476,7 +476,7 @@ pub const GitSync = struct {
 
         // Header with session ID
         try writer.writeAll("# Session State\n\n");
-        if (store.session_id) |sid| {
+        if (store.getSessionId()) |sid| {
             try writer.print("Session ID: {s}\n", .{sid});
         }
         const now = std.time.timestamp();
@@ -484,7 +484,7 @@ pub const GitSync = struct {
 
         // Current Task section
         try writer.writeAll("## Current Task\n");
-        if (store.current_task_id) |cid| {
+        if (store.getCurrentTaskId()) |cid| {
             if (try store.getTask(cid)) |task| {
                 defer {
                     var t = task;

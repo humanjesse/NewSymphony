@@ -38,6 +38,7 @@ const conversation_db_module = @import("conversation_db");
 const task_store_module = @import("task_store");
 const task_db_module = @import("task_db");
 const git_sync_module = @import("git_sync");
+const scroll_controller = @import("scroll_controller");
 
 // Import extracted modules
 const app_streaming = @import("app_streaming.zig");
@@ -107,6 +108,7 @@ pub const VirtualizationState = struct {
     streaming_message_idx: ?usize = null, // Protected message during streaming
     estimated_heights: std.AutoHashMapUnmanaged(usize, usize) = .{}, // Heights of unloaded messages
     average_message_height: usize = 15, // Default for never-loaded messages
+    height_sum: usize = 0, // Running sum for O(1) average calculation
     last_load_time: i64 = 0, // For debouncing rapid scroll
 
     const Self = @This();
@@ -140,25 +142,31 @@ pub const VirtualizationState = struct {
         return self.estimated_heights.get(absolute_idx) orelse self.average_message_height;
     }
 
-    /// Store height estimate before unloading a message
+    /// Store height estimate before unloading a message (O(1) incremental average)
     pub fn storeHeightEstimate(self: *Self, allocator: mem.Allocator, absolute_idx: usize, height: usize) !void {
+        // Check if we're updating an existing entry
+        if (self.estimated_heights.get(absolute_idx)) |old_height| {
+            // Update: adjust sum by delta
+            self.height_sum = self.height_sum - old_height + height;
+        } else {
+            // New entry: add to sum
+            self.height_sum += height;
+        }
+
         try self.estimated_heights.put(allocator, absolute_idx, height);
 
-        // Update running average
+        // Update average using running sum (O(1) instead of O(n))
         const count = self.estimated_heights.count();
         if (count > 0) {
-            var total: usize = 0;
-            var iter = self.estimated_heights.valueIterator();
-            while (iter.next()) |h| {
-                total += h.*;
-            }
-            self.average_message_height = total / count;
+            self.average_message_height = self.height_sum / count;
         }
     }
 
     /// Clear all height estimates (on terminal resize)
     pub fn clearHeightEstimates(self: *Self) void {
         self.estimated_heights.clearRetainingCapacity();
+        self.height_sum = 0;
+        self.average_message_height = 15; // Reset to default
     }
 };
 
@@ -193,7 +201,7 @@ pub const App = struct {
     llm_provider: llm_provider_module.LLMProvider,
     input_buffer: std.ArrayListUnmanaged(u8),
     clickable_areas: std.ArrayListUnmanaged(ClickableArea),
-    scroll_y: usize = 0,
+    scroll: scroll_controller.ScrollState = .{},
     cursor_y: usize = 1,
     terminal_size: ui.TerminalSize,
     valid_cursor_positions: std.ArrayListUnmanaged(usize),
@@ -204,7 +212,9 @@ pub const App = struct {
     // Streaming state
     streaming_active: bool = false,
     streaming_message_idx: ?usize = null, // Specific message to update (for agents with tool calls)
-    user_scrolled_away: bool = false, // Track if user manually scrolled away from bottom
+    streaming_message_id: ?u64 = null, // Stable ID for streaming target (survives virtualization)
+    next_message_id: u64 = 1, // Counter for assigning unique message IDs
+    last_markdown_process_time: i64 = 0, // Throttle markdown reprocessing (ms timestamp)
     // Agent responding state (for status indicator)
     agent_responding: bool = false,
     stream_mutex: std.Thread.Mutex = .{},
@@ -455,13 +465,11 @@ pub const App = struct {
             }
 
             // Restore session to TaskStore
-            task_store_ptr.session_id = try allocator.dupe(u8, state.session_id);
-            task_store_ptr.session_started_at = state.started_at;
-            if (state.current_task_id) |cid| {
-                if (try task_db_ptr.taskExists(cid)) {
-                    task_store_ptr.current_task_id = cid;
-                }
-            }
+            const current_task = if (state.current_task_id) |cid|
+                if (try task_db_ptr.taskExists(cid)) cid else null
+            else
+                null;
+            try task_store_ptr.restoreSession(state.session_id, current_task, state.started_at);
         } else {
             // Start a new session
             try task_store_ptr.startSession();
@@ -503,6 +511,24 @@ pub const App = struct {
         } else {
             return error.DatabaseNotInitialized;
         }
+    }
+
+    /// Find a message by its stable ID, returns local index if found
+    pub fn findMessageById(self: *App, message_id: u64) ?usize {
+        for (self.messages.items, 0..) |*msg, idx| {
+            if (msg.message_id == message_id) {
+                return idx;
+            }
+        }
+        return null;
+    }
+
+    /// Assign a unique ID to a message and return it
+    pub fn assignMessageId(self: *App, message: *Message) u64 {
+        const id = self.next_message_id;
+        self.next_message_id += 1;
+        message.message_id = id;
+        return id;
     }
 
     /// Invalidate height cache for a specific message (call when message content changes)
@@ -710,8 +736,8 @@ pub const App = struct {
         _ = try message_renderer.redrawScreen(self);
         self.updateCursorToBottom();
 
-        // Reset scroll state so response auto-scrolls
-        self.user_scrolled_away = false;
+        // Enable auto-scroll for response
+        self.scroll.enableAutoScroll();
 
         // 2. Start streaming
         try app_streaming.startStreaming(self, format);
@@ -969,10 +995,12 @@ pub const App = struct {
         _ = app_tui; // Will be used later for editor integration
 
         // Buffers for accumulating stream data
+        // Track which streaming session the accumulators belong to
         var thinking_accumulator = std.ArrayListUnmanaged(u8){};
         defer thinking_accumulator.deinit(self.allocator);
         var content_accumulator = std.ArrayListUnmanaged(u8){};
         defer content_accumulator.deinit(self.allocator);
+        var accumulator_session_id: ?u64 = null; // Tracks which streaming_message_id the accumulators belong to
 
         while (true) {
             // 1. Modal modes take priority
@@ -997,6 +1025,20 @@ pub const App = struct {
 
             // 3. Process stream chunks
             if (self.streaming_active) {
+                // Detect session change - clear accumulators if streaming to a different message
+                // This fixes a race condition where the done chunk from the previous session
+                // might not be processed before the new session starts
+                if (self.streaming_message_id) |current_id| {
+                    if (accumulator_session_id) |prev_id| {
+                        if (current_id != prev_id) {
+                            // New streaming session - clear stale accumulator content
+                            thinking_accumulator.clearRetainingCapacity();
+                            content_accumulator.clearRetainingCapacity();
+                        }
+                    }
+                    accumulator_session_id = current_id;
+                }
+
                 const result = try app_streaming.processStreamChunks(
                     self,
                     &thinking_accumulator,
@@ -1012,6 +1054,10 @@ pub const App = struct {
                 // Process queued messages after main streaming completes (no tool calls)
                 if (result.streaming_complete and !result.has_pending_tool_calls) {
                     _ = try self.processQueuedMessages();
+                }
+                // Clear session tracking when streaming ends
+                if (result.streaming_complete) {
+                    accumulator_session_id = null;
                 }
                 if (result.needs_redraw) {
                     _ = try message_renderer.redrawScreen(self);
@@ -1104,11 +1150,11 @@ pub const App = struct {
                 self.terminal_size.height - input_field_height - 1
             else
                 1;
-            if (self.cursor_y < self.scroll_y + 1) {
-                self.scroll_y = if (self.cursor_y > 0) self.cursor_y - 1 else 0;
+            if (self.cursor_y < self.scroll.offset + 1) {
+                self.scroll.offset = if (self.cursor_y > 0) self.cursor_y - 1 else 0;
             }
-            if (self.cursor_y > self.scroll_y + view_height) {
-                self.scroll_y = self.cursor_y - view_height;
+            if (self.cursor_y > self.scroll.offset + view_height) {
+                self.scroll.offset = self.cursor_y - view_height;
             }
         }
     }

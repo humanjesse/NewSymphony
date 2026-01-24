@@ -31,7 +31,7 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
             .type = "function",
             .function = .{
                 .name = try allocator.dupe(u8, "add_task_comment"),
-                .description = try allocator.dupe(u8, "Add a comment to a task's audit trail. Use prefixes like 'BLOCKED:', 'REJECTED:', 'APPROVED:', 'SUMMARY:' for structured communication between agents."),
+                .description = try allocator.dupe(u8, "Add a comment to a task's audit trail. Use prefixes for structured agent communication."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
@@ -42,7 +42,7 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
                     \\    },
                     \\    "comment": {
                     \\      "type": "string",
-                    \\      "description": "The comment to add. Use prefixes for structured feedback: BLOCKED:, REJECTED:, APPROVED:, SUMMARY:"
+                    \\      "description": "The comment to add. Prefixes: BLOCKED: (needs decomposition), QUEUED: (ready for work), REJECTED: (needs revision), APPROVED: (work accepted), SUMMARY: (completion notes)"
                     \\    }
                     \\  },
                     \\  "required": ["comment"]

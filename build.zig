@@ -37,8 +37,16 @@ pub fn build(b: *std.Build) void {
     task_db_module.addImport("sqlite", sqlite_module);
     task_db_module.addImport("task_store", task_store_module);
 
-    // Add task_db to task_store (facade pattern - store delegates to db)
+    // TaskScheduler module - scheduling logic extracted from TaskStore
+    const task_scheduler_module = b.createModule(.{
+        .root_source_file = b.path("task_scheduler.zig"),
+    });
+    task_scheduler_module.addImport("task_store", task_store_module);
+    task_scheduler_module.addImport("task_db", task_db_module);
+
+    // Add task_db and task_scheduler to task_store (facade pattern - store delegates to db and scheduler)
     task_store_module.addImport("task_db", task_db_module);
+    task_store_module.addImport("task_scheduler", task_scheduler_module);
 
     // Git sync module for task persistence
     const git_sync_module = b.createModule(.{
@@ -218,9 +226,15 @@ pub fn build(b: *std.Build) void {
     });
     agent_builder_state_module.addImport("tools", tools_module);
 
+    // Scroll controller module (unified scroll state management)
+    const scroll_controller_module = b.createModule(.{
+        .root_source_file = b.path("scroll_controller.zig"),
+    });
+
     const help_state_module = b.createModule(.{
         .root_source_file = b.path("help_state.zig"),
     });
+    help_state_module.addImport("scroll_controller", scroll_controller_module);
 
     // UI helper modules (renderer + input for each state)
     const config_editor_renderer_module = b.createModule(.{
@@ -411,6 +425,7 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("task_store", task_store_module);
     app_module.addImport("task_db", task_db_module);
     app_module.addImport("git_sync", git_sync_module);
+    app_module.addImport("scroll_controller", scroll_controller_module);
 
     // Message loader module (Phase 3: Virtualization)
     // Note: Defined early so it can be added to app_module and other modules

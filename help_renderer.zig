@@ -30,7 +30,7 @@ pub fn render(
     try writer.writeAll("┐");
 
     // Draw content lines
-    const start_line = state.scroll_offset;
+    const start_line = state.scroll.offset;
     const end_line = @min(start_line + content_height, state.total_lines);
 
     var row: usize = 0;
@@ -89,12 +89,12 @@ pub fn render(
 
     // Calculate scroll indicator
     const scroll_percent = if (state.total_lines > content_height)
-        (state.scroll_offset * 100) / (state.total_lines - content_height)
+        (state.scroll.offset * 100) / (state.total_lines - content_height)
     else
         0;
 
-    const at_top = state.scroll_offset == 0;
-    const at_bottom = (state.scroll_offset + content_height) >= state.total_lines;
+    const at_top = state.scroll.offset == 0;
+    const at_bottom = (state.scroll.offset + content_height) >= state.total_lines;
 
     var footer_buf: [256]u8 = undefined;
     const footer_text = if (at_top)

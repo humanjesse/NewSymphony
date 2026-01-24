@@ -468,8 +468,8 @@ test "TaskStore startSession creates session ID" {
 
     try fixture.store.startSession();
 
-    try testing.expect(fixture.store.session_id != null);
-    try testing.expect(fixture.store.session_started_at != null);
+    try testing.expect(fixture.store.getSessionId() != null);
+    try testing.expect(fixture.store.getSessionStartedAt() != null);
 }
 
 test "TaskStore setCurrentTask sets and persists current task" {
@@ -484,8 +484,8 @@ test "TaskStore setCurrentTask sets and persists current task" {
 
     try fixture.store.setCurrentTask(task_id);
 
-    try testing.expect(fixture.store.current_task_id != null);
-    try testing.expectEqual(task_id, fixture.store.current_task_id.?);
+    try testing.expect(fixture.store.getCurrentTaskId() != null);
+    try testing.expectEqual(task_id, fixture.store.getCurrentTaskId().?);
 
     // Task should be marked as in_progress
     var task = (try fixture.store.getTask(task_id)).?;
@@ -493,7 +493,7 @@ test "TaskStore setCurrentTask sets and persists current task" {
     try testing.expectEqual(TaskStatus.in_progress, task.status);
 }
 
-test "TaskStore getCurrentTask auto-assigns from ready queue" {
+test "TaskStore getCurrentTask requires explicit start_task" {
     const allocator = testing.allocator;
 
     var fixture = try TestFixture.init(allocator);
@@ -503,11 +503,18 @@ test "TaskStore getCurrentTask auto-assigns from ready queue" {
 
     // Create a task but don't set it as current
     const task_id = try fixture.store.createTask(.{
-        .title = "Auto Assign Task",
+        .title = "Model Selected Task",
         .priority = .critical,
     });
 
-    // getCurrentTask should auto-assign
+    // getCurrentTask should return null - no auto-assignment
+    const no_task = try fixture.store.getCurrentTask();
+    try testing.expectEqual(@as(?Task, null), no_task);
+
+    // Explicitly set current task (simulating start_task tool)
+    try fixture.store.setCurrentTask(task_id);
+
+    // Now getCurrentTask should return the task
     var task = (try fixture.store.getCurrentTask()).?;
     defer task.deinit(allocator);
 
@@ -538,11 +545,11 @@ test "TaskStore clearCurrentTask clears current task" {
     const task_id = try fixture.store.createTask(.{ .title = "Clear Me" });
     try fixture.store.setCurrentTask(task_id);
 
-    try testing.expect(fixture.store.current_task_id != null);
+    try testing.expect(fixture.store.getCurrentTaskId() != null);
 
     fixture.store.clearCurrentTask();
 
-    try testing.expectEqual(@as(?TaskId, null), fixture.store.current_task_id);
+    try testing.expectEqual(@as(?TaskId, null), fixture.store.getCurrentTaskId());
 }
 
 // ============================================================
@@ -741,5 +748,379 @@ test "TaskStore updateStatus rejects blocking a molecule" {
         var task = (try fixture.store.getTask(task_id)).?;
         defer task.deinit(allocator);
         try testing.expectEqual(TaskStatus.pending, task.status);
+    }
+}
+
+test "TaskStore getCurrentTask returns null when current task is a molecule" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    try fixture.store.startSession();
+
+    // Create a regular task and set it as current
+    const task_id = try fixture.store.createTask(.{
+        .title = "Task to become molecule",
+    });
+
+    try fixture.store.setCurrentTask(task_id);
+
+    // Verify it's the current task
+    {
+        var task = (try fixture.store.getCurrentTask()).?;
+        defer task.deinit(allocator);
+        try testing.expectEqual(task_id, task.id);
+        try testing.expectEqual(TaskStatus.in_progress, task.status);
+    }
+
+    // Convert it to a molecule
+    _ = try fixture.store.updateTask(task_id, .{ .task_type = .molecule });
+
+    // Create subtasks under it
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    _ = try fixture.store.createTask(.{
+        .title = "Subtask 1",
+        .parent_id = task_id,
+    });
+
+    // Now getCurrentTask should return null - molecules aren't directly workable
+    // Model must use list_tasks(ready_only=true) + start_task to select a subtask
+    const task = try fixture.store.getCurrentTask();
+    try testing.expectEqual(@as(?Task, null), task);
+
+    // Current task ID should have been cleared
+    try testing.expectEqual(@as(?TaskId, null), fixture.store.getCurrentTaskId());
+}
+
+test "TaskStore getCurrentTask returns null when current task is cancelled" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    try fixture.store.startSession();
+
+    // Create two tasks
+    const task1 = try fixture.store.createTask(.{
+        .title = "Task 1",
+    });
+
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+
+    _ = try fixture.store.createTask(.{
+        .title = "Task 2",
+    });
+
+    // Set task1 as current
+    try fixture.store.setCurrentTask(task1);
+
+    // Verify task1 is current
+    try testing.expectEqual(task1, fixture.store.getCurrentTaskId().?);
+
+    // Cancel task1
+    try fixture.store.updateStatus(task1, .cancelled);
+
+    // current_task_id should be cleared immediately
+    try testing.expectEqual(@as(?TaskId, null), fixture.store.getCurrentTaskId());
+
+    // getCurrentTask returns null - model must explicitly select next task
+    const task = try fixture.store.getCurrentTask();
+    try testing.expectEqual(@as(?Task, null), task);
+}
+
+test "TaskStore getCurrentTask returns null when current task is cancelled via updateTask" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    try fixture.store.startSession();
+
+    // Create two tasks
+    const task1 = try fixture.store.createTask(.{
+        .title = "Task 1",
+    });
+
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+
+    _ = try fixture.store.createTask(.{
+        .title = "Task 2",
+    });
+
+    // Set task1 as current
+    try fixture.store.setCurrentTask(task1);
+    try testing.expectEqual(task1, fixture.store.getCurrentTaskId().?);
+
+    // Cancel task1 via updateTask
+    _ = try fixture.store.updateTask(task1, .{ .status = .cancelled });
+
+    // current_task_id should be cleared immediately
+    try testing.expectEqual(@as(?TaskId, null), fixture.store.getCurrentTaskId());
+
+    // getCurrentTask returns null - model must explicitly select next task
+    const task = try fixture.store.getCurrentTask();
+    try testing.expectEqual(@as(?Task, null), task);
+}
+
+test "TaskStore clears current task when converted to molecule via updateTask" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    try fixture.store.startSession();
+
+    // Create a task and set it as current
+    const task_id = try fixture.store.createTask(.{
+        .title = "Task to become molecule",
+    });
+
+    try fixture.store.setCurrentTask(task_id);
+    try testing.expectEqual(task_id, fixture.store.getCurrentTaskId().?);
+
+    // Convert to molecule via updateTask
+    _ = try fixture.store.updateTask(task_id, .{ .task_type = .molecule });
+
+    // current_task_id should be cleared immediately (molecules are not directly workable)
+    try testing.expectEqual(@as(?TaskId, null), fixture.store.getCurrentTaskId());
+}
+
+test "TaskStore clears current task when converted to molecule via updateTaskType" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    try fixture.store.startSession();
+
+    // Create a task and set it as current
+    const task_id = try fixture.store.createTask(.{
+        .title = "Task to become molecule",
+    });
+
+    try fixture.store.setCurrentTask(task_id);
+    try testing.expectEqual(task_id, fixture.store.getCurrentTaskId().?);
+
+    // Convert to molecule via updateTaskType
+    try fixture.store.updateTaskType(task_id, .molecule);
+
+    // current_task_id should be cleared immediately (molecules are not directly workable)
+    try testing.expectEqual(@as(?TaskId, null), fixture.store.getCurrentTaskId());
+}
+
+// ============================================================
+// Molecule Blocking Invariant Tests
+// ============================================================
+
+test "TaskStore rejects setting molecule to blocked status" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Create a molecule directly
+    const molecule_id = try fixture.store.createTask(.{
+        .title = "Test Molecule",
+        .task_type = .molecule,
+    });
+
+    // Attempt to block the molecule should fail
+    const result = fixture.store.updateStatus(molecule_id, .blocked);
+    try testing.expectError(error.CannotBlockMolecule, result);
+}
+
+test "TaskStore getReadyTasks excludes molecules" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Create a molecule (pending, no blockers)
+    _ = try fixture.store.createTask(.{
+        .title = "Pending Molecule",
+        .task_type = .molecule,
+    });
+
+    // Create a regular task (pending, no blockers)
+    _ = try fixture.store.createTask(.{
+        .title = "Regular Task",
+        .task_type = .task,
+    });
+
+    // Get ready tasks - molecules should be excluded
+    const ready = try fixture.store.getReadyTasks();
+    defer {
+        for (ready) |*t| {
+            var task = t.*;
+            task.deinit(allocator);
+        }
+        allocator.free(ready);
+    }
+
+    // Only the regular task should be in ready queue
+    try testing.expectEqual(@as(usize, 1), ready.len);
+    try testing.expectEqualStrings("Regular Task", ready[0].title);
+    try testing.expectEqual(TaskType.task, ready[0].task_type);
+}
+
+// ============================================================
+// Cycle Detection Tests
+// ============================================================
+
+test "TaskStore detects 3-node cycle A->B->C->A" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Create chain: A blocks B, B blocks C
+    const task_a = try fixture.store.createTask(.{ .title = "Task A" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const task_b = try fixture.store.createTask(.{ .title = "Task B" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const task_c = try fixture.store.createTask(.{ .title = "Task C" });
+
+    // A blocks B (B depends on A)
+    try fixture.store.addDependency(task_a, task_b, .blocks);
+    // B blocks C (C depends on B)
+    try fixture.store.addDependency(task_b, task_c, .blocks);
+
+    // Attempting C blocks A would create cycle: A->B->C->A
+    const result = fixture.store.addDependency(task_c, task_a, .blocks);
+    try testing.expectError(error.CircularDependency, result);
+}
+
+test "TaskStore allows valid DAG dependencies" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Create tasks
+    const task_a = try fixture.store.createTask(.{ .title = "Task A" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const task_b = try fixture.store.createTask(.{ .title = "Task B" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const task_c = try fixture.store.createTask(.{ .title = "Task C" });
+
+    // Build valid DAG: A->B, A->C, B->C (diamond shape)
+    try fixture.store.addDependency(task_a, task_b, .blocks); // A blocks B
+    try fixture.store.addDependency(task_a, task_c, .blocks); // A blocks C
+    try fixture.store.addDependency(task_b, task_c, .blocks); // B blocks C
+
+    // Verify C is blocked by both A and B
+    const blocked_by_count = try fixture.db.getBlockedByCount(task_c);
+    try testing.expectEqual(@as(usize, 2), blocked_by_count);
+
+    // Verify B is blocked by A only
+    const b_blocked_by = try fixture.db.getBlockedByCount(task_b);
+    try testing.expectEqual(@as(usize, 1), b_blocked_by);
+}
+
+// ============================================================
+// Blocking State Machine Tests
+// ============================================================
+
+test "TaskStore handles multiple blockers" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Create blockers and blocked task
+    const blocker_a = try fixture.store.createTask(.{ .title = "Blocker A" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const blocker_b = try fixture.store.createTask(.{ .title = "Blocker B" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const blocked_task = try fixture.store.createTask(.{ .title = "Blocked Task" });
+
+    // Both A and B block the task
+    try fixture.store.addDependency(blocker_a, blocked_task, .blocks);
+    try fixture.store.addDependency(blocker_b, blocked_task, .blocks);
+
+    // Verify task is blocked
+    {
+        var task = (try fixture.store.getTask(blocked_task)).?;
+        defer task.deinit(allocator);
+        try testing.expectEqual(TaskStatus.blocked, task.status);
+    }
+
+    // Complete A - task should still be blocked (B is still pending)
+    const result_a = try fixture.store.completeTask(blocker_a);
+    defer allocator.free(result_a.unblocked);
+    try testing.expectEqual(@as(usize, 0), result_a.unblocked.len);
+
+    {
+        var task = (try fixture.store.getTask(blocked_task)).?;
+        defer task.deinit(allocator);
+        try testing.expectEqual(TaskStatus.blocked, task.status);
+    }
+
+    // Complete B - task should now be unblocked
+    const result_b = try fixture.store.completeTask(blocker_b);
+    defer allocator.free(result_b.unblocked);
+    try testing.expectEqual(@as(usize, 1), result_b.unblocked.len);
+    try testing.expectEqual(blocked_task, result_b.unblocked[0]);
+
+    {
+        var task = (try fixture.store.getTask(blocked_task)).?;
+        defer task.deinit(allocator);
+        try testing.expectEqual(TaskStatus.pending, task.status);
+    }
+}
+
+test "TaskStore cascade unblock updates all dependents" {
+    const allocator = testing.allocator;
+
+    var fixture = try TestFixture.init(allocator);
+    defer fixture.deinit();
+
+    // Create chain: blocker -> [task1, task2, task3]
+    const blocker = try fixture.store.createTask(.{ .title = "Single Blocker" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const task1 = try fixture.store.createTask(.{ .title = "Dependent 1" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const task2 = try fixture.store.createTask(.{ .title = "Dependent 2" });
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const task3 = try fixture.store.createTask(.{ .title = "Dependent 3" });
+
+    // Blocker blocks all three tasks
+    try fixture.store.addDependency(blocker, task1, .blocks);
+    try fixture.store.addDependency(blocker, task2, .blocks);
+    try fixture.store.addDependency(blocker, task3, .blocks);
+
+    // Verify all are blocked
+    {
+        var t1 = (try fixture.store.getTask(task1)).?;
+        defer t1.deinit(allocator);
+        var t2 = (try fixture.store.getTask(task2)).?;
+        defer t2.deinit(allocator);
+        var t3 = (try fixture.store.getTask(task3)).?;
+        defer t3.deinit(allocator);
+
+        try testing.expectEqual(TaskStatus.blocked, t1.status);
+        try testing.expectEqual(TaskStatus.blocked, t2.status);
+        try testing.expectEqual(TaskStatus.blocked, t3.status);
+    }
+
+    // Complete blocker - all three should be unblocked atomically
+    const result = try fixture.store.completeTask(blocker);
+    defer allocator.free(result.unblocked);
+
+    try testing.expectEqual(@as(usize, 3), result.unblocked.len);
+
+    // Verify all are now pending
+    {
+        var t1 = (try fixture.store.getTask(task1)).?;
+        defer t1.deinit(allocator);
+        var t2 = (try fixture.store.getTask(task2)).?;
+        defer t2.deinit(allocator);
+        var t3 = (try fixture.store.getTask(task3)).?;
+        defer t3.deinit(allocator);
+
+        try testing.expectEqual(TaskStatus.pending, t1.status);
+        try testing.expectEqual(TaskStatus.pending, t2.status);
+        try testing.expectEqual(TaskStatus.pending, t3.status);
     }
 }
