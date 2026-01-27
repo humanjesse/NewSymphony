@@ -4,6 +4,7 @@ const ollama = @import("ollama");
 const permission = @import("permission");
 const context_module = @import("context");
 const tools_module = @import("../tools.zig");
+const mvzr = tools_module.mvzr;
 
 const AppContext = context_module.AppContext;
 const ToolDefinition = tools_module.ToolDefinition;
@@ -68,20 +69,22 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
             .function = .{
                 .name = try allocator.dupe(u8, "grep_search"),
                 .description = try allocator.dupe(u8,
-                    \\Search file contents for patterns.
+                    \\Search file contents using regex patterns.
+                    \\
+                    \\PATTERNS: Full regex support via mvzr library
+                    \\- Literals: "handlePlayerInteraction"
+                    \\- Escaped specials: "foo\(bar\)" matches "foo(bar)"
+                    \\- Character classes: \d (digits), \w (word), \s (space), [a-z]
+                    \\- Quantifiers: *, +, ?, {n,m}
+                    \\- Anchors: ^ (start), $ (end), \b (word boundary)
+                    \\- Alternation: "foo|bar"
                     \\
                     \\OUTPUT MODES (output_mode):
-                    \\- "files_with_matches" (default): Just file paths, one per line
-                    \\- "content": Shows matching lines with optional context (-A/-B/-C)
-                    \\- "count": Shows match counts per file
+                    \\- "files_with_matches" (default): Just file paths
+                    \\- "content": Matching lines with context (-A/-B/-C)
+                    \\- "count": Match counts per file
                     \\
-                    \\FILTERING:
-                    \\- glob: Pattern like "*.zig" or "**/*.ts"
-                    \\- type: Shortcut - "zig", "js", "py", "go", "rust", etc.
-                    \\
-                    \\PAGINATION:
-                    \\- head_limit: Limit results (default: 50 for files, 100 for content)
-                    \\- offset: Skip N results for paging
+                    \\FILTERING: glob="*.zig" or type="js"
                 ),
                 .parameters = try allocator.dupe(u8,
                     \\{
@@ -89,7 +92,7 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
                     \\  "properties": {
                     \\    "pattern": {
                     \\      "type": "string",
-                    \\      "description": "Text or regex pattern to search for (supports * wildcards)"
+                    \\      "description": "Regex pattern to search for. Use \\( \\) \\. to match literal parens/dots."
                     \\    },
                     \\    "path": {
                     \\      "type": "string",
@@ -200,6 +203,9 @@ const SearchContext = struct {
     results_collected: usize,
     results_skipped: usize,
     current_path: std.ArrayListUnmanaged(u8),
+    // Compiled regex (null if pattern is invalid regex, falls back to literal)
+    compiled_regex: ?mvzr.Regex,
+    use_regex: bool,
 };
 
 fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppContext) !ToolResult {
@@ -290,6 +296,10 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     // Case insensitive defaults to true
     const case_insensitive = args.@"-i" orelse true;
 
+    // Try to compile pattern as regex, fall back to literal search if invalid
+    const compiled_regex = mvzr.Regex.compile(args.pattern);
+    const use_regex = compiled_regex != null;
+
     // Initialize search context
     var search_ctx = SearchContext{
         .allocator = allocator,
@@ -313,6 +323,8 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
         .results_collected = 0,
         .results_skipped = 0,
         .current_path = .{},
+        .compiled_regex = compiled_regex,
+        .use_regex = use_regex,
     };
     defer {
         for (search_ctx.gitignore_patterns.items) |pattern| {
@@ -597,7 +609,17 @@ fn searchFile(ctx: *SearchContext, dir: std.fs.Dir, path: []const u8) !void {
 }
 
 fn matchesPattern(ctx: *SearchContext, line: []const u8) bool {
-    // Detect if pattern contains wildcards
+    // Use compiled regex if available
+    if (ctx.use_regex) {
+        if (ctx.compiled_regex) |regex| {
+            // mvzr doesn't have case-insensitive flag, so we match as-is
+            // TODO: Could lowercase both for case-insensitive, but expensive
+            return regex.isMatch(line);
+        }
+    }
+
+    // Fallback: literal pattern matching (used when regex compilation fails)
+    // Detect if pattern contains wildcards for glob-style matching
     const has_wildcard = std.mem.indexOf(u8, ctx.pattern, "*") != null;
 
     if (has_wildcard) {

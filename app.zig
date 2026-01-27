@@ -1076,8 +1076,10 @@ pub const App = struct {
             // 4b. Process queued agent command events (kickback dispatch)
             _ = try app_agents.processAgentCommandEvents(self);
 
-            // 5. Render (when not streaming)
-            if (!self.streaming_active) {
+            // 5. Render (when idle - not streaming, executing tools, or running agent)
+            // Skip unconditional redraw when other subsystems handle their own redraws
+            // to avoid double-redraw flicker
+            if (!self.streaming_active and !self.tool_executor.hasPendingWork() and self.agent_thread == null) {
                 if (ui.resize_pending) {
                     ui.resize_pending = false;
                 }

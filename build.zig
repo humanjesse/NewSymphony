@@ -76,6 +76,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/html_utils.zig"),
     });
 
+    // mvzr regex library (vendored)
+    const mvzr_module = b.createModule(.{
+        .root_source_file = b.path("libs/mvzr/mvzr.zig"),
+    });
+
     // Now add html_utils to git_sync_module
     git_sync_module.addImport("html_utils", html_utils_module);
 
@@ -196,6 +201,7 @@ pub fn build(b: *std.Build) void {
     tools_module.addImport("task_db", task_db_module);
     tools_module.addImport("git_sync", git_sync_module);
     tools_module.addImport("git_utils", git_utils_module);
+    tools_module.addImport("mvzr", mvzr_module);
     // Will add file_curator and types after they're created
 
     // Now that tools_module is created, add it to agents_module

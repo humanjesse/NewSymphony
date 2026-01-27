@@ -145,10 +145,9 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
         }
     }
 
-    // Clear current task if we blocked it
-    if (is_current_task) {
-        store.clearCurrentTask();
-    }
+    // NOTE: Do NOT clear current_task here - the orchestration layer (handleQuestionerComplete)
+    // needs to know which task was being evaluated to route correctly (blocked → planner kickback)
+    // The orchestration will clear it after determining the next action.
 
     // Note: TaskStore now handles persistence via SQLite automatically
 
@@ -160,7 +159,7 @@ fn execute(allocator: std.mem.Allocator, args_json: []const u8, context: *AppCon
             .title = task.title,
         },
         .reason = reason.?,
-        .current_task_cleared = is_current_task,
+        .current_task_cleared = false, // No longer cleared here - orchestration handles routing
     };
 
     const result = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(response, .{})});

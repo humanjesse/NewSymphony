@@ -171,8 +171,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
             // Nothing staged - provide helpful error message
             const msg = try allocator.dupe(u8,
                 "No changes to commit. The specified files either don't exist or have no modifications. " ++
-                "You must use write_file to CREATE or MODIFY files before calling submit_work. " ++
-                "If files already exist unchanged, modify them first.");
+                "Please ensure you have created or modified the files before submitting your work.");
             defer allocator.free(msg);
             return ToolResult.err(allocator, .validation_failed, msg, start_time);
         }

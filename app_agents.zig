@@ -402,8 +402,7 @@ pub fn handleAgentCommand(app: *App, agent_name: []const u8, task: ?[]const u8, 
             .timestamp = std.time.milliTimestamp(),
         });
         message_loader.onMessageAdded(app);
-        _ = try message_renderer.redrawScreen(app);
-        app.updateCursorToBottom();
+        // Let main loop handle redraw to avoid double-redraw flicker
     }
 }
 
@@ -657,7 +656,9 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
         }
 
         try finalizeAgentStreamedMessage(app, agent_name_copy, result.success);
-        try endAgentSession(app);
+        endAgentSession(app) catch |err| {
+            std.log.err("endAgentSession failed: {}, continuing with agent completion handlers", .{err});
+        };
 
         // Trigger questioner after planner completes successfully
         if (result.success and mem.eql(u8, agent_name_copy, "planner")) {
@@ -689,7 +690,10 @@ pub fn handleAgentResult(app: *App, result: *agents_module.AgentResult) !void {
 
         // Judge completion: either move to next task or trigger revision retry
         if (result.success and mem.eql(u8, agent_name_copy, "judge")) {
+            std.log.info("Judge completed successfully, calling handleJudgeComplete", .{});
             handleJudgeComplete(app);
+        } else if (mem.eql(u8, agent_name_copy, "judge")) {
+            std.log.warn("Judge completed but success=false, NOT calling handleJudgeComplete", .{});
         }
     } else if (result.status == .needs_input) {
         // Conversation mode: agent responded, waiting for user input
@@ -733,11 +737,14 @@ fn queueAgentCommand(app: *App, agent_name: []const u8, task_desc: []const u8, d
     app.agent_command_events.append(app.allocator, event) catch {
         app.allocator.free(task);
         app.allocator.free(display);
+        return;
     };
+    std.log.info("queueAgentCommand: queued {s}, queue size now {d}", .{ agent_name, app.agent_command_events.items.len });
 }
 
 /// Trigger Questioner to evaluate the next ready task
 pub fn triggerQuestioner(app: *App) void {
+    std.log.info("triggerQuestioner: queueing questioner agent", .{});
     queueAgentCommand(app, "questioner", "Evaluate next task", "/questioner");
 }
 
@@ -753,6 +760,7 @@ pub fn triggerJudge(app: *App) void {
 
 /// Handle Judge completion - either move to next task or retry Tinkerer
 pub fn handleJudgeComplete(app: *App) void {
+    std.log.info("handleJudgeComplete: starting", .{});
     const store = app.app_context.task_store orelse return;
 
     // Get the tracked current task ID - this is the task the Judge was reviewing
@@ -760,10 +768,12 @@ pub fn handleJudgeComplete(app: *App) void {
     // 1. getCurrentInProgressTask() queries ANY in_progress task
     // 2. We need the specific task that was being tracked during this session
     const current_task_id = store.getCurrentTaskId() orelse {
-        // No tracked task - check for next ready task
+        // No tracked task - check for next ready task (likely task was completed via complete_task)
+        std.log.info("handleJudgeComplete: no current_task_id, checking for next ready task", .{});
         checkForNextReadyTask(app, store);
         return;
     };
+    std.log.info("handleJudgeComplete: current_task_id={s}", .{&current_task_id});
 
     // Load the specific tracked task to check for rejection
     const maybe_task = store.getTaskWithAllocator(current_task_id, app.allocator) catch |err| {
@@ -812,6 +822,7 @@ pub fn handleJudgeComplete(app: *App) void {
 
 /// Helper: Check for next ready task and trigger questioner if any exist
 fn checkForNextReadyTask(app: *App, store: *task_store_module.TaskStore) void {
+    std.log.info("checkForNextReadyTask: checking for ready tasks", .{});
     // Use local arena to properly manage task memory
     var task_arena = std.heap.ArenaAllocator.init(app.allocator);
     defer task_arena.deinit();
@@ -821,11 +832,13 @@ fn checkForNextReadyTask(app: *App, store: *task_store_module.TaskStore) void {
     };
     // No individual cleanup needed - arena handles everything
 
+    std.log.info("checkForNextReadyTask: found {d} ready tasks", .{ready_tasks.len});
     if (ready_tasks.len > 0) {
         // More tasks to do - questioner evaluates before tinkerer implements
         triggerQuestioner(app);
+    } else {
+        std.log.info("checkForNextReadyTask: no ready tasks, execution loop ends", .{});
     }
-    // else: All tasks complete, execution loop ends
 }
 
 /// Trigger Tinkerer to retry with revision feedback
@@ -858,10 +871,15 @@ pub fn triggerTinkererRevision(app: *App, task_id: *const [8]u8, feedback: []con
 
 /// Handle questioner completion - route based on questioner's decision (BLOCKED or ready)
 pub fn handleQuestionerComplete(app: *App) void {
+    std.log.info("handleQuestionerComplete: starting", .{});
     const store = app.app_context.task_store orelse return;
 
     // Get the task questioner just evaluated (tracked via current_task_id)
-    const task_id = store.getCurrentTaskId() orelse return;
+    const task_id = store.getCurrentTaskId() orelse {
+        std.log.warn("handleQuestionerComplete: no current_task_id, cannot route", .{});
+        return;
+    };
+    std.log.info("handleQuestionerComplete: evaluating task {s}", .{&task_id});
 
     // Load the task to check its comments
     const maybe_task = store.getTaskWithAllocator(task_id, app.allocator) catch return;
@@ -1136,8 +1154,7 @@ pub fn endAgentSession(app: *App) !void {
         .timestamp = std.time.milliTimestamp(),
     });
     message_loader.onMessageAdded(app);
-    _ = try message_renderer.redrawScreen(app);
-    app.updateCursorToBottom();
+    // Let main loop handle redraw to avoid double-redraw flicker
 }
 
 /// Process any queued tool events from background agent thread

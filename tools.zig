@@ -4,6 +4,9 @@ const ollama = @import("ollama");
 const permission = @import("permission");
 const context_module = @import("context");
 
+// Re-export mvzr for use by tool modules (grep_search)
+pub const mvzr = @import("mvzr");
+
 // Import all tool modules
 const ls = @import("tools/ls.zig");
 const read_lines = @import("tools/read_lines.zig");

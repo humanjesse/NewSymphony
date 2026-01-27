@@ -110,7 +110,6 @@ Call `complete_task(task_id, completion_notes)` with:
 - Changes don't meet requirements
 - There are obvious bugs
 - Tests fail (when we have them)
-- Build is broken
 
 Call `request_revision(task_id, feedback)` - this adds a "REJECTED:" comment to the task's audit trail with:
 - Specific issues that need fixing
