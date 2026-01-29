@@ -373,7 +373,7 @@ pub const App = struct {
             \\- For simple questions: Answer directly using your knowledge and available tools
             \\- For complex multi-step tasks: Suggest using `/planner` to create a structured plan
             \\- When asked about progress: Call `get_session_status` to report task status
-            \\- Use file tools (read_lines, grep_search, write_file, etc.) for code tasks
+            \\- Use file tools (read, grep_search, write_file, etc.) for code tasks
             \\
             \\## Shutdown Protocol
             \\When user indicates they're done ("I'm done", "that's all", "wrap up", "goodbye", etc.):
@@ -642,15 +642,34 @@ pub const App = struct {
                 if (self.app_context.agent_registry) |registry| {
                     const space_idx = mem.indexOf(u8, command, " ");
                     const agent_name = if (space_idx) |idx| command[0..idx] else command;
+                    const task_text = if (space_idx) |idx| blk: {
+                        const t = command[idx + 1 ..];
+                        break :blk if (t.len == 0) null else t;
+                    } else null;
+
                     if (registry.has(agent_name)) {
-                        // Remove from queue and process
+                        // Check if this is for the active agent (potential injection)
+                        if (self.app_context.active_agent) |active| {
+                            if (mem.eql(u8, active.agent_name, agent_name) and task_text != null) {
+                                // Try injection - if fails with InjectionNotReady, DON'T remove from queue
+                                self.handleAgentCommand(agent_name, task_text, msg) catch |err| {
+                                    if (err == error.InjectionNotReady) {
+                                        // Stay in queue, will retry next tick
+                                        i += 1;
+                                        continue;
+                                    }
+                                    return err;
+                                };
+                                // Injection succeeded - remove from queue
+                                const pending = self.pending_user_messages.orderedRemove(i);
+                                self.allocator.free(pending);
+                                continue;
+                            }
+                        }
+                        // Normal handling (not injection case)
                         const pending = self.pending_user_messages.orderedRemove(i);
                         defer self.allocator.free(pending);
-                        const task = if (space_idx) |idx| blk: {
-                            const t = command[idx + 1 ..];
-                            break :blk if (t.len == 0) null else t;
-                        } else null;
-                        try self.handleAgentCommand(agent_name, task, pending);
+                        try self.handleAgentCommand(agent_name, task_text, pending);
                         // Don't increment i - array shifted
                         continue;
                     }
@@ -1066,6 +1085,13 @@ pub const App = struct {
 
             // 4. Poll agent results
             try app_agents.processAgentToolEvents(self);
+
+            // Try to process injection messages while agent is running
+            // This allows mid-execution steering via `/agentname message`
+            if (self.agent_thread != null and self.app_context.active_agent != null) {
+                _ = try self.processQueuedMessages();
+            }
+
             if (try app_agents.pollAgentResult(self)) {
                 self.agent_responding = false;
 

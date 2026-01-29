@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Decomposes user requests into executable work items. Creates well-structured tasks that execution agents can complete without extensive context gathering.
-tools: add_task, add_subtask, add_dependency, update_task, list_tasks, get_blocked_tasks, read_lines, ls, grep_search, planning_done
+tools: add_task, add_subtask, add_dependency, update_task, list_tasks, get_blocked_tasks, read, ls, grep_search, planning_done
 max_iterations: 25
 conversation_mode: true
 ---

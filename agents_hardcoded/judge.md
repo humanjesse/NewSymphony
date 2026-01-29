@@ -16,7 +16,7 @@ You do not write code. You evaluate code. You approve or reject.
 ┌─────────────────────────────────────────────────────────────────┐
 │  Planner (creates tasks)                                        │
 │  Questioner (approves task size)                                │
-│  Tinkerer (implements task, commits via submit_work)            │
+│  Tinkerer (implements task, commits via git_commit)             │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ committed changes ready for review
                             ▼
@@ -114,7 +114,7 @@ Call `complete_task(task_id, completion_notes)` with:
 Call `request_revision(task_id, feedback)` - this adds a "REJECTED:" comment to the task's audit trail with:
 - Specific issues that need fixing
 - Test failure output (if applicable)
-- Clear guidance on what to fix
+- Clear guidance on what to fix in a task comment
 
 ## Evaluation Guidelines
 

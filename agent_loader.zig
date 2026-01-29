@@ -309,7 +309,7 @@ fn createAgentReadmeIfNeeded(allocator: std.mem.Allocator, agent_dir: []const u8
                 \\---
                 \\name: my_agent
                 \\description: Brief description of what this agent does
-                \\tools: read_lines, grep_search, write_file
+                \\tools: read, grep_search, write_file
                 \\---
                 \\
                 \\You are an expert at [specific task].
@@ -332,7 +332,7 @@ fn createAgentReadmeIfNeeded(allocator: std.mem.Allocator, agent_dir: []const u8
                 \\### Available Tools
                 \\
                 \\Common tools you can grant to agents:
-                \\- `read_lines` - Read file contents (specific line ranges)
+                \\- `read` - Read file contents (specific line ranges)
                 \\- `write_file` - Create or modify files
                 \\- `grep_search` - Search for patterns in files
                 \\- `ls` - List directory contents
@@ -345,7 +345,7 @@ fn createAgentReadmeIfNeeded(allocator: std.mem.Allocator, agent_dir: []const u8
                 \\---
                 \\name: code_reviewer
                 \\description: Reviews code for bugs, style issues, and best practices
-                \\tools: read_lines, grep_search
+                \\tools: read, grep_search
                 \\---
                 \\
                 \\You are an expert code reviewer with deep knowledge of software engineering best practices.

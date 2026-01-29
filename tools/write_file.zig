@@ -69,7 +69,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     if (file_exists) {
         // Overwriting existing file - must have read it first
         if (!context.state.wasFileRead(parsed.value.path)) {
-            return ToolResult.err(allocator, .permission_denied, "File must be read with read_lines before overwriting", start_time);
+            return ToolResult.err(allocator, .permission_denied, "File must be read with read before overwriting", start_time);
         }
     } else {
         // Creating new file - must explicitly request creation

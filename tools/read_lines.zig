@@ -1,4 +1,4 @@
-// Read Lines Tool - Primary file reading tool with line range support
+// Read Tool - Primary file reading tool with line range support
 const std = @import("std");
 const ollama = @import("ollama");
 const permission = @import("permission");
@@ -17,8 +17,8 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
         .ollama_tool = .{
             .type = "function",
             .function = .{
-                .name = try allocator.dupe(u8, "read_lines"),
-                .description = try allocator.dupe(u8, "Read specific line ranges from a file."),
+                .name = try allocator.dupe(u8, "read"),
+                .description = try allocator.dupe(u8, "Read a file. Specify line ranges to read specific sections."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
@@ -42,8 +42,8 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
             },
         },
         .permission_metadata = .{
-            .name = "read_lines",
-            .description = "Read specific line ranges from file",
+            .name = "read",
+            .description = "Read a file with optional line ranges",
             .risk_level = .low, // Low risk - read-only, no expensive side effects
             .required_scopes = &.{.read_files},
             .validator = validate,
@@ -80,7 +80,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     if (requested_lines > MAX_LINE_RANGE) {
         const msg = try std.fmt.allocPrint(
             allocator,
-            "Requested {d} lines. Maximum range is {d} lines. Make multiple read_lines calls to read more.",
+            "Requested {d} lines. Maximum range is {d} lines. Make multiple read calls to read more.",
             .{ requested_lines, MAX_LINE_RANGE },
         );
         defer allocator.free(msg);

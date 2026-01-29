@@ -26,6 +26,9 @@ pub const ToolCall = struct {
     },
 };
 
+// NOTE: For multi-turn reasoning support, this struct needs a field to carry
+// thinking/reasoning content (and ideally the structured reasoning_details from
+// OpenRouter) so it can be serialized back in subsequent requests.
 pub const ChatMessage = struct {
     role: []const u8, // "user", "assistant", "system", or "tool"
     content: []const u8,

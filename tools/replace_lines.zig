@@ -26,7 +26,7 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
                     \\    },
                     \\    "line_start": {
                     \\      "type": "integer",
-                    \\      "description": "First line number to replace (1-indexed, as shown in read_lines output)"
+                    \\      "description": "First line number to replace (1-indexed, as shown in read output)"
                     \\    },
                     \\    "line_end": {
                     \\      "type": "integer",
@@ -70,7 +70,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
 
     // Check if file was read first
     if (!context.state.wasFileRead(parsed.value.path)) {
-        return ToolResult.err(allocator, .permission_denied, "File must be read with read_lines before editing", start_time);
+        return ToolResult.err(allocator, .permission_denied, "File must be read with read before editing", start_time);
     }
 
     // Validate line numbers

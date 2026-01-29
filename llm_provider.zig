@@ -164,7 +164,7 @@ pub const ProviderRegistry = struct {
 
     /// OpenRouter provider capabilities (cloud-hosted, no embeddings)
     pub const OPENROUTER = ProviderCapabilities{
-        .supports_thinking = false,
+        .supports_thinking = true,
         .supports_keep_alive = false,
         .supports_tools = true,
         .supports_json_mode = true,
@@ -396,7 +396,7 @@ pub const OpenRouterProvider = struct {
         self: *OpenRouterProvider,
         model: []const u8,
         messages: []const ollama.ChatMessage,
-        think: bool, // Ignored - not supported
+        think: bool,
         format: ?[]const u8,
         tools: ?[]const ollama.Tool,
         keep_alive: ?[]const u8, // Ignored - not supported
@@ -412,7 +412,6 @@ pub const OpenRouterProvider = struct {
             tool_calls_chunk: ?[]const ollama.ToolCall,
         ) void,
     ) !void {
-        _ = think;
         _ = keep_alive;
         _ = num_ctx;
         _ = repeat_penalty;
@@ -420,6 +419,7 @@ pub const OpenRouterProvider = struct {
         return self.chat_client.chatStream(
             model,
             messages,
+            think,
             format,
             tools,
             num_predict,

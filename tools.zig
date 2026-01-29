@@ -9,7 +9,7 @@ pub const mvzr = @import("mvzr");
 
 // Import all tool modules
 const ls = @import("tools/ls.zig");
-const read_lines = @import("tools/read_lines.zig");
+const read = @import("tools/read_lines.zig");
 const write_file = @import("tools/write_file.zig");
 const replace_lines = @import("tools/replace_lines.zig");
 const insert_lines = @import("tools/insert_lines.zig");
@@ -45,13 +45,12 @@ const sync_to_git = @import("tools/sync_to_git.zig");
 const run_agent = @import("tools/run_agent.zig");
 const list_agents = @import("tools/list_agents.zig");
 const planning_done = @import("tools/planning_done.zig");
-const submit_work = @import("tools/submit_work.zig");
+const git_commit = @import("tools/submit_work.zig");
 const request_revision = @import("tools/request_revision.zig");
 const git_status = @import("tools/git_status.zig");
 const git_diff = @import("tools/git_diff.zig");
 const git_log = @import("tools/git_log.zig");
 const git_add = @import("tools/git_add.zig");
-const git_commit = @import("tools/git_commit.zig");
 const git_branch = @import("tools/git_branch.zig");
 const git_checkout = @import("tools/git_checkout.zig");
 const git_stash = @import("tools/git_stash.zig");
@@ -218,7 +217,7 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
 
     // File system tools
     try tools.append(allocator, try ls.getDefinition(allocator));
-    try tools.append(allocator, try read_lines.getDefinition(allocator));
+    try tools.append(allocator, try read.getDefinition(allocator));
     try tools.append(allocator, try write_file.getDefinition(allocator));
     try tools.append(allocator, try replace_lines.getDefinition(allocator));
     try tools.append(allocator, try insert_lines.getDefinition(allocator));
@@ -233,7 +232,6 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try git_diff.getDefinition(allocator));
     try tools.append(allocator, try git_log.getDefinition(allocator));
     try tools.append(allocator, try git_add.getDefinition(allocator));
-    try tools.append(allocator, try git_commit.getDefinition(allocator));
     try tools.append(allocator, try git_branch.getDefinition(allocator));
     try tools.append(allocator, try git_checkout.getDefinition(allocator));
     try tools.append(allocator, try git_stash.getDefinition(allocator));
@@ -277,7 +275,7 @@ pub fn getAllToolDefinitions(allocator: std.mem.Allocator) ![]ToolDefinition {
     try tools.append(allocator, try run_agent.getDefinition(allocator));
     try tools.append(allocator, try list_agents.getDefinition(allocator));
     try tools.append(allocator, try planning_done.getDefinition(allocator));
-    try tools.append(allocator, try submit_work.getDefinition(allocator));
+    try tools.append(allocator, try git_commit.getDefinition(allocator));
     try tools.append(allocator, try request_revision.getDefinition(allocator));
 
     // Web tools

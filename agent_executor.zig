@@ -115,11 +115,16 @@ pub const AgentExecutor = struct {
     // Planning completion flag (set by planning_done tool)
     planning_complete: bool = false,
 
-    // Tinkering completion flag (set by submit_work tool)
+    // Tinkering completion flag (set by git_commit tool)
     tinkering_complete: bool = false,
 
     // Current agent name (for attributing comments)
     agent_name: ?[]const u8 = null,
+
+    // Pause/injection state (thread-safe)
+    pause_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    injected_message: ?[]const u8 = null,
+    injection_mutex: std.Thread.Mutex = .{},
 
     // VTable for AgentExecutorInterface
     const vtable = AgentExecutorInterface.VTable{
@@ -159,6 +164,11 @@ pub const AgentExecutor = struct {
         // Free agent_name if allocated
         if (self.agent_name) |name| {
             self.allocator.free(name);
+        }
+
+        // Free injected_message if pending
+        if (self.injected_message) |msg| {
+            self.allocator.free(msg);
         }
 
         // Free message history
@@ -382,6 +392,9 @@ pub const AgentExecutor = struct {
                 null;
 
             // Add assistant message to history
+            // NOTE: final_thinking is available here but not stored in ChatMessage.
+            // For multi-turn reasoning support, ChatMessage needs a thinking/reasoning
+            // field so reasoning content can be round-tripped back to the LLM.
             {
                 self.message_history_mutex.lock();
                 defer self.message_history_mutex.unlock();
@@ -454,6 +467,41 @@ pub const AgentExecutor = struct {
 
                     self.tool_calls_made += 1;
                 }
+
+                // Check for pause/injection request after each tool boundary
+                if (self.pause_requested.load(.acquire)) {
+                    self.pause_requested.store(false, .release);
+
+                    self.injection_mutex.lock();
+                    defer self.injection_mutex.unlock();
+
+                    if (self.injected_message) |msg| {
+                        defer {
+                            self.allocator.free(msg);
+                            self.injected_message = null;
+                        }
+
+                        // Add user message to history
+                        {
+                            self.message_history_mutex.lock();
+                            defer self.message_history_mutex.unlock();
+                            self.message_history.append(self.allocator, .{
+                                .role = "user",
+                                .content = self.allocator.dupe(u8, msg) catch continue,
+                            }) catch continue;
+                        }
+
+                        // Persist injected message
+                        if (context.conversation_db) |db| {
+                            if (self.invocation_id) |inv_id| {
+                                _ = db.saveAgentMessage(inv_id, self.message_index, "user", msg, null, null, null, null) catch {};
+                                self.message_index += 1;
+                            }
+                        }
+                    }
+                    // Continue iteration loop - agent will see injected message
+                }
+
                 // Continue to next iteration to process tool results
                 continue;
             }
@@ -486,7 +534,7 @@ pub const AgentExecutor = struct {
                 return try AgentResult.ok(self.allocator, response_content, stats, final_thinking);
             }
 
-            // Check if submit_work tool was called (overrides conversation_mode)
+            // Check if git_commit tool was called (overrides conversation_mode)
             if (self.tinkering_complete) {
                 // Tinkering phase complete - force completion even in conversation mode
                 std.log.info("AgentExecutor: tinkering_complete detected, returning success", .{});
@@ -648,5 +696,31 @@ pub const AgentExecutor = struct {
                 .{error_msg},
             );
         }
+    }
+
+    /// Request pause and inject a user message at next tool boundary
+    /// Returns error.NoToolBoundary if no tool calls have been made yet
+    pub fn requestPauseWithInjection(self: *AgentExecutor, message: []const u8) !void {
+        // Block injection if no tool calls made yet
+        if (self.tool_calls_made == 0) {
+            return error.NoToolBoundary;
+        }
+
+        self.injection_mutex.lock();
+        defer self.injection_mutex.unlock();
+
+        // Replace any pending injection
+        if (self.injected_message) |old| {
+            self.allocator.free(old);
+        }
+        self.injected_message = try self.allocator.dupe(u8, message);
+
+        // Signal pause
+        self.pause_requested.store(true, .release);
+    }
+
+    /// Check if injection is currently possible (tool boundary reached)
+    pub fn canInject(self: *AgentExecutor) bool {
+        return self.tool_calls_made > 0;
     }
 };

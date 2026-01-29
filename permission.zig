@@ -9,7 +9,7 @@ const ollama = @import("ollama");
 pub const RiskLevel = enum {
     safe,     // Auto-approve (ls, get_current_time)
     low,      // Ask once per session
-    medium,   // Ask each time (read_lines)
+    medium,   // Ask each time (read)
     high,     // Ask + show preview
     critical, // Require explicit confirmation
 };
@@ -245,7 +245,7 @@ pub const PolicyEngine = struct {
         arguments: []const u8,
     ) !bool {
         // For file operations, check path patterns
-        if (std.mem.eql(u8, tool_name, "read_lines")) {
+        if (std.mem.eql(u8, tool_name, "read")) {
             const Args = struct { path: []const u8 };
             const parsed = std.json.parseFromSlice(Args, self.allocator, arguments, .{}) catch return false;
             defer parsed.deinit();

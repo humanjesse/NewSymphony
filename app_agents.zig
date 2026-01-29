@@ -360,20 +360,61 @@ pub fn agentThreadFn(ctx: *AgentThreadContext) void {
     ctx.app.agent_result_ready = true;
 }
 
+/// Attempt to inject a message into the active agent
+/// Returns true if injection was accepted, false if not at tool boundary
+pub fn attemptInjection(app: *App, message: []const u8, display_text: []const u8) !bool {
+    const session = app.app_context.active_agent orelse return false;
+    const executor: *agent_executor.AgentExecutor = @ptrCast(@alignCast(session.executor.ptr));
+
+    // Check if we can inject (past first tool call)
+    if (!executor.canInject()) {
+        // Not ready - message will stay queued
+        return false;
+    }
+
+    // Display user's injection message in UI
+    const user_content = try app.allocator.dupe(u8, display_text);
+    const user_processed = try markdown.processMarkdown(app.allocator, user_content);
+
+    try app.messages.append(app.allocator, .{
+        .role = .user,
+        .content = user_content,
+        .agent_source = try app.allocator.dupe(u8, session.agent_name),
+        .processed_content = user_processed,
+        .timestamp = std.time.milliTimestamp(),
+    });
+    message_loader.onMessageAdded(app);
+    try app.persistMessage(app.messages.items.len - 1); // Persist for conversation history
+
+    // Request pause with injection
+    try executor.requestPauseWithInjection(message);
+
+    _ = try message_renderer.redrawScreen(app);
+    return true;
+}
+
 /// Handle agent slash command (e.g., /agentname or /agentname task)
 /// full_input is the complete user input for display (e.g., "/planner hello")
 pub fn handleAgentCommand(app: *App, agent_name: []const u8, task: ?[]const u8, full_input: []const u8) !void {
-    // If this agent is already active, end the session
+    // If this agent is already active, check for injection
     if (app.app_context.active_agent) |active| {
         if (mem.eql(u8, active.agent_name, agent_name)) {
-            // Check if this was the planner being ended - trigger questioner
-            const was_planner = mem.eql(u8, active.agent_name, "planner");
-            try endAgentSession(app);
-            if (was_planner) {
-                // Queue questioner event for main loop dispatch
-                triggerQuestioner(app);
+            if (task) |injection_text| {
+                // Try to inject - if not at tool boundary, return error for queue retry
+                const injected = try attemptInjection(app, injection_text, full_input);
+                if (injected) return;
+                // Not injected - caller should keep in queue for retry
+                return error.InjectionNotReady;
+            } else {
+                // No message = end session (existing behavior)
+                const was_planner = mem.eql(u8, active.agent_name, "planner");
+                try endAgentSession(app);
+                if (was_planner) {
+                    // Queue questioner event for main loop dispatch
+                    triggerQuestioner(app);
+                }
+                return;
             }
-            return;
         }
     }
 

@@ -17,6 +17,7 @@ const OpenAIStreamChunk = struct {
         delta: ?struct {
             role: ?[]const u8 = null,
             content: ?[]const u8 = null,
+            reasoning: ?[]const u8 = null,
             tool_calls: ?[]struct {
                 index: ?i32 = null,
                 id: ?[]const u8 = null,
@@ -71,6 +72,7 @@ pub const OpenRouterClient = struct {
         self: *OpenRouterClient,
         model: []const u8,
         messages: []const ollama.ChatMessage,
+        think: bool,
         format: ?[]const u8,
         tools: ?[]const ollama.Tool,
         num_predict: ?isize,
@@ -92,6 +94,9 @@ pub const OpenRouterClient = struct {
         try payload_list.appendSlice(self.allocator, "\",\"messages\":[");
 
         // Add messages
+        // NOTE: For multi-turn reasoning preservation, assistant messages should include
+        // reasoning_details (passed back unmodified from the response) so models can
+        // maintain their reasoning chain across tool-call round-trips.
         for (messages, 0..) |msg, i| {
             if (i > 0) try payload_list.append(self.allocator, ',');
             try payload_list.appendSlice(self.allocator, "{\"role\":\"");
@@ -228,6 +233,11 @@ pub const OpenRouterClient = struct {
             if (std.mem.eql(u8, fmt, "json")) {
                 try payload_list.appendSlice(self.allocator, ",\"response_format\":{\"type\":\"json_object\"}");
             }
+        }
+
+        // Add reasoning/thinking parameter if enabled
+        if (think) {
+            try payload_list.appendSlice(self.allocator, ",\"reasoning\":{\"effort\":\"high\"}");
         }
 
         try payload_list.append(self.allocator, '}');
@@ -502,6 +512,16 @@ pub const OpenRouterClient = struct {
                     if (chunk.choices) |choices| {
                         if (choices.len > 0 and choices[0].delta != null) {
                             const delta = choices[0].delta.?;
+
+                            // Handle reasoning (thinking content)
+                            // NOTE: OpenRouter also provides delta.reasoning_details (array of objects
+                            // with type/format/id/index and text/summary/data fields). For proper
+                            // multi-turn reasoning preservation with tool-calling models, we need to
+                            // parse reasoning_details instead of (or in addition to) the plain
+                            // reasoning string, and pass it back unmodified in subsequent requests.
+                            if (delta.reasoning) |reasoning| {
+                                callback(context, reasoning, null, null);
+                            }
 
                             // Handle content
                             if (delta.content) |content| {

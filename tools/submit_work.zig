@@ -1,4 +1,4 @@
-// Submit Work Tool - Atomic tool that replaces git_add + git_commit + tinkering_done
+// Git Commit Tool - Atomic tool that stages files, commits, and signals completion
 // Ensures the Tinkerer can't partially complete the workflow
 // Phase 2: Commit tracking for robust Judge review
 const std = @import("std");
@@ -19,8 +19,8 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
         .ollama_tool = .{
             .type = "function",
             .function = .{
-                .name = try allocator.dupe(u8, "submit_work"),
-                .description = try allocator.dupe(u8, "Submit your work for review. This atomic tool stages ONLY the specified files, commits them, and signals completion. Use this instead of separate git_add/git_commit/tinkering_done calls."),
+                .name = try allocator.dupe(u8, "git_commit"),
+                .description = try allocator.dupe(u8, "Commit your work and submit for review. This atomic tool stages ONLY the specified files, commits them, and signals completion. You MUST call this when your implementation is done."),
                 .parameters = try allocator.dupe(u8,
                     \\{
                     \\  "type": "object",
@@ -45,8 +45,8 @@ pub fn getDefinition(allocator: std.mem.Allocator) !ToolDefinition {
             },
         },
         .permission_metadata = .{
-            .name = "submit_work",
-            .description = "Submit work for review (atomic git add + commit + signal)",
+            .name = "git_commit",
+            .description = "Commit work and submit for review (atomic git add + commit + signal)",
             .risk_level = .medium,
             .required_scopes = &.{ .write_files, .todo_management },
             .validator = null,
@@ -211,7 +211,7 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     var commit_hash: ?[]const u8 = null;
     {
         const head = git_utils.getCurrentHead(allocator, null) catch |err| blk: {
-            std.log.warn("Failed to get HEAD commit after submit_work: {}", .{err});
+            std.log.warn("Failed to get HEAD commit after git_commit: {}", .{err});
             break :blk null;
         };
         commit_hash = head;
@@ -242,9 +242,9 @@ fn execute(allocator: std.mem.Allocator, arguments: []const u8, context: *AppCon
     // Step 7: Signal tinkering complete (triggers Judge)
     if (context.tinkering_complete_ptr) |ptr| {
         ptr.* = true;
-        std.log.info("submit_work: tinkering_complete flag set to true", .{});
+        std.log.info("git_commit: tinkering_complete flag set to true", .{});
     } else {
-        std.log.warn("submit_work: tinkering_complete_ptr is null, cannot signal completion!", .{});
+        std.log.warn("git_commit: tinkering_complete_ptr is null, cannot signal completion!", .{});
     }
 
     // Response struct for JSON serialization

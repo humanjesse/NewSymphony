@@ -143,7 +143,7 @@ pub const Task = struct {
     comments: []Comment = &.{}, // Append-only audit trail (Beads philosophy)
     // Commit tracking for Tinkerer/Judge workflow
     started_at_commit: ?[]const u8 = null, // Captured when task is picked up (owned)
-    completed_at_commit: ?[]const u8 = null, // Captured when submit_work is called (owned)
+    completed_at_commit: ?[]const u8 = null, // Captured when git_commit is called (owned)
 
     /// Free all owned memory
     pub fn deinit(self: *Task, allocator: Allocator) void {
@@ -292,7 +292,7 @@ pub const TaskStore = struct {
         }
     }
 
-    /// Set the completed_at_commit for a task (commit tracking for submit_work)
+    /// Set the completed_at_commit for a task (commit tracking for git_commit)
     pub fn setTaskCompletedCommit(self: *Self, task_id: TaskId, commit_hash: []const u8) !void {
         if (!try self.db.taskExists(task_id)) {
             return error.TaskNotFound;

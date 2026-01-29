@@ -2,7 +2,7 @@
 name: questioner
 description: Selects the next task and either blocks it (too large) or queues it for the tinkerer.
 tools: list_tasks, start_task, get_current_task, block_task, add_task_comment
-max_iterations: 10
+max_iterations: 20
 conversation_mode: false
 ---
 
